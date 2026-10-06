@@ -76,7 +76,11 @@ setup_toolchain() {
     #    它只看 INCLUDE 环境变量。少这一条 ⇒ 资源编不出来 ⇒
     #    .res 文件根本不存在 ⇒ link 拿不到 RES_OBJ（而 link **不报错**，
     #    只是图标没了）。这正是"构建报绿但图标是空白"的根源。
-    r3sc_export_msvc_env "${ARCH:-x64}"
+    #    ★ 必须用**本函数的 $arch 参数**，不能写 ${ARCH:-x64} ——
+    #      build.sh 里根本没有 ARCH 这个变量（用的是 ONLY_ARCH），
+    #      写 ${ARCH:-x64} 会让 x86 构建也拿到 x64 的库路径 ⇒
+    #      LNK4272「库计算机类型 x64 与目标 x86 冲突」+ LNK1120 大量未解析符号。
+    r3sc_export_msvc_env "$arch"
     if [ "$arch" = "x64" ]; then
         CL="$MSVC_ROOT/bin/Hostx64/x64/cl.exe"
         LINK="$MSVC_ROOT/bin/Hostx64/x64/link.exe"
