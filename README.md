@@ -470,3 +470,11 @@ Copyright (C) 2026 yunsjxh。
 
 各组件的**完整许可原文**、以及与二进制分发相关的义务说明，见
 [`THIRD-PARTY-NOTICES.md`](THIRD-PARTY-NOTICES.md)。
+
+---
+
+## Star History
+
+<img alt="Star History Chart" src="https://api.star-history.com/chart?repos=yunsjxh/R3ShieldCore&type=date&legend=top-left" />
+
+<sub>图表由 [star-history.com](https://www.star-history.com) 实时生成。</sub>
