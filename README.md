@@ -131,16 +131,36 @@ bash driver/build_driver.sh Debug
 > ⚠️ 内核驱动需要**签名**才能在主流的 64 位 Windows 上加载。开发自测可开启
 > 测试签名模式（`bcdedit /set testsigning on`）；正式发布需 EV 代码签名证书。
 > 详见 `driver/README.md`。
+>
+> **「可选」的确切含义**：不编驱动也能跑完整条发布流程
+> （`build.sh` → `deploy_dist.sh` → `build_dist_zip.sh` → `installer/build_setup.sh`）。
+> 差别只在安装包里：
+>
+> | | 编了驱动 | 没编驱动 |
+> |---|---|---|
+> | 安装包 | **完整包** | **仅用户态包** |
+> | 装驱动那步 | 正常执行 | 自动跳过（引擎照常工作，只是没有「开机优先加载」） |
+> | 构建时 | 无提示 | 打印醒目警告 + 结论行写「**未包含**」 |
+> | `selftest_setup.py` | 驱动断言全跑 | 驱动断言标 `[SKIP]` 并计数 |
+>
+> 驱动是构建产物，**不进版本库**（`.gitignore` 的 `build/` 规则），所以
+> `git clone` 下来默认就是「仅用户态包」。
+>
+> ★ **官方发布必须用完整包**：加 `--require-driver`，让驱动缺席变成硬失败，
+> 避免误发一个少了组件的包。
 
 ### 构建安装包（单文件原生 GUI 安装器）
 
 ```bash
-bash installer/build_setup.sh        # -> dist/R3ShieldCore-Setup.exe
+bash installer/build_setup.sh                    # -> dist/R3ShieldCore-Setup.exe
+bash installer/build_setup.sh --require-driver   # 官方发布：驱动缺席即失败
 ```
 
 > 需要 MSYS2 `ucrt64` 的 `gcc` + `windres`（payload 以 zlib 压缩后作为 RCDATA 内嵌）。
 > 产物自检（**不碰系统**）：`python installer/selftest_setup.py`
 > （`--verify` / `--extract` 只读；第 4 层"真机装→卸"需要管理员）。
+> 构建结尾会打印 `内核驱动 : 已包含 / **未包含**` —— 这是两种产物之间**唯一**的实质差异，
+> 所以它必须出现在结论里，而不是只在滚屏警告里。
 >
 > `installer/build_installer.sh` 是**老路**（iexpress 自解压），仅作兼容保留，
 > 产物固定叫 `dist/R3ShieldCore-Setup-iexpress.exe`，不会覆盖上面的正式产物。

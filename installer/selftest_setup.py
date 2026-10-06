@@ -62,6 +62,18 @@ EXE = os.path.join(ROOT, "dist", "R3ShieldCore-Setup.exe")
 DIST_DIR = os.path.join(ROOT, "dist", "R3ShieldCore-x64")
 DRIVER_SYS = os.path.join(ROOT, "driver", "build", "r3shieldcore_kernel.sys")
 
+# ★ 本次运行**独占**的临时路径后缀。
+#   踩过：本机跑完整自测的同时，在另一个 clone 里也跑自测 —— 两边共用
+#   %TEMP%\r3sc-selftest-extract，一方 rmtree 掉另一方正在逐字节比对的文件，
+#   于是报出 "没解出 r3shieldcore_svc.exe" 这种**假 FAIL**（看着像产品少了文件）。
+#   自测必须可并行：多工作树 / CI 同时跑是常态。判据用 PID —— 它保证唯一。
+RUN_TAG = "p%d" % os.getpid()
+
+
+def _tmp(name):
+    """自测用的临时路径（带本次运行的 PID 后缀，保证并行不互相踩）。"""
+    return os.path.join(tempfile.gettempdir(), "r3sc-selftest-%s-%s" % (name, RUN_TAG))
+
 # 清单（必须和 gen_payload_rc.py 的 DIST_FILES 一致）
 DIST_FILES = [
     "R3 ShieldCore.exe", "r3shieldcore_svc.exe", "64/r3shieldcore-lib.dll", "32/r3shieldcore-lib.dll",
@@ -72,6 +84,14 @@ DIST_FILES = [
     "配置详解.md", "模式选择说明.md", "部署指南.md", "预设说明.txt",
 ]
 DRIVER_REL = "driver/r3shieldcore_kernel.sys"
+
+# ★★ 驱动是**可选**的（对齐 README「构建内核驱动（可选）」）★★
+#   判据与 gen_payload_rc.py **同源**：看源文件在不在。
+#   于是产物有两种：完整包 / 仅用户态包。自测必须**跟着产物走** ——
+#   否则"包本来就没驱动"会被报成 FAIL，那是**假 FAIL**（铁律 127：
+#   假 FAIL 比漏报更贵，它让正常功能看起来是坏的，然后你会去"修"一个不存在的问题）。
+HAVE_DRIVER = os.path.isfile(DRIVER_SYS)
+PAYLOAD_LIST = list(DIST_FILES) + ([DRIVER_REL] if HAVE_DRIVER else [])
 
 # ★★★ 「期望的文件名」只能有**一处**定义 ★★★
 #   踩过（v65c）：第 4 层曾经手写 ["R3 Shield Core.exe", ...] —— Shield 和 Core
@@ -85,8 +105,7 @@ KEY_FILES = [
     "64/r3shieldcore-lib.dll",
     "32/r3shieldcore-lib.dll",
     "r3shieldcore.ini",
-    DRIVER_REL,
-]
+] + ([DRIVER_REL] if HAVE_DRIVER else [])
 
 # ---------------------------------------------------------------------------
 # ShellExecuteExW：提权启动
@@ -169,6 +188,7 @@ class Tally:
     def __init__(self):
         self.passed = 0
         self.failed = 0
+        self.skipped = 0
         self.msgs = []
 
     def ok(self, what):
@@ -179,6 +199,12 @@ class Tally:
         self.failed += 1
         self.msgs.append(what)
         print("  [FAIL] %s" % what)
+
+    def skip(self, what):
+        """★ 跳过必须**可见**（打印 + 计数 + 进总结行）。
+        静默不计入 ⇒ "这个包本来就是残的"和"全绿"长得一样。"""
+        self.skipped += 1
+        print("  [SKIP] %s" % what)
 
     def check(self, cond, what):
         if cond:
@@ -208,7 +234,7 @@ def payload_source(rel):
 # ---------------------------------------------------------------------------
 def test_verify(t):
     print("\n=== 1/4 --verify：内嵌资源完整性（含真解压一遍）===")
-    rpt = os.path.join(tempfile.gettempdir(), "r3sc-selftest-verify.txt")
+    rpt = _tmp("verify.txt")
     if os.path.exists(rpt):
         os.remove(rpt)
 
@@ -230,10 +256,10 @@ def test_verify(t):
 
     # ★ 清单条目数用**独立来源**核对：脚本自己知道应该有 21 项，
     #   不是从报告里读的（否则"清单自己漏了一条"也照样绿）。
-    n_expect = len(DIST_FILES) + 1        # +1 = 内核驱动
+    n_expect = len(PAYLOAD_LIST)
     t.check("清单条目 : %d" % n_expect in txt, "清单条目 == %d" % n_expect)
 
-    total = sum(os.path.getsize(payload_source(r)) for r in DIST_FILES + [DRIVER_REL])
+    total = sum(os.path.getsize(payload_source(r)) for r in PAYLOAD_LIST)
     t.check("资源总字节: %d" % total in txt, "资源总字节 == %d" % total)
 
     for name in KEY_FILES:
@@ -242,7 +268,7 @@ def test_verify(t):
     # ★ 自校验：KEY_FILES 里的名字必须真的在 payload 清单（DIST_FILES + 驱动）里。
     #   否则"我期望的"和"实际打进包的"分家，而上面那条断言会**因为名字对不上**
     #   报 FAIL —— 报的是"清单里没有"，但真因是**自测自己写错了名字**。
-    _all = DIST_FILES + [DRIVER_REL]
+    _all = PAYLOAD_LIST
     for name in KEY_FILES:
         t.check(name in _all, "自测的期望名 %r 确实在 payload 清单里" % name)
 
@@ -256,8 +282,8 @@ def test_verify(t):
 # ---------------------------------------------------------------------------
 def test_extract(t):
     print("\n=== 2/4 --extract：解出来的文件逐字节比对源文件 ===")
-    out = os.path.join(tempfile.gettempdir(), "r3sc-selftest-extract")
-    rpt = os.path.join(tempfile.gettempdir(), "r3sc-selftest-extract.txt")
+    out = _tmp("extract")
+    rpt = _tmp("extract.txt")
     shutil.rmtree(out, ignore_errors=True)
     if os.path.exists(rpt):
         os.remove(rpt)
@@ -273,7 +299,7 @@ def test_extract(t):
     # ★ 逐文件 sha256 —— 比"大小相等"强得多。大小对但内容错是可能的
     #   （比如压缩流错位、解压缓冲没清）。
     bad = 0
-    for rel in DIST_FILES + [DRIVER_REL]:
+    for rel in PAYLOAD_LIST:
         src = payload_source(rel)
         dst = os.path.join(out, rel.replace("/", os.sep))
         if not os.path.exists(dst):
@@ -290,7 +316,7 @@ def test_extract(t):
             bad += 1
             continue
     if bad == 0:
-        t.ok("%d 个 payload 全部解出且 sha256 一致" % (len(DIST_FILES) + 1))
+        t.ok("%d 个 payload 全部解出且 sha256 一致" % len(PAYLOAD_LIST))
 
     # 卸载脚本
     ub_dst = os.path.join(out, "uninstall.bat")
@@ -434,7 +460,7 @@ def test_gui(t):
     #   为什么必须让程序自己报：EDIT 的文本要发 WM_GETTEXT 才拿得到，
     #   而 UIPI 挡住了跨完整性级别的消息 —— 从外面读永远是空串。
     print("  --- 控件状态自证（--uicheck，进程内快照）---")
-    snap = os.path.join(tempfile.gettempdir(), "r3sc-selftest-ui.txt")
+    snap = _tmp("ui.txt")
     if os.path.exists(snap):
         os.remove(snap)
     try:
@@ -521,7 +547,7 @@ def test_gui(t):
     #     选项页最容易改坏、又最不容易被发现的地方。
     def snap(extra, tag):
         """跑一次 --uicheck 快照并解析。返回 (ok, {ID: kv}, 窗口标题)。"""
-        path = os.path.join(tempfile.gettempdir(), "r3sc-selftest-ui-%s.txt" % tag)
+        path = _tmp("ui-%s.txt" % tag)
         if os.path.exists(path):
             os.remove(path)
         try:
@@ -846,7 +872,7 @@ def test_install_uninstall(t):
     """
     print("\n=== 4/4 真机安装 -> 卸载 ===")
     dest = os.path.join(ROOT, "_selftest_install")
-    rpt = os.path.join(tempfile.gettempdir(), "r3sc-selftest-install.txt")
+    rpt = _tmp("install.txt")
     if os.path.exists(rpt):
         os.remove(rpt)
 
@@ -877,8 +903,7 @@ def test_install_uninstall(t):
     #     **真的在跑**（以前是计划任务，只在登录时触发，所以 L4 里没有引擎），
     #     它会往安装目录写 r3shieldcore-console.log / events.log，服务写
     #     r3shieldcore-svc.log —— 总数必然多出来。按**集合**比更准也更可诊断。
-    expected = set(r.replace("/", os.sep) for r in DIST_FILES)
-    expected.add(DRIVER_REL.replace("/", os.sep))
+    expected = set(r.replace("/", os.sep) for r in PAYLOAD_LIST)
     expected.add("uninstall.bat")
 
     def is_runtime_artifact(fn):
@@ -914,12 +939,23 @@ def test_install_uninstall(t):
 
     # ★ 驱动：这台的驱动服务**注册得上但加载不起来**，
     #   所以断言的是 drv=1（已注册未加载），不是 drv=2。
-    t.check("drv=1" in log or "drv=2" in log,
-            "驱动那步真的走了（日志里 drv=1 或 2，实得 %r）"
-            % ([l for l in log.splitlines() if "SILENT" in l] or ["无"])[-1:])
-    t.check("实际有：" not in log,
-            "没有出现「payload 里没有 driver」的告警（文件名对得上）")
-    t.check(sc_query("R3ShieldCoreKernel") == 0, "驱动服务已注册")
+    #   ★ 整块跟着**产物**走：仅用户态包本来就没有驱动 ⇒ 必须 SKIP 而不是 FAIL。
+    #     但**不能只跳过** —— 要正向断言"它确实识别出没驱动并跳过了"，
+    #     否则"驱动那步被静默略过"和"正确处理"长得一模一样（铁律 137）。
+    if HAVE_DRIVER:
+        t.check("drv=1" in log or "drv=2" in log,
+                "驱动那步真的走了（日志里 drv=1 或 2，实得 %r）"
+                % ([l for l in log.splitlines() if "SILENT" in l] or ["无"])[-1:])
+        t.check("实际有：" not in log,
+                "没有出现「payload 里没有 driver」的告警（文件名对得上）")
+        t.check(sc_query("R3ShieldCoreKernel") == 0, "驱动服务已注册")
+    else:
+        t.skip("本包不含驱动（仅用户态包）—— 跳过「驱动那步走了 / 服务已注册」2 条")
+        t.check("drv=3" in log,
+                "包不含驱动时安装器**明确跳过**驱动步骤（日志 drv=3，实得 %r）"
+                % ([l for l in log.splitlines() if "SILENT" in l] or ["无"])[-1:])
+        t.check(sc_query("R3ShieldCoreKernel") != 0,
+                "包不含驱动时没有凭空注册出驱动服务")
 
     # ---- 开机自启（用户报的就是"装了不自启"）----
     #   ★ 顺序很重要：先趁**引擎还在跑**证明"服务真的把引擎拉起来了"，
@@ -995,16 +1031,20 @@ def test_install_uninstall(t):
     # ---- 驱动启动类型：默认勾了"开机优先" ⇒ 必须是 BOOT_START ----
     #   ★ 回读 `sc qc`，不认 `sc create` 的返回码：返回 0 只说明参数被接受，
     #     不说明 START_TYPE 真的落成了我们要的那个（铁律 94）。
-    qc = sc_qc("R3ShieldCoreKernel")
-    t.check("BOOT_START" in qc,
-            "驱动启动类型 = BOOT_START（开机优先）"
-            "（sc qc 实得 %r）" % [l.strip() for l in qc.splitlines()
-                                   if "START_TYPE" in l])
+    #   ★ 仅用户态包没有驱动服务可查 ⇒ SKIP（否则又是假 FAIL）。
+    if HAVE_DRIVER:
+        qc = sc_qc("R3ShieldCoreKernel")
+        t.check("BOOT_START" in qc,
+                "驱动启动类型 = BOOT_START（开机优先）"
+                "（sc qc 实得 %r）" % [l.strip() for l in qc.splitlines()
+                                       if "START_TYPE" in l])
+    else:
+        t.skip("本包不含驱动 —— 跳过「启动类型 = BOOT_START」断言")
 
     # ---- 第二次安装：不勾"开机优先" ⇒ 应落到普通开机自启 ----
     #   这一支是用户明确要的"未选就加到普通的开机自启里去"，
     #   不测的话它永远只是代码里的一句话。
-    rpt2 = os.path.join(tempfile.gettempdir(), "r3sc-selftest-install2.txt")
+    rpt2 = _tmp("install2.txt")
     if os.path.exists(rpt2):
         os.remove(rpt2)
     try:
@@ -1019,11 +1059,16 @@ def test_install_uninstall(t):
     #   所以这里必须再停一次，否则下面的 sc qc 又被引擎自己的规则拦掉。
     wait_engine(10)
     t.check(kill_engine(dest), "第二次安装后引擎已停（让 sc.exe 能用）")
-    qc2 = sc_qc("R3ShieldCoreKernel")
-    t.check("AUTO_START" in qc2,
-            "不勾「开机优先」时驱动启动类型 = AUTO_START（普通开机自启）"
-            "（sc qc 实得 %r）" % [l.strip() for l in qc2.splitlines()
-                                   if "START_TYPE" in l])
+    #   ★ 只跳过「驱动启动类型」这一条断言 —— 第二次安装本身（升级路径）
+    #     仍然必须真跑，那才是这段的主体。
+    if HAVE_DRIVER:
+        qc2 = sc_qc("R3ShieldCoreKernel")
+        t.check("AUTO_START" in qc2,
+                "不勾「开机优先」时驱动启动类型 = AUTO_START（普通开机自启）"
+                "（sc qc 实得 %r）" % [l.strip() for l in qc2.splitlines()
+                                       if "START_TYPE" in l])
+    else:
+        t.skip("本包不含驱动 —— 跳过「启动类型 = AUTO_START」断言")
 
     # ---- 卸载 ----
     ub = os.path.join(dest, "uninstall.bat")
@@ -1083,6 +1128,10 @@ def main():
 
     print("  大小     : %d 字节" % os.path.getsize(EXE))
     print("  sha256   : %s" % sha256_file(EXE))
+    # ★ 先亮明**这是哪一种包**：完整包和仅用户态包的断言集合不同，
+    #   不写出来就无法分辨"跳过了"和"根本没跑"（铁律 137）。
+    print("  包类型   : %s" % ("完整包（含内核驱动）" if HAVE_DRIVER
+                              else "仅用户态包（不含驱动）—— 驱动相关断言将 [SKIP]"))
 
     t = Tally()
     test_verify(t)
@@ -1097,12 +1146,15 @@ def main():
         test_install_uninstall(t)
 
     print("\n" + "=" * 64)
+    # ★ 跳过数必须出现在**结论行**里：否则"这个包本来就少一组断言"和
+    #   "全绿"输出完全一样，下次就分不出来了。
+    _skip = ("，%d 项跳过" % t.skipped) if t.skipped else ""
     if t.failed:
-        print(" 自测失败：%d 通过 / %d 失败" % (t.passed, t.failed))
+        print(" 自测失败：%d 通过 / %d 失败%s" % (t.passed, t.failed, _skip))
         for m in t.msgs:
             print("   x %s" % m)
         return 1
-    print(" 自测全部通过：%d 项断言" % t.passed)
+    print(" 自测全部通过：%d 项断言%s" % (t.passed, _skip))
     return 0
 
 
