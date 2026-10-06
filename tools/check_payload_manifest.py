@@ -40,6 +40,10 @@ check_payload_manifest.py —— 安装包 payload 清单一致性闸门
   D. selftest 的 KEY_FILES 必须都真的在清单里。
   E. 清单里的每个文件必须真的存在于 dist 发布目录（缺一个就 FAIL —— 铁律 117：
      声明的路径必须存在，否则闸门会在"什么都没查"的情况下报绿）。
+     ★ 本条**需要先构建**，所以全新 clone / CI 上必跑不了 —— 那种环境用
+       `--static-only` 跳过 E，只跑 A~D、F、G（纯源码判据）。
+       **不是默认跳过**：默认行为不变，跳过必须显式要求，且会在输出里打
+       `[SKIP]` 行（铁律 118：跳过行要显式计入结论，不能静默）。
   F. 开机启动**服务**的名字（SVC_NAME / SVC_EXE_NAME）必须跨 C / 卸载脚本 /
      安装脚本 / 自测四处一致 —— 装一个名、卸另一个名 ⇒ 服务**永远删不掉**。
   G. 排查工具（diag_autostart.py / .bat）里的 ENGINE_EXE / SVC_NAME / SVC_EXE /
@@ -50,6 +54,9 @@ check_payload_manifest.py —— 安装包 payload 清单一致性闸门
     python tools/check_payload_manifest.py           # 检查
     python tools/check_payload_manifest.py --quiet   # 只在失败时输出
     python tools/check_payload_manifest.py --selftest # 负对照：证明本闸门真的会失败
+    python tools/check_payload_manifest.py --static-only
+        # 跳过判据 E（发布目录存在性）—— 只跑纯源码判据。
+        # 用于**还没构建**的环境：全新 clone、CI。默认不跳过。
 """
 
 import os
@@ -155,11 +162,15 @@ def extract_assign_str(text, name, what, fails):
     return m.group(1)
 
 
-def check_all(texts, dist_dir, driver_dir):
+def check_all(texts, dist_dir, driver_dir, check_dist=True):
     """核心检查。texts = {GEN, SH, C, ST} → 文本。返回 (fails, notes)。
 
     ★ 抽成函数是为了让 --selftest 能拿**改坏了的文本**去喂同一套逻辑 ——
       负对照必须走真判据，不能另写一份"我以为的判据"。
+
+    check_dist=False（`--static-only`）时跳过判据 E —— 它要求发布目录已经装配好，
+    在全新 clone / CI 上必然不存在。跳过会**显式**记一条 [SKIP] note，
+    不静默（铁律 118）。
     """
     fails, notes = [], []
     gen_txt, sh_txt, c_txt, st_txt = texts[GEN], texts[SH], texts[C], texts[ST]
@@ -295,7 +306,10 @@ def check_all(texts, dist_dir, driver_dir):
                      % (C, svc_exe_c, ST, svc_exe_st))
 
     # ---- G. 清单里的文件真的在发布目录 ----
-    if gen_list is not None:
+    if gen_list is not None and not check_dist:
+        notes.append("[SKIP] 判据 E 发布目录存在性检查（--static-only）："
+                     "需要先跑 deploy_dist.sh 才能查，本次未构建")
+    elif gen_list is not None:
         if not os.path.isdir(dist_dir):
             fails.append("发布目录不存在：%s —— 先构建（铁律 117：声明的路径必须存在，"
                          "否则闸门会在什么都没查的情况下报绿）" % dist_dir)
@@ -374,11 +388,17 @@ def check_all(texts, dist_dir, driver_dir):
 # 负对照：证明这个闸门**真的会失败**
 # ---------------------------------------------------------------------------
 def run_selftest():
-    """给真文本注入 5 种"漂移"，逐一断言被抓到。
+    """给真文本注入 9 种"漂移"，逐一断言被抓到。
 
     ★ 铁律 108/124：一个只会 PASS 的闸门等于没有闸门。而且**必须走真判据** ——
       不能另写一份"我以为的检查逻辑"来自测，否则测的是那份副本。
       所以这里调用的是 check_all() 本体。
+
+    ★ 2026-10-06：两处 check_all 都改成 check_dist=False。
+      理由是**负对照测的是"文本漂移能不能被抓到"，与磁盘上有没有产物无关**；
+      带着判据 E 跑，全新 clone / CI 上正向对照会先失败，整个 --selftest
+      就永远跑不起来（= 负对照等于不存在）。
+      判据 E 本身不受文本注入影响，跳过它不影响本自测的效力。
     """
     texts = {
         GEN: read_text(GEN_PY),
@@ -392,7 +412,7 @@ def run_selftest():
     }
 
     # 正向对照：原样必须 0 失败（否则下面的"抓到了"毫无意义）
-    base_fails, base_notes = check_all(texts, DIST_DIR, DRIVER_DIR)
+    base_fails, base_notes = check_all(texts, DIST_DIR, DRIVER_DIR, check_dist=False)
     if base_fails:
         print("负对照前置失败：原始文件本来就不干净，先修好再谈负对照")
         for f in base_fails:
@@ -435,12 +455,22 @@ def run_selftest():
                         "build_installer.sh 清单少一项", "DIST_FILES 不一致"))
 
     # 4) KEY_FILES 里出现清单外的名字
+    #    ★ 2026-10-06 修（开源整理时发现 --selftest 整体是红的）：
+    #      注入模式原本写的是
+    #          '    "r3shieldcore.ini",\r\n    DRIVER_REL,'
+    #      但 selftest_setup.py 的 KEY_FILES **后来改成了条件拼接**：
+    #          ] + ([DRIVER_REL] if HAVE_DRIVER else [])
+    #      ⇒ 注入**一次都没匹配上** ⇒ 负对照报"替换没匹配上"、--selftest 直接失败。
+    #      这正是铁律 128 要防的：判据和夹具分家之后，
+    #      "负对照还在"本身变成了假的（而死掉的那条判据看起来一切正常）。
+    #    ★ 锚点必须带上**列表闭合的位置** —— 单看 `    "r3shieldcore.ini",`
+    #      在文件里**不唯一**（另一处常量也以它开头），
+    #      只按字面量替换会把假名字塞进**另一个列表**，
+    #      判据 D 反而抓不到 ⇒ 负对照会改报"没抓住"，方向又被引偏。
+    _nl = "\r\n" if "\r\n" in texts[ST] else "\n"
     cases.append(mutate(ST, texts[ST].replace(
-        '    "r3shieldcore.ini",\r\n    DRIVER_REL,',
-        '    "r3shieldcore.ini",\r\n    DRIVER_REL,\r\n    "no-such-file.exe",', 1)
-        if '\r\n' in texts[ST] else texts[ST].replace(
-        '    "r3shieldcore.ini",\n    DRIVER_REL,',
-        '    "r3shieldcore.ini",\n    DRIVER_REL,\n    "no-such-file.exe",', 1),
+        '    "r3shieldcore.ini",' + _nl + ']',
+        '    "r3shieldcore.ini",' + _nl + '    "no-such-file.exe",' + _nl + ']', 1),
         "KEY_FILES 混进清单外的名字", "KEY_FILES 里有清单外的名字"))
 
     # 5) 清单块变成空的（空真 / 假绿）
@@ -483,7 +513,7 @@ def run_selftest():
 
     bad = 0
     for title, t, expect in cases:
-        fails, _ = check_all(t, DIST_DIR, DRIVER_DIR)
+        fails, _ = check_all(t, DIST_DIR, DRIVER_DIR, check_dist=False)
         hit = [f for f in fails if expect in f]
         # ★ 断言在**字段**上（具体那条消息），不是"有任意一条失败"
         if hit:
@@ -506,6 +536,7 @@ def main():
         return run_selftest()
 
     quiet = "--quiet" in sys.argv
+    static_only = "--static-only" in sys.argv
 
     for p in (GEN_PY, BUILD_SH, SETUP_C, SELFTEST, UNINSTALL, INSTALL,
               DIAG_PY, DIAG_BAT):
@@ -523,7 +554,8 @@ def main():
         DP: read_text(DIAG_PY),
         DB: read_text(DIAG_BAT),
     }
-    fails, notes = check_all(texts, DIST_DIR, DRIVER_DIR)
+    fails, notes = check_all(texts, DIST_DIR, DRIVER_DIR,
+                             check_dist=not static_only)
 
     if fails:
         print("=" * 64)

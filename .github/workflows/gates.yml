@@ -46,4 +46,29 @@ jobs:
         run: python tools/check_env_switch_names.py
 
       - name: payload 清单闸门
-        run: python tools/check_payload_manifest.py
+        # 判据 E（发布目录存在性）需要先跑 deploy_dist.sh，全新 clone 上必然没有
+        # ⇒ 用 --static-only 只跑纯源码判据（清单互相比对 / 服务名一致性 / 排查器常量）。
+        # 跳过会显式打出 [SKIP] 行，不静默（铁律 118）。
+        run: python tools/check_payload_manifest.py --static-only
+
+  negative-controls:
+    name: 负对照（证明闸门真的会失败）
+    # ★ 一个只会 PASS 的闸门等于没有闸门。
+    #   这三条本身就是"给真文本注入漂移、断言被抓到"，纯源码判据，适合进 CI。
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: GBK 闸门负对照（30 项）
+        run: python tools/selftest_gbk_gate.py
+
+      - name: .bat 通配符闸门负对照
+        run: python tools/check_bat_dir_wildcard.py --selftest
+
+      - name: payload 清单闸门负对照（9 种漂移）
+        run: python tools/check_payload_manifest.py --selftest
