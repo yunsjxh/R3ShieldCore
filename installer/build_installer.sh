@@ -156,6 +156,9 @@ for f in "${DIST_FILES[@]}"; do
 done
 if [ ! -f "$DRIVER_SYS" ]; then
     echo "  [缺] $DRIVER_SYS  —— 先跑 bash driver/build_driver.sh"
+    # ★ 本脚本（老路 iexpress）**要求**驱动；正式路 build_setup.sh 不要求
+    #   （没驱动就出「仅用户态包」）。两条路的差异是有意的，不是漏改。
+    echo "       （正式路 bash installer/build_setup.sh 允许缺驱动，产物是「仅用户态包」）"
     FAILED=1
 fi
 for f in install.bat uninstall.bat; do

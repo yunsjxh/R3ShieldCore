@@ -24,6 +24,12 @@
 #   bash installer/build_setup.sh              # 构建
 #   bash installer/build_setup.sh --no-copy    # 只构建，不拷回 dist/
 #   bash installer/build_setup.sh --res-only   # 只生成 payload 资源（调试用）
+#   bash installer/build_setup.sh --require-driver
+#                                              # 官方发布：驱动缺席即硬失败
+#
+# ★ 内核驱动是**可选**的（对齐 README「构建内核驱动（可选）」）：
+#   没编驱动也能出安装包，只是产物是「仅用户态」版，安装器会跳过装驱动那步。
+#   官方发布必须带驱动 ⇒ 加 --require-driver。
 #
 set -u
 
@@ -59,6 +65,21 @@ else
 fi
 
 MODE="${1:-build}"
+
+# ★ --require-driver：**官方发布**用 —— 驱动缺席即硬失败。
+#   默认**不**强制：纯源码 clone 没有 WDK，强制等于把"出安装包"这条路掐断，
+#   而 README 又把驱动写成「可选」。详见 gen_payload_rc.py 顶部注释。
+REQ_DRV=""
+for _a in "$@"; do
+    [ "$_a" = "--require-driver" ] && REQ_DRV="--require-driver"
+done
+
+# 驱动是否入包 —— 收尾的结论行要报它（两个产物之间唯一的实质差异）
+if [ -f "$PROJECT_ROOT/driver/build/r3shieldcore_kernel.sys" ]; then
+    DRV_IN="已包含（完整包）"
+else
+    DRV_IN="**未包含**（仅用户态包，装完驱动那步会自动跳过）"
+fi
 
 # ---------------------------------------------------------------------------
 # 1/6 预检
@@ -116,7 +137,7 @@ echo "  暂存目录 : $TMP"
 # ---------------------------------------------------------------------------
 echo ""
 echo "=== 3/6 生成 payload 资源 ==="
-if ! "$PY" "$INST_DIR/gen_payload_rc.py" "$TMP" ; then
+if ! "$PY" "$INST_DIR/gen_payload_rc.py" "$TMP" $REQ_DRV ; then
     echo "  [败] gen_payload_rc.py 失败"
     exit 1
 fi
@@ -254,6 +275,7 @@ echo ""
 echo "=== 完成 ==="
 echo "  安装包 : dist/$OUT_NAME  ($SIZE 字节)"
 echo "  sha256 : $SHA"
+echo "  内核驱动 : $DRV_IN"
 echo ""
 echo "  自测（不碰系统）："
 echo "     python installer/selftest_setup.py"

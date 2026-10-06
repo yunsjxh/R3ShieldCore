@@ -71,6 +71,14 @@ DIST_FILES = [
 ]
 
 # 驱动：源在 driver/build/ 下，装到 <部署根>\driver\ 子目录
+# ★ 驱动是**可选**的 —— 与 README「构建内核驱动（可选）」保持一致：
+#   · 在（作者机器 / 装了 WDK 的机器）→ 打进安装包，安装器会装它；
+#   · 不在（纯源码 clone）            → 警告并继续，装出来的包**不含驱动**，
+#     安装器运行时那一步会自己跳过（r3sc_setup.c 的
+#     「payload 里没有 driver\... —— 跳过驱动」分支，drv_state=3）。
+#   ★ 但**官方发布必须带驱动** ⇒ 用 `--require-driver` 把缺席变成硬失败。
+#   为什么不默认强制：clone 用户没 WDK，默认强制等于把"出安装包"这条路
+#   对他们直接掐断，而 README 又把驱动写成"可选"—— 文档与实现打架。
 DRIVER_SRC = "driver/build/r3shieldcore_kernel.sys"
 DRIVER_REL = "driver/r3shieldcore_kernel.sys"
 
@@ -96,10 +104,14 @@ def rc_path(p):
 
 
 def main():
-    if len(sys.argv) < 2:
-        print("用法: python gen_payload_rc.py <out_dir>")
+    # ★ 用 "--" 前缀的是本脚本自己的开关，其余是位置参数（out_dir）。
+    require_drv = "--require-driver" in sys.argv
+    pos = [a for a in sys.argv[1:] if not a.startswith("--")]
+    if len(pos) < 1:
+        print("用法: python gen_payload_rc.py <out_dir> [--require-driver]")
+        print("  --require-driver  驱动缺席时硬失败（官方发布用；纯源码 clone 不要加）")
         return 2
-    out_dir = os.path.abspath(sys.argv[1])
+    out_dir = os.path.abspath(pos[0])
 
     # ★ 纯 ASCII 断言：这是本脚本存在的**唯一理由**，必须硬检查。
     try:
@@ -114,7 +126,8 @@ def main():
         if not os.path.isfile(p):
             missing.append(p)
     drv = os.path.join(PROJECT_ROOT, DRIVER_SRC.replace("/", os.sep))
-    if not os.path.isfile(drv):
+    have_drv = os.path.isfile(drv)
+    if not have_drv and require_drv:
         missing.append(drv)
     unb = os.path.join(INST_DIR, "uninstall.bat")
     if not os.path.isfile(unb):
@@ -133,9 +146,24 @@ def main():
         print("        bash deploy_dist.sh       # ★ 把产物搬进 dist/ 并验收（缺了就会缺这一批）")
         print("    · driver/build/r3shieldcore_kernel.sys")
         print("        bash driver/build_driver.sh   # 需要 WDK；驱动不签名只能在测试签名模式加载")
+        print("        （本次是被 --require-driver 强制要求的；去掉该开关可出「仅用户态」安装包）")
         print("    · installer/uninstall.bat")
         print("        这个文件在版本库里，缺了说明 clone/解压不完整。")
         return 1
+
+    # ---- 驱动缺席：**醒目**警告后继续（不是静默降级）----
+    #   ★ 必须显眼：产物会**少一个组件**，事后只能靠这条日志分辨。
+    #     （铁律 97：布尔判定不可诊断 —— 所以这里要写清"少了什么、后果是什么"。）
+    if not have_drv:
+        print("")
+        print("  " + "!" * 66)
+        print("  !! 本次安装包 **不含内核驱动**（找不到 %s）" % DRIVER_SRC)
+        print("  !! 后果：安装器会跳过装驱动那一步，装出来是**仅用户态**版本；")
+        print("  !!       引擎照常工作，只是没有「开机优先加载」能力。")
+        print("  !! 想要完整包：先跑 `bash driver/build_driver.sh`（需要 WDK）再重跑本步；")
+        print("  !!       官方发布请加 `--require-driver` 让这里变成硬失败。")
+        print("  " + "!" * 66)
+        print("")
 
     res_dir = os.path.join(out_dir, "_res")
     shutil.rmtree(res_dir, ignore_errors=True)
@@ -150,7 +178,8 @@ def main():
     #   压缩顺带把体积从 2.6MB 降到 ~1.2MB，比 iexpress 版还小。
     entries = []          # (id, relpath, rawsize, zipsize)
     nid = RES_ID_BASE
-    for rel in DIST_FILES + [DRIVER_REL]:
+    pack_list = list(DIST_FILES) + ([DRIVER_REL] if have_drv else [])
+    for rel in pack_list:
         src = drv if rel == DRIVER_REL else os.path.join(DIST_DIR, rel.replace("/", os.sep))
         with open(src, "rb") as f:
             raw = f.read()
@@ -198,6 +227,11 @@ def main():
     print("  清单     : %s" % man)
     print("  资源脚本 : %s" % rc)
     print("  条目     : %d 个 payload + 1 个清单 + 1 个卸载脚本" % len(entries))
+    # ★ 驱动是否入包，必须在**结论行**里再说一次 —— 上面的警告容易被滚屏刷掉，
+    #   而这是产物之间唯一的实质差异（铁律 137：自测全绿≠功能存在，同理
+    #   "构建成功"也证明不了"包是完整的那一个"）。
+    print("  内核驱动 : %s" % ("已包含（完整包）" if have_drv
+                              else "**未包含**（仅用户态包；见上方警告）"))
     print("  原始总量 : %d 字节 (%.1f MB)" % (raw_total, raw_total / 1024.0 / 1024.0))
     print("  压缩后   : %d 字节 (%.1f MB, %.0f%%)" % (
         zip_total, zip_total / 1024.0 / 1024.0,

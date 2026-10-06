@@ -2194,12 +2194,14 @@ static int mode_verify(const WCHAR *report)
 
     /* ★ 关键文件必须**按名字**在清单里找到 —— 不依赖清单自己说了什么 */
     {
+        /* ★ 驱动**故意不在这里**：它是可选的（见下面单独那一段）。
+           列进这个"必须有"的列表，会把「仅用户态包」直接判成 FAIL ——
+           而那种包是**受支持**的形态（README「构建内核驱动（可选）」）。 */
         static const WCHAR *must[] = {
             L"R3 ShieldCore.exe",
             L"64/r3shieldcore-lib.dll",
             L"32/r3shieldcore-lib.dll",
             L"r3shieldcore.ini",
-            L"driver/r3shieldcore_kernel.sys",
             L"r3shieldcore_svc.exe",
         };
         for (size_t m = 0; m < sizeof(must) / sizeof(must[0]); m++) {
@@ -2217,18 +2219,31 @@ static int mode_verify(const WCHAR *report)
        踩过：DRV_SYS_NAME 写成 R3ShieldCoreKernel.sys（把**服务名**当文件名），
        而 payload 里是 r3shieldcore_kernel.sys —— 差一个下划线，安装时驱动
        那步永远静默跳过；而 --verify 因为自己**硬编码**了小写名所以照样全绿。
-       所以这里必须用代码里真正会用的那个常量去比。 */
+       所以这里必须用代码里真正会用的那个常量去比。
+
+       ★ 但要区分**两种**"没找到"，它们的结论相反：
+         · 清单里根本没有 driver/ 条目 → 构建时没编驱动 = **仅用户态包**，
+           这是受支持的形态（README「构建内核驱动（可选）」）⇒ 报 SKIP，不算错；
+         · 有 driver/ 条目但名字对不上   → 真 bug（安装时那步会静默跳过）⇒ FAIL。
+       混在一起报，就会让"我们故意没打驱动"看起来像"产品坏了"（假 FAIL）。 */
     {
-        int found = 0;
+        int found = 0, any_drv = 0;
         for (i = 0; i < g_nitems; i++) {
             const WCHAR *r = g_items[i].rel;
-            if (wcsncmp(r, L"driver/", 7) == 0 && _wcsicmp(r + 7, DRV_SYS_NAME) == 0) {
-                found = 1;
-                break;
+            if (wcsncmp(r, L"driver/", 7) == 0) {
+                any_drv = 1;
+                if (_wcsicmp(r + 7, DRV_SYS_NAME) == 0) { found = 1; break; }
             }
         }
         if (found) {
-            rpt("OK   驱动文件名与 DRV_SYS_NAME 一致\n");
+            /* ★ 输出格式必须和上面 must[] 那段**逐字一致**（"OK   <相对路径>"）：
+               自测按 KEY_FILES 里的相对路径去报告里找这一行，格式一变就成了
+               假 FAIL（"报告里没有 driver/..." 而其实是换了种写法）。 */
+            w2u8(L"driver/" DRV_SYS_NAME, u8, sizeof(u8));
+            rpt("OK   %s\n", u8);
+            rpt("     ^ 驱动文件名与 DRV_SYS_NAME 一致（安装那步就是按它找的）\n");
+        } else if (!any_drv) {
+            rpt("SKIP 本包不含内核驱动（仅用户态包）—— 安装时会跳过驱动那步\n");
         } else {
             w2u8(DRV_SYS_NAME, u8, sizeof(u8));
             rpt("FAIL 清单里的驱动文件名和 DRV_SYS_NAME(%s) 对不上 —— 驱动那步会静默跳过\n", u8);
