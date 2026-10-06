@@ -48,7 +48,7 @@
 
 ## 1. 这是什么
 
-一个用 C++20 写的 Windows 用户态安全代理，由**三层**组成，各层职责刻意分得很开：
+一个用 C++20 写的 Windows 用户态安全代理，分三层，各层职责刻意分得很开：
 
 ```
 ┌──────────────────────────────────────────────────────────────────────────┐
@@ -70,9 +70,9 @@
 └──────────────────────────────────────────────────────────────────────────┘
 ```
 
-**为什么驱动不拦截？** 因为内核里做拦截意味着**每一条内核路径都是开机风险**
+驱动不拦截是有意的：内核里做拦截意味着每一条内核路径都是开机风险
 （蓝屏、死锁、与其它安全软件打架），而本项目的目标不是拿到最高权限，
-而是让用户**看见并决定**。驱动留着是为了拿到"最早加载"这个位置，
+而是让用户看见并决定。驱动留着是为了拿到"最早加载"这个位置，
 以及给用户态一个可核对的加载证据（见 `driver/README.md`）。
 
 ## 2. 监控面：18 类对象 / 17 个 guard
@@ -101,9 +101,9 @@
 | 16 | WMI 事件订阅 | `wmi_subscription_guard.cpp` | `IWbemLocator::ConnectServer`、`IWbemServices::PutInstance/ExecMethod/ExecNotificationQuery`（vtable patch） |
 | 17 | 宿主劫持 | `host_hijack_guard.cpp` | `LoadLibraryExW` `LdrRegisterDllNotification` `NtQueueApcThread` `QueueUserAPC` |
 
-> **6/7/8 三类**（摄像头、输入钩子、截屏）的共同点是：本身不破坏数据、不装东西，
-> 但都是**窃听** —— 木马与间谍软件的标配三件套，同时也是正常软件会用到的东西。
-> 所以对它们的判据不是"危险"，而是"**需要用户知情**"。
+> 6/7/8 三类（摄像头、输入钩子、截屏）本身不破坏数据、不装东西，
+> 但都是窃听手段 —— 木马与间谍软件的标配三件套，同时也是正常软件会用到的东西。
+> 所以对它们的判据不是"危险"，而是"需要用户知情"。
 
 ## 3. 拦截模式（`mode=`，5 种）
 
@@ -117,18 +117,18 @@
 
 ### ⚠️ 三条容易搞错的语义（都是代码里的显式决定，不是实现疏漏）
 
-1. **只有 `ask` 模式会弹窗。**
+1. 只有 `ask` 模式会弹窗。
    `ModeAllowsAsk()` 只在 `mode == Ask` 时返回真（`process_guard.cpp:372`）。
-   全拦模式下，进程创建 / 远程线程 / 跨进程内存这三类**一律直接拒**，
-   **不弹窗、不问用户、也不看 `prompt_default`** —— 否则"全拦"能被一行配置放水。
+   全拦模式下，进程创建 / 远程线程 / 跨进程内存这三类一律直接拒，
+   不弹窗、不问用户、也不看 `prompt_default` —— 否则"全拦"能被一行配置放水。
 
-2. **`block_all_safe` 的豁免只给「进程创建」。**
-   远程线程与跨进程内存**不享受豁免**（`process_guard.cpp:605`、`:715`）。
+2. `block_all_safe` 的豁免只给「进程创建」。
+   远程线程与跨进程内存不享受豁免（`process_guard.cpp:605`、`:715`）。
    放行进程创建是为了让正常程序能起来；放行远程线程等于放行整条注入链。
 
-3. **`inject_policy` 不是"询问/硬拒"的依据。**
-   它是**注入分级**（Full / Thin / Skip），决定"这个进程要不要装 guard"。
-   容易和"拦截策略"混淆，特此说明。
+3. `inject_policy` 不是"询问/硬拒"的依据。
+   它是注入分级（Full / Thin / Skip），决定"这个进程要不要装 guard"。
+   容易和"拦截策略"混淆。
 
 > `prompt_default` 只在 `ask` 模式下作为**超时兜底**生效，默认 `deny`。
 
@@ -163,7 +163,7 @@
 - **32/64 位**：`64/` 与 `32/` 两个目录各放一份 DLL，按目标进程位数选；
   32 位侧依赖 `wow64ext` 做跨架构调用。
 
-> **注入器自己也是被 hook 的对象**：守卫自身的注入由 hook 层的 `IsInjectingInto`
+> 注入器自己也是被 hook 的对象：守卫自身的注入由 hook 层的 `IsInjectingInto`
 > 提前放行，否则同步注入路会把自己掐死。
 
 ## 6. 构建
@@ -202,9 +202,9 @@ r3shieldcore_svc.exe         守候服务（只编 x64）
 32/r3shieldcore-lib.dll      32 位注入 DLL
 ```
 
-> 为什么直接调 `cl.exe` 而不用 MSBuild？本机 `devenv.com` 只会把 IDE 拉起来、
-> 不执行命令行构建；`MSBuild.exe` 被安全策略按名字拦截。脚本用的是同一套编译器、
-> 同样的参数，产物与 IDE 构建等价。详见 `build.sh` 顶部注释。
+> 不用 MSBuild 是因为本机 `devenv.com` 只会把 IDE 拉起来、不执行命令行构建，
+> 而 `MSBuild.exe` 被安全策略按名字拦截。脚本用的是同一套编译器、同样的参数，
+> 产物与 IDE 构建等价。详见 `build.sh` 顶部注释。
 
 ### 6.3 装配发布目录（打包前**必须先做**）
 
@@ -226,7 +226,7 @@ bash deploy_dist.sh --check  # 只验收，不重新装配
 `GlobalHookSessionSelfExit` 两个特性标记、以及 v66 代次标记（exe 含宽串
 `R3 Shield Core`，DLL 含 `System32\consent.exe` 等整行）。
 
-> 这一步以前是**手工 `cp`**，代价是出过一次真实事故：x86 DLL 停在旧代次构建，
+> 这一步以前是手工 `cp`，代价是出过一次真实事故：x86 DLL 停在旧代次构建，
 > 发布包"文件都在、大小也对、闸门也全绿"，而 32 位进程一条事件都没有。
 > 详见 `check_dist_sync.sh` 顶部注释。
 
@@ -240,10 +240,10 @@ bash driver/build_driver.sh Debug
 驱动用**单独探测的 WDK 版本**（挑存在 `Include/*/km` 的那个，可 `WDK_SDK_VERSION` 覆盖），
 `-SUBSYSTEM:NATIVE -ENTRY:DriverEntry -NODEFAULTLIB`。
 
-> ⚠️ 64 位 Windows 要求内核驱动**有签名**才能加载。开发自测可以开测试签名模式，
+> ⚠️ 64 位 Windows 要求内核驱动有签名才能加载。开发自测可以开测试签名模式，
 > 正式发布需要 EV 证书 + 微软 attestation 签名。
-> **实测（本机）**：自签驱动在 Secure Boot 关闭的机器上确实能加载，但那是
-> 「有签名」+「本机 CI 处于审计模式」两个条件同时成立的结果，**换强制模式的机器会被拒**。
+> 实测（本机）：自签驱动在 Secure Boot 关闭的机器上确实能加载，但那是
+> 「有签名」+「本机 CI 处于审计模式」两个条件同时成立的结果，换强制模式的机器会被拒。
 > 完整实测矩阵与结论见 [`driver/README.md`](driver/README.md) 第 1.2.1 节。
 
 **「可选」的确切含义**：不编驱动也能跑完整条发布流程。差别只在安装包里：
@@ -269,8 +269,8 @@ bash installer/build_setup.sh --no-copy          # 只编不拷
 
 需要 MSYS2 `ucrt64` 的 `gcc` + `windres`。payload 以 **zlib 压缩后作为 RCDATA**
 内嵌（资源 ID：`1`=manifest，`2`=uninstall.bat，`1000+`=payload 文件）。
-构建结尾打印 `内核驱动 : 已包含 / **未包含**` —— 这是两种产物之间**唯一**的实质差异，
-所以它必须出现在结论里，而不是只躺在滚屏警告里。
+构建结尾打印 `内核驱动 : 已包含 / 未包含` —— 这是两种产物之间唯一的实质差异，
+所以它必须出现在结论里，不能只躺在滚屏警告里。
 
 安装器是原生 Win32 GUI，支持这些开关（`r3sc_setup.c:2452`）：
 
@@ -421,18 +421,18 @@ bash build_guard_ut.sh       # guard 层单元测试（链 MinHook）
 python installer/selftest_setup.py --no-gui --no-install   # 安装程序自测（★ 推荐）
 ```
 
-> ⚠️ **安装程序自测的第 4 层会真的启动引擎。** 引擎的全局注入会 hook 本机
-> **所有**进程（包括编辑器 / IDE）。所以第 4 层必须**显式**加 `--run-engine`
-> 才会跑；不加时它报 `[SKIP]` 并计入结论行，**不会静默跳过**。
-> **要跑第 4 层，请在虚拟机或另一台机器上跑。**
+> ⚠️ 安装程序自测的第 4 层会真的启动引擎。引擎的全局注入会 hook 本机
+> 所有进程（包括编辑器 / IDE）。所以第 4 层必须显式加 `--run-engine`
+> 才会跑；不加时它报 `[SKIP]` 并计入结论行，不会静默跳过。
+> 要跑第 4 层，请在虚拟机或另一台机器上跑。
 >
-> 平时只需 `--no-gui --no-install`：第 1-2 层**只读**，验证内嵌资源完整性
+> 平时只需 `--no-gui --no-install`：第 1-2 层只读，验证内嵌资源完整性
 > 并逐字节比对解出来的 payload。
 
 `tools/` 下有 60+ 个**只读探针**（`*probe*`）与 30+ 个单元测试，用于验证 hook 是否
-真的挂上、规则是否真的命中 —— 它们本身就是本项目"用实验代替猜测"工作方式的产物。
+真的挂上、规则是否真的命中。
 > ⚠️ 但 `tools/` 里的 `test_*.sh` / `acceptance_test.sh` / `accept_file_modes.sh` /
-> `verify_log_mode.sh` 属于**验收脚本**，它们会启动引擎 —— 同样请在隔离环境跑。
+> `verify_log_mode.sh` 属于验收脚本，它们会启动引擎 —— 同样请在隔离环境跑。
 
 ## 10. 已知边界
 
@@ -465,10 +465,10 @@ python installer/selftest_setup.py --no-gui --no-install   # 安装程序自测�
 
 [GNU General Public License v3.0](LICENSE)。Copyright (C) 2026 yunsjxh。
 
-> `LICENSE` 是 GPL-3.0 的**逐字原文**（含官方附录的占位符），一个字节都没改 ——
+> `LICENSE` 是 GPL-3.0 的逐字原文（含官方附录的占位符），一个字节都没改 ——
 > GPL 自己写着 "changing it is not allowed"。本项目的版权声明就在上面这行，
 > 以及 [`THIRD-PARTY-NOTICES.md`](THIRD-PARTY-NOTICES.md) 顶部。
-> **别往 `LICENSE` 里加东西**：加了之后 GitHub 会把它识别成 `Other` 而不是
+> 别往 `LICENSE` 里加东西：加了之后 GitHub 会把它识别成 `Other` 而不是
 > GPL-3.0，仓库侧栏的许可证标识就没了。
 
 本项目的注入/hook 框架派生自
