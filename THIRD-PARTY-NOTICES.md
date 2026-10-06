@@ -2,10 +2,10 @@
 
 本文件汇集 R3 ShieldCore 中**全部第三方代码**的版权与许可信息。
 
-**为什么需要单独一份？** 不是重复 README。两个许可（MinHook、ReflectiveDLLInjection）
-都属于 BSD 系列，其条款明确要求：**以二进制形式再分发**时，必须把版权声明、条件列表
-和免责声明"**随文档或其他随附材料**"复现出来。README 里的一句话列表不构成"随附材料"，
-而你要发的是 `R3ShieldCore-Setup.exe` / `R3ShieldCore-x64.zip` —— 所以本文件必须随包发出。
+MinHook 与 ReflectiveDLLInjection 都属 BSD 系列，其条款要求：**以二进制形式再分发**
+时，必须把版权声明、条件列表和免责声明"**随文档或其他随附材料**"复现出来。
+README 里的一句话列表不构成"随附材料"，而本仓库发布的是
+`R3ShieldCore-Setup.exe` / `R3ShieldCore-x64.zip`，所以本文件必须随包发出。
 
 ---
 
@@ -66,10 +66,9 @@ NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
 SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ```
 
-> ⚠️ 注意：MinHook 在 `libraries/MinHook/` 下**只有** `MinHook.h` 和四个 `.lib`，
-> 上游的 `LICENSE.txt` 并未随源码一起 vendored。上述原文是从 `MinHook.h`
-> 头部逐字复制的 —— 这是满足条款 2 的**唯一**依据，改动本文件前请先确认这点。
-> 若上游日后发布新的补丁版本，重新拉取时记得同步这一节。
+> MinHook 在 `libraries/MinHook/` 下只有 `MinHook.h` 和四个 `.lib`，上游的
+> `LICENSE.txt` 没有一起 vendored。上面这段原文是从 `MinHook.h` 头部逐字复制的，
+> 也是满足条款 2 的唯一依据。上游发新补丁版本时，重新拉取后要同步这一节。
 
 ---
 
@@ -96,8 +95,8 @@ LGPL-3.0 的正文**不在本仓库单独存放**，原因是：LGPL-3.0 第 0 �
 | 分发二进制（静态链接） | LGPL-3.0 §4(d)(0)：随目标码提供 "Corresponding Source" | ✅ 本项目整体为 GPL-3.0 开源，源码即随包提供 |
 | 用户可重新链接 | LGPL-3.0 §4(d)(1)：允许用户用自己的修改版库重新链接 | ✅ 完整构建脚本在库，用户可自编替换 |
 
-> `wow64ext` 是本文档中**唯一**的 copyleft（弱）组件。它并入 GPL-3.0 项目是允许的
-> （LGPL-3.0 §4 许可与 GPL-3.0 组合），但**不要**把它单独摘出去放进一个闭源产品。
+> `wow64ext` 是本文档中唯一的 copyleft（弱）组件。它并入 GPL-3.0 项目是允许的
+> （LGPL-3.0 §4 许可与 GPL-3.0 组合），但不能单独摘出去放进闭源产品。
 
 ---
 
