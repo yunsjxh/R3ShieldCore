@@ -38,7 +38,9 @@ mkdir -p obj/rgprobe
 
 build_one() {
     local arch="$1" host="$2" expect="$3"
-    r3sc_export_msvc_env "${ARCH:-x64}"
+    # ★ 用本函数的 $arch（x86/x64），不能写 ${ARCH:-x64}：
+    #   本脚本没有 ARCH 变量，写死 x64 会让 x86 探针链到 x64 库（LNK4272）。
+    r3sc_export_msvc_env "$arch"
 
     local CL="$MSVC_ROOT/bin/Hostx64/$host/cl.exe"
     local LINK="$MSVC_ROOT/bin/Hostx64/$host/link.exe"
