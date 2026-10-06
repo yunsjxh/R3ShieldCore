@@ -15,9 +15,10 @@ user-mode registry behavior interceptor with four modes: `log`, `block`, `ask`
 > The project has since grown to **18 monitored object classes** (process /
 > thread / driver / network / camera+audio / input hooks / screen / DLL load /
 > clipboard / process spawn / service ACL / COM hijack / scheduled task / token
-> theft / WMI subscription / host hijack / file) — see
-> [`../docs/HANDOVER.md`](../docs/HANDOVER.md) for the full, authoritative
-> picture (Hook inventory, ABI history, pitfall archive).
+> theft / WMI subscription / host hijack / file) — see the repository-root
+> [`README.md`](../README.md) for the full, authoritative picture
+> (monitored object classes, interception modes, known limits), and
+> [`docs/CODE-REVIEW.md`](../docs/CODE-REVIEW.md) for the architecture review.
 
 ## Covered APIs
 

@@ -1,0 +1,111 @@
+name: Bug 报告
+description: 引擎行为不对、保护失效、崩溃 —— 用这个模板
+title: "[Bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ## 先确认三件事，能省掉一半来回
+
+        1. **这不是安全问题？** 安全问题请走
+           [私有漏洞报告](https://github.com/yunsjxh/R3ShieldCore/security/advisories/new)，
+           **不要**开公开 issue。
+        2. **读完了 [`SECURITY.md`](https://github.com/yunsjxh/R3ShieldCore/blob/main/SECURITY.md) 吗？**
+           "能用直 syscall 绕过"、"拦不住内核态操作"、"没有单实例互斥体" 都是
+           **已文档化的设计边界**，不是 bug。
+        3. **注意使用风险**：本工具会 hook 未文档化的 `Nt*` 接口，可能让目标进程
+           崩溃或死锁。请在**虚拟机或一次性环境**里复现。
+
+  - type: checkboxes
+    id: precheck
+    attributes:
+      label: 前置确认
+      options:
+        - label: 我已阅读 SECURITY.md 的「明确不接受为漏洞的类别」一节
+          required: true
+        - label: 我已确认这不是安全问题（否则我走私有报告通道）
+          required: true
+
+  - type: input
+    id: commit
+    attributes:
+      label: 版本 / 提交号
+      description: 运行 `git rev-parse HEAD`；若是 Release 包，写出包名
+      placeholder: 4f6b1b2 / R3ShieldCore-x64.zip (2026-10-06)
+    validations:
+      required: true
+
+  - type: dropdown
+    id: arch
+    attributes:
+      label: 出问题的架构
+      description: 32 位与 64 位是两份独立 DLL，**分别验证过吗？**
+      options:
+        - x64（64 位进程）
+        - x86（32 位进程）
+        - 两者都有
+    validations:
+      required: true
+
+  - type: input
+    id: winver
+    attributes:
+      label: Windows 版本
+      description: "`winver` 里的完整内部版本号（如 26100.2314）"
+      placeholder: Windows 11 24H2 / 26100.2314
+    validations:
+      required: true
+
+  - type: dropdown
+    id: mode
+    attributes:
+      label: 引擎当前模式（`mode=`）
+      description: "`ask` 是**唯一**会弹窗询问的模式；`block_all` 一律直接拒、不弹窗"
+      options:
+        - log
+        - block
+        - ask
+        - block_all
+        - block_all_safe
+        - 不清楚
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤
+      description: 越具体越好。涉及配置时贴出 `r3shieldcore.ini` 的相关段（**删掉本机路径**）
+      placeholder: |
+        1. 以管理员启动引擎，mode=block
+        2. 打开 X
+        3. 触发 Y
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: 期望行为 vs 实际行为
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: 日志
+      description: |
+        `events.log` / `stats.json` 的相关片段。
+        **注意**：日志里可能含本机路径与进程名，贴之前请自行脱敏。
+      render: text
+    validations:
+      required: false
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: 补充信息
+      description: 是否装了其它安全软件？是否在虚拟机里？是否开了 HVCI / VBS / Secure Boot？
+    validations:
+      required: false
