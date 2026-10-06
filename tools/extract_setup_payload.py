@@ -226,6 +226,7 @@ def main():
 
     g_pass = 0
     g_fail = 0
+    g_skip = 0
 
     def check(ok, label, detail=""):
         nonlocal g_pass, g_fail
@@ -236,6 +237,13 @@ def main():
         print("%s %s%s" % ("  ok  " if ok else "  FAIL", label,
                            ("  -- " + detail) if detail else ""))
         return ok
+
+    def skip(label, detail=""):
+        """★ 跳过必须**可见**并计数：静默不计入 => 「本包故意不含驱动」和
+        「全绿」输出完全一样，下次就分不出来了。"""
+        nonlocal g_skip
+        g_skip += 1
+        print("%s %s%s" % ("  skip", label, ("  -- " + detail) if detail else ""))
 
     print("=== 安装包 payload 解包比对（铁律 153/162）===")
     print("安装包 : %s" % SETUP_EXE)
@@ -349,10 +357,23 @@ def main():
     #   有了这条断言，改名会在这里直接红，且原因写在脸上。
     print("\n--- 驱动 payload 的相对路径登记 ---")
     rels = {r[1] for r in rows}
-    check(DRIVER_REL in rels,
-          "清单里有驱动条目 '%s'" % DRIVER_REL,
-          "清单里带 driver/ 的条目=%s" % sorted(r for r in rels if "driver" in r))
-    check(os.path.isfile(DRIVER_SRC), "驱动构建源存在", DRIVER_SRC)
+    # ★ 驱动是**可选**的（README「构建内核驱动（可选）」）：没编驱动时
+    #   gen_payload_rc.py 出的就是「仅用户态包」，清单里本来就没有 driver/ 条目。
+    #   这和「改名了导致本工具匹配不上」是**两件事**，必须分开：
+    #     · 清单里没有任何 driver/ 条目  -> 仅用户态包，SKIP（不算错）；
+    #     · 有 driver/ 条目但不是 DRIVER_REL -> 真 bug，FAIL（安装那步会静默跳过）。
+    _drv_entries = sorted(r for r in rels if r.startswith("driver/"))
+    if DRIVER_REL in rels:
+        check(True, "清单里有驱动条目 '%s'" % DRIVER_REL,
+              "清单里带 driver/ 的条目=%s" % _drv_entries)
+        check(os.path.isfile(DRIVER_SRC), "驱动构建源存在", DRIVER_SRC)
+    elif not _drv_entries:
+        skip("清单里没有驱动条目 —— 本包是「仅用户态包」（构建时未编驱动）",
+             "对照物 driver/build/r3shieldcore_kernel.sys 不存在，无需比对")
+    else:
+        check(False, "清单里有驱动条目 '%s'" % DRIVER_REL,
+              "清单里带 driver/ 的条目=%s（名字对不上 ⇒ 安装时驱动那步会静默跳过）"
+              % _drv_entries)
 
     # ---- ④ 卸载脚本（GBK 原样内嵌，不压缩）-------------------------------
     print("\n--- 卸载脚本（ID %d，原样内嵌不压缩）---" % RES_ID_UNINSTALL)
@@ -374,9 +395,11 @@ def main():
         except zlib.error:
             check(True, "卸载脚本确实是未压缩的原样字节")
 
-    print("\n=== 结果：%d 通过 / %d 失败 ===" % (g_pass, g_fail))
+    _sk = ("，%d 跳过" % g_skip) if g_skip else ""
+    print("\n=== 结果：%d 通过 / %d 失败%s ===" % (g_pass, g_fail, _sk))
     if g_fail == 0:
-        print("PASS：安装包里装的就是 dist 里现在这些文件（逐条 md5 相等）。")
+        print("PASS：安装包里装的就是 dist 里现在这些文件（逐条 md5 相等）。%s"
+              % ("★ 注意：本包**不含内核驱动**（仅用户态包）。" if g_skip else ""))
     else:
         print("FAIL：安装包与 dist 不一致 —— **不要发布**，重跑 installer/build_setup.sh。")
     return 0 if g_fail == 0 else 1
