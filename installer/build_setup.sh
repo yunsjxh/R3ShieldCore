@@ -47,9 +47,16 @@ OUT_NAME="R3ShieldCore-Setup.exe"
 OUT_EXE="$PROJECT_ROOT/$DIST_DIR/$OUT_NAME"
 
 PY="$PYTHON"   # 由 scripts_env.sh 自动探测（见文件头）
-# ★ 工具链：MSYS2 ucrt64。两个都必须存在，否则直接停。
-WINDRES="/d/msys64/ucrt64/bin/windres.exe"
-OBJDUMP="/d/msys64/ucrt64/bin/objdump.exe"
+# ★ 工具链：MSYS2 ucrt64。windres/objdump 与 gcc 同目录，所以从 $GCC 推导，
+#   不写死 /d/msys64/...（换机器/换安装位置就编不了）。可用 WINDRES/OBJDUMP 覆盖。
+if [ -n "${GCC:-}" ]; then
+    _gccdir="$(dirname "$GCC")"
+    WINDRES="${WINDRES:-$_gccdir/windres.exe}"
+    OBJDUMP="${OBJDUMP:-$_gccdir/objdump.exe}"
+else
+    WINDRES="${WINDRES:-}"
+    OBJDUMP="${OBJDUMP:-}"
+fi
 
 MODE="${1:-build}"
 

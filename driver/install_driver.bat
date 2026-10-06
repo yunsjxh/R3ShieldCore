@@ -47,8 +47,24 @@ rem ---- 签名预检 ----
 rem 没签名的驱动在 x64 上根本加载不了，而报出来的错只有
 rem "拒绝访问(5)" 或 0xC0000428，看不出是签名问题。先查一遍。
 set SIGNTOOL=
-for /f "delims=" %%i in ('dir /b /s /o-n "D:\Windows Kits\10\bin\*\x64\signtool.exe" 2^>nul') do (
-    if not defined SIGNTOOL set SIGNTOOL=%%i
+rem ★ 不写死盘符：Windows Kits 通常装在 %ProgramFiles(x86)% 下，
+rem   也可能在别的盘。下面四个根依次找，找到即停。
+rem   装到别处：把那台的盘根补进这一行，或先设
+rem   环境变量 SIGNTOOL=完整路径 直接跳过搜索。
+rem
+rem 【注意】这里不能写 dir /b /s "...\bin\*\x64\signtool.exe"：
+rem   dir 不支持路径**中间**的 * （通配符只能在最后一段）。
+rem   它的表现是 exit=1 + 零输出，而 for /f 对“命令失败”和
+rem   “命令成功但没输出”一视同仁 —— 静默 0 次迭代。
+rem   结果就是签名预检从来没跑过，每次都安静地走到
+rem   “找不到 signtool.exe，跳过签名预检” —— 看起来像本机没装 SDK。
+rem   （已实测：改成 for /d + if exist 就能正确找到。）
+for %%R in ("%ProgramFiles(x86)%" "%ProgramFiles%" "C:" "D:") do (
+    if not defined SIGNTOOL (
+        for /d %%V in ("%%~R\Windows Kits\10\bin\*") do (
+            if not defined SIGNTOOL if exist "%%~V\x64\signtool.exe" set "SIGNTOOL=%%~V\x64\signtool.exe"
+        )
+    )
 )
 if defined SIGNTOOL (
     echo [1/5] 校验签名...

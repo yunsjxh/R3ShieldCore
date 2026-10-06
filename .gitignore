@@ -35,8 +35,13 @@ build_svc/
 ArkTest/
 BuildCheck/
 Release-x*/
-Dist/
 build/
+#   ⚠️ 这里**不能**写 `Dist/`。Windows 上 git 默认 core.ignorecase=true，
+#      `Dist/` 会把小写的 `dist/`（= 发布目录）一起匹配掉，而且
+#      "父目录被排除时，里面的文件无法再用 ! 放回来" ⇒ 整棵 dist/ 被吞。
+#      实测症状：`git check-ignore -v dist/R3ShieldCore-x64/r3shieldcore.ini`
+#      报的是 `.gitignore:38:Dist/`，而你在第 75 行写的那些 ! 规则**全部失效**、
+#      且不会报任何错。（铁律 116：大小写变体会漏，而检查器报绿。）
 
 # ---- 可执行/驱动产物 ----
 #   ★ 例外：dist/ 下的正式安装包要发布（见文件末尾 ! 规则）
@@ -72,9 +77,23 @@ tools/toastclick_out.txt
 #   ★ 例外：gbk_gate_fixture.txt 是 check_source_gbk.py 的**负对照夹具**，要进仓库
 !tools/gbk_gate_fixture.txt
 
-# ---- 发布目录（绿色版解包产物，属构建输出，由 build_dist_zip.sh 生成）----
-#   源码仓库只放源码；二进制走 GitHub Releases。
-dist/R3ShieldCore-x64/
+# ---- 发布目录（★ 装配目录：二进制 + 手写源码混放）----
+#   ⚠️ 踩过的坑（后果是"全新 clone 直接编不出发布包"）：
+#     原来这里写的是 `dist/R3ShieldCore-x64/`，把**整个目录**忽略了。
+#     可这个目录里不止有构建出来的 exe/dll，还躺着 14 个**手写文件**：
+#       5 个 .ini（配置）+ 5 个 .bat（部署脚本）+ 4 个 .md/.txt（用户文档）
+#     它们没有任何脚本会生成，就是源码。整目录一忽略 ⇒ 仓库里一个 ini 都
+#     没有 ⇒ clone 下来 build_dist_zip.sh 直接报"缺少必备文件"、
+#     installer/build_setup.sh 也过不了预检。
+#     ★ 注意这类事故"查文件存在"的闸门挡不住：闸门（build_dist_zip.sh）
+#       自己就在被忽略的那一侧，本机有文件所以永远是绿的。
+#   规则：目录**不整体忽略**，只靠上面的 *.exe / *.dll / *.sys 规则忽略
+#         二进制，手写的那几类用 ! 放回来。
+dist/R3ShieldCore-x64/*
+!dist/R3ShieldCore-x64/*.ini
+!dist/R3ShieldCore-x64/*.bat
+!dist/R3ShieldCore-x64/*.md
+!dist/R3ShieldCore-x64/*.txt
 dist/R3ShieldCore-x64.zip
 
 # ---- 编辑器 / 系统 ----

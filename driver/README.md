@@ -244,6 +244,24 @@ Git-Bash/MSYS 会把**以 `/` 开头的参数当成路径**做 POSIX→Windows �
 > —— 闸门一直显示 PASS。已改成递归扫全仓。改完立刻抓到
 > `driver/sign_driver.ps1` 里一处真实的"注释吞掉下一行"。
 
+### 6.4b `dir` 通配符位置闸门（`tools/check_bat_dir_wildcard.py`）
+
+`dir` **只支持最后一段**带通配符。写成中间段带 `*` / `?` 时它不报错、不提示，
+就是 **exit=1 + 零输出**：
+
+```
+dir /b /s "D:\Windows Kits\10\bin\*\x64\signtool.exe"   -> exit=1，零输出
+dir /b /s "D:\Windows Kits\10\bin\*.exe"                -> 正常
+```
+
+放进 `for /f` 里就变成**静默 0 次迭代**（`for /f` 对"命令失败"和
+"命令成功但没输出"一视同仁），最后落到"找不到 X，跳过这一步"。
+
+★ 这个坑**真踩过**：`install_driver.bat` 的签名预检就是这么坏的 ——
+它从来没找到过 signtool，所以**签名预检从来没执行过**，而每次输出都是那句
+无辜的"找不到 signtool.exe，跳过签名预检"。已改成 `for /d` + `if exist`，
+并加闸门防复发（已接进 `build_driver.sh` 预检 0b，带 `--selftest` 负对照）。
+
 ### 6.5 产物校验（构建脚本会自动做）
 
 ```

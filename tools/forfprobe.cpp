@@ -160,9 +160,20 @@ int main() {
     std::string batdir = tmpdir + "\\forfprobe";
     CreateDirectoryA(batdir.c_str(), nullptr);
     if (GetFileAttributesA(batdir.c_str()) == INVALID_FILE_ATTRIBUTES) {
-        // 退到仓库根的 _t 下（一定有写权限）
-        batdir = "D:\\\xe7\x94\xa8\xe6\x88\xb7\xe6\x80\x81\xe6\x9d\x80\xe8\xbd\xaf\\_t\\forfprobe";
-        CreateDirectoryA("D:\\\xe7\x94\xa8\xe6\x88\xb7\xe6\x80\x81\xe6\x9d\x80\xe8\xbd\xaf\\_t", nullptr);
+        // 退到**本 exe 所在目录**下的 forfprobe —— 这个程序就是我们自己编出来
+        // 放进仓库里跑的，它所在的目录一定有写权限。
+        // ★ 这里曾经硬编码成开发机的 `D:\<工作区>\_t\forfprobe`（用 \xNN
+        //   十六进制转义写的，所以明文 grep 永远扫不到）。两个后果：
+        //     1) 换机器 / 换 clone 位置 ⇒ 这个分支必然失败（而它恰恰是
+        //        "主路径失败时"的兜底，等于兜底本身也废了）；
+        //     2) 把开发机的绝对路径带进开源仓库。
+        //   所以改成跟着 exe 走，不依赖任何固定盘符。
+        char self[MAX_PATH] = { 0 };
+        GetModuleFileNameA(nullptr, self, MAX_PATH);
+        std::string exedir(self);
+        size_t slash = exedir.find_last_of("\\/");
+        if (slash != std::string::npos) exedir.resize(slash);
+        batdir = exedir + "\\forfprobe";
         CreateDirectoryA(batdir.c_str(), nullptr);
     }
     std::printf("[dir] %s\n\n", batdir.c_str());
