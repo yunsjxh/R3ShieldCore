@@ -284,7 +284,14 @@ bash build_dist_zip.sh     # -> dist/R3ShieldCore-x64.zip
 ├── dist/                    发布产物（构建生成；随包文档入库，见 .gitignore）
 ├── build.sh                 引擎构建入口
 ├── scripts_env.sh           ★ 工具链自动探测（所有脚本共用）
-└── deploy_dist.sh           装配发布目录
+├── deploy_dist.sh           装配发布目录
+├── README.md                本文档
+├── LICENSE                  GPL-3.0 全文
+├── THIRD-PARTY-NOTICES.md   ★ 第三方组件的许可原文（二进制分发必读）
+├── SECURITY.md              安全模型边界 + 漏洞上报方式
+├── CONTRIBUTING.md          贡献指南（构建前置 / 闸门要求 / 提交规范）
+├── CHANGELOG.md             版本变更记录
+└── .github/                 issue / PR 模板 + CI（跑 tools/ 下的闸门脚本）
 ```
 
 ## 8. 配置
@@ -420,15 +427,23 @@ python installer/selftest_setup.py --no-gui --no-install   # 安装程序自测�
 ## 12. 许可
 
 [GNU General Public License v3.0](LICENSE)。
+Copyright (C) 2026 yunsjxh。
 
 本项目的注入/hook 框架派生自
 [m417z/global-inject-demo](https://github.com/m417z/global-inject-demo)
-（见 `R3ShieldCore/README.md`），遵循其原始许可。
-第三方组件：
+（GPL-3.0，见 `R3ShieldCore/README.md`），遵循其原始许可。
 
-- **MinHook** —— BSD 2-Clause，© 2009-2017 Tsuda Kageyu
-  （`R3ShieldCore/R3ShieldCoreLib/libraries/MinHook/`）
-- **wow64ext** —— GNU LGPL-3.0，© 2014 ReWolf
-  （`R3ShieldCore/R3ShieldCoreLib/libraries/wow64ext/`）
-- **WIL**（Windows Implementation Library）—— MIT
-  （`R3ShieldCore/shared/libraries/wil/`）
+`R3ShieldCore/R3ShieldCoreLib/inject-shellcode/` 又派生自
+[stephenfewer/ReflectiveDLLInjection](https://github.com/stephenfewer/ReflectiveDLLInjection)
+（BSD 3-Clause，© 2012 Stephen Fewer / Harmony Security）。
+
+其余第三方组件：
+
+| 组件 | 许可 | 版权 | 位置 |
+|---|---|---|---|
+| MinHook | BSD 2-Clause | © 2009-2017 Tsuda Kageyu | `R3ShieldCore/R3ShieldCoreLib/libraries/MinHook/` |
+| wow64ext | GNU LGPL-3.0 | © 2014 ReWolf | `R3ShieldCore/R3ShieldCoreLib/libraries/wow64ext/` |
+| WIL（Windows Implementation Library） | MIT | © Microsoft | `R3ShieldCore/shared/libraries/wil/` |
+
+各组件的**完整许可原文**、以及与二进制分发相关的义务说明，见
+[`THIRD-PARTY-NOTICES.md`](THIRD-PARTY-NOTICES.md)。
