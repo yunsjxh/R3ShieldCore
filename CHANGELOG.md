@@ -11,17 +11,7 @@
 
 ## [未发布]
 
-- 修复：`LICENSE` 还原为 **GPL-3.0 逐字原文**。此前在文件顶部加了 20 行版权声明，
-  导致 GitHub 判定为 `Other / NOASSERTION` 而非 GPL-3.0（仓库侧栏许可证标识丢失）。
-  项目版权声明改由 README §12 与 THIRD-PARTY-NOTICES.md 承载。
-  同时把 `R3ShieldCore/LICENSE` 一并归一（它离官方文本差 3 行 ——
-  上游把 GPL 附录里的 `<one line to give the program's name…>` 占位符
-  替换成了自己的名字）。
-
-- 文档：README 末尾加 **Star History** 图表（star-history.com 实时生成）
-- 文档：README 顶部补**项目简介**（监控哪 18 类行为、有几种拦截选择、规模、隐私姿态）
-- 文档：README 顶部改为「使用前必读」警示块，明确写出**项目不成熟 / 容易被绕过 /
-  请勿作为唯一终端防护软件 / 误报较多**；§11 免责声明同步。SECURITY.md 同步。
+暂无。
 
 ---
 
@@ -99,6 +89,24 @@ DLL 加载、剪贴板、进程创建旁路、服务安全描述符、COM 激活
 - **两个死闸门**：闸门判据失效但仍报绿
 - **本机痕迹**：清除开发机路径、证书信息、内部诊断全文
 - **`.bat` 通配符闸门**：补齐缺失的检查
+- **`LICENSE` 被 GitHub 判成 `Other`**：文件与官方 GPL-3.0 文本有两处偏差
+  （顶部多加的 20 行版权声明 + 上游把 GPL 附录占位符换成了自己的名字），
+  相似度掉到阈值下。已用 `gh api licenses/gpl-3.0` 的权威文本整份替换，
+  项目版权声明改由 README §12 与 `THIRD-PARTY-NOTICES.md` 承载
+- **CI 在全新 clone 上必红**：两条判据依赖"本机已构建过"
+  （`check_payload_manifest.py` 的判据 E 与它自己的 `--selftest`）。
+  后者**本来就是坏的** —— 注入锚点写死的文本早已改过，9 条负对照一条都没跑过
+
+### 文档
+
+- README 顶部改为「使用前必读」，明确写出**项目不成熟 / 容易被绕过 /
+  请勿作为唯一终端防护软件 / 误报较多**；§11 免责声明与 `SECURITY.md` 同步
+- README 顶部补**项目简介**（监控哪 18 类行为、有几种拦截选择、规模、隐私姿态）
+- README 新增「下载」节与末尾 **Star History** 图表
+- 新增 `SECURITY.md`（安全模型边界 + 私有漏洞上报 + 不接受为漏洞的类别清单）、
+  `CONTRIBUTING.md`、`CHANGELOG.md`、`THIRD-PARTY-NOTICES.md`
+- 新增 `.github/`：issue 表单、PR 模板、CI（6 个源码闸门 + 3 条负对照）
+- 修复 `R3ShieldCore/README.md` 指向内部开发笔记的死链
 
 ### 安全
 
