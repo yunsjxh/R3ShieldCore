@@ -82,6 +82,21 @@ if [ -f "../tools/check_source_gbk.py" ]; then
     echo ""
 fi
 
+# ---- 预检 0b：.bat 里不许出现 `dir` 中间段带通配符 ----
+# 为什么：`dir "X:\a\*\b.exe"` 不报错、不提示，就是 exit=1 + 零输出；
+# 而 `for /f` 对"命令失败"和"命令成功但没输出"一视同仁，于是**静默 0 次迭代**，
+# 最后落到"找不到 X，跳过这一步"——看起来像"这台机器没装那个东西"。
+# ★ 真踩过：install_driver.bat 的签名预检就是这么坏的（从来没执行过）。
+# 详见 tools/check_bat_dir_wildcard.py 顶部说明（铁律 100/124）。
+if [ -f "../tools/check_bat_dir_wildcard.py" ]; then
+    if ! python ../tools/check_bat_dir_wildcard.py; then
+        echo ""
+        echo "BUILD FAILED (预检：.bat 的 dir 通配符位置)"
+        exit 1
+    fi
+    echo ""
+fi
+
 # ---- 内核头/库存在性预检：缺了就直说，别让编译器报一句含糊的 ntddk.h 找不到 ----
 KM_INC="$WDK_ROOT/Include/$WDK_SDK_VERSION/km"
 KM_LIB="$WDK_ROOT/Lib/$WDK_SDK_VERSION/km/x64"

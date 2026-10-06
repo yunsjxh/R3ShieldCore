@@ -70,11 +70,23 @@ $root    = Split-Path $PSScriptRoot -Parent
 if (-not $SysPath) { $SysPath = Join-Path $PSScriptRoot 'build\r3shieldcore_kernel.sys' }
 
 function Find-SignTool {
-    $candidates = Get-ChildItem 'D:\Windows Kits\10\bin' -Directory -ErrorAction SilentlyContinue |
-        Sort-Object Name -Descending |
-        ForEach-Object { Join-Path $_.FullName 'x64\signtool.exe' }
+    # ★ 不写死盘符：先读环境变量，再依次扫常见根。
+    $roots = @()
+    if ($env:SIGNTOOL_DIR) { $roots += $env:SIGNTOOL_DIR }
+    foreach ($d in @($env:ProgramFiles, ${env:ProgramFiles(x86)})) {
+        if ($d) { $roots += (Join-Path $d 'Windows Kits\10\bin') }
+    }
+    $roots += 'C:\Windows Kits\10\bin', 'D:\Windows Kits\10\bin'
+    $candidates = @()
+    foreach ($r in $roots) {
+        if (Test-Path $r) {
+            $candidates += Get-ChildItem $r -Directory -ErrorAction SilentlyContinue |
+                Sort-Object Name -Descending |
+                ForEach-Object { Join-Path $_.FullName 'x64\signtool.exe' }
+        }
+    }
     foreach ($c in $candidates) { if (Test-Path $c) { return $c } }
-    throw '找不到 signtool.exe（在 D:\Windows Kits\10\bin\<ver>\x64\ 下）'
+    throw "找不到 signtool.exe（已扫：$($roots -join ' | ')）。可用 `$env:SIGNTOOL_DIR 指定。"
 }
 
 function Assert-Admin {
