@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <assemblyIdentity type="win32" name="R3ShieldCore.DiagAutostart" version="1.0.0.0" processorArchitecture="amd64"/>
+  <!--
+    诊断器**故意不** requireAdministrator：
+      · 大部分项（注册表、服务键、进程枚举）普通用户就能读；
+      · 只有读 Program Files 下的日志需要提权 —— 源码里会对这种情况
+        给出明确的「请以管理员身份运行」提示，而不是静默失败。
+    这样用户双击就能跑，看到提示后再决定要不要提权。
+  -->
+  <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
+    <security>
+      <requestedPrivileges>
+        <requestedExecutionLevel level="asInvoker" uiAccess="false"/>
+      </requestedPrivileges>
+    </security>
+  </trustInfo>
+  <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">
+    <application>
+      <supportedOS Id="{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}"/>
+      <supportedOS Id="{1f676c76-80e1-4239-95bb-83d0f6d0da78}"/>
+      <supportedOS Id="{4a2f28e3-53b9-4441-ba9c-d69d4a4a6e38}"/>
+    </application>
+  </compatibility>
+</assembly>
