@@ -32,8 +32,17 @@ selftest_setup.py —— 原生安装程序的自测（**不碰系统**）。
 
 用法
 ====
-    python installer/selftest_setup.py
-    python installer/selftest_setup.py --no-gui     # 跳过 GUI 检查
+    python installer/selftest_setup.py --no-gui --no-install   # ★ 默认推荐（不碰系统）
+    python installer/selftest_setup.py --no-gui                # 跑到第 3 层
+    python installer/selftest_setup.py --run-engine            # 第 4 层：会**真启动引擎**
+
+★★★ 第 4 层必须**显式**加 `--run-engine`。
+    理由：它是本仓库**唯一会启动引擎**的一层，而引擎的全局注入会 hook 本机
+    **所有**进程 —— 实测会把编辑器一起 hook ⇒ 编辑器崩。
+    靠"忘了加 `--no-install`"来触发一个会 hook 全机的动作，代价太高。
+    没有 `--run-engine` 时第 4 层报 `[SKIP]` 并**计入结论行** —— 不静默跳过，
+    所以"整层没跑"和"全绿"不会看起来一样（铁律 137 / 178）。
+    ★ 要真跑第 4 层，请到**虚拟机 / 另一台机器**上跑。
 """
 
 import ctypes
@@ -1142,6 +1151,19 @@ def main():
         test_gui(t)
     if "--no-install" in sys.argv:
         print("\n=== 4/4 真机安装->卸载：已跳过（--no-install）===")
+    elif "--run-engine" not in sys.argv:
+        # ★★★ 第 4 层是本仓库**唯一会启动引擎**的地方，而引擎的全局注入会 hook
+        #   本机**所有**进程 —— 实测会把编辑器一起 hook ⇒ 编辑器崩。
+        #   所以它必须是**显式 opt-in**：不能靠"忘了加 --no-install"来触发一个
+        #   会 hook 全机的动作。
+        #   ★ 报 SKIP 而不是静默跳过：静默会让"整层没跑"和"全绿"看起来一样
+        #     （铁律 137 / 178）。结论行里也会带上跳过计数。
+        print("\n=== 4/4 真机安装->卸载：已跳过（缺 --run-engine）===")
+        print("    本层会**真的启动引擎**，而引擎的全局注入会 hook 本机所有进程")
+        print("    （实测会把编辑器一起 hook ⇒ 编辑器崩）。")
+        print("    要跑请显式加 --run-engine，并**建议在虚拟机 / 另一台机器上**跑：")
+        print("        python installer/selftest_setup.py --run-engine")
+        t.skip("第 4 层「真机安装->卸载」未运行（缺 --run-engine）")
     else:
         test_install_uninstall(t)
 
