@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: ⚠️ 安全问题 / 漏洞
+    url: https://github.com/yunsjxh/R3ShieldCore/security/advisories/new
+    about: 请勿开公开 issue。用私有漏洞报告通道，详见 SECURITY.md。
+  - name: 先读：已知边界（很可能不是 bug）
+    url: https://github.com/yunsjxh/R3ShieldCore/blob/main/SECURITY.md
+    about: "「能用直 syscall 绕过」「拦不住内核态操作」等均为已文档化的设计边界，不会被当作漏洞处理。"

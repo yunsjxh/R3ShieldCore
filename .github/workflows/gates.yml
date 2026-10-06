@@ -1,0 +1,49 @@
+name: gates
+
+# 只跑**不需要编译器**的源码闸门。
+# 完整构建（cl.exe + link.exe + Windows SDK + WDK + MSYS2）在 GitHub 托管 runner
+# 上代价高且易假绿，刻意不放进 CI —— 构建验证请在本地按 CONTRIBUTING.md 做。
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # 闸门脚本会打印中文与 `⇒` 一类字符；runner 默认控制台编码可能不是 UTF-8
+  PYTHONUTF8: '1'
+  PYTHONIOENCODING: utf-8
+
+jobs:
+  source-gates:
+    name: 源码闸门
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: 源码编码 / GBK 闸门
+        run: python tools/check_source_gbk.py
+
+      - name: 带空格程序名的引号闸门
+        run: python tools/check_spaced_name_quoted.py
+
+      - name: .bat 目录通配符闸门
+        run: python tools/check_bat_dir_wildcard.py
+
+      - name: .bat for /f 重定向闸门
+        run: python tools/check_bat_forf_redirect.py
+
+      - name: 环境变量名一致性闸门
+        run: python tools/check_env_switch_names.py
+
+      - name: payload 清单闸门
+        run: python tools/check_payload_manifest.py

@@ -203,15 +203,24 @@ def is_ps_command(line: str) -> bool:
     return "-command" in low or "powershell" in low and " -c " in low
 
 
-def is_echo_occurrence(line: str, idx: int) -> bool:
-    """这个出现位置是不是 echo 的参数？
+def is_raw_arg_occurrence(line: str, idx: int) -> bool:
+    """这个出现位置是不是"整行吃参数"的命令的参数？
 
-    `echo [错误] 未找到 R3 ShieldCore.exe` —— echo 只负责把整行原样打出来，
-    空格不构成问题，属于**假阳性**，要放过。
+    这类命令把**字节原样**交给后面的东西，不按空格分词，所以空格不构成问题，
+    属于**假阳性**，要放过。目前三类：
+
+      · `echo [错误] 未找到 R3 ShieldCore.exe` —— echo 原样打印
+      · `rem` 行（已在 is_comment 里挡掉，这里兜一手行内的 rem）
+      · `title R3 ShieldCore 开机自启诊断` —— cmd 的 `title` 取**整行余下部分**
+        作为窗口标题，同样不分词。
+
+    ★ 为什么 title 要特判：`title "R3 ShieldCore 诊断"` 会把**引号本身**显示在
+      标题栏里，所以这里**不能**用"加引号"来消警报 —— 只能从判据上放过。
+      （实测：diag.cmd:18、diag_autostart.bat:4 两处命中，均为本类假阳性。）
     """
     seg = line[segment_start(line, idx):idx].strip().lstrip("@").strip()
     head = seg.split(None, 1)[0].lower() if seg.split() else ""
-    return head in ("echo", "rem")
+    return head in ("echo", "rem", "title")
 
 
 def is_comment(line: str, ext: str) -> bool:
@@ -274,7 +283,7 @@ def main() -> int:
                     start = idx + 1
                     if not st[idx]:
                         # 第一层：连引号都没有 —— shell / cmd 直接按空格拆参
-                        if is_echo_occurrence(line, idx):
+                        if is_raw_arg_occurrence(line, idx):
                             continue
                         bad.append(f"{rel}:{lineno}: 引号外 -> {line.strip()}")
                     elif ps_cmd and not st1[idx]:
