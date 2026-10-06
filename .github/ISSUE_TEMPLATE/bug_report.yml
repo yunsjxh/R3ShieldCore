@@ -6,16 +6,16 @@ body:
   - type: markdown
     attributes:
       value: |
-        ## 先确认三件事，能省掉一半来回
+        ## 先确认三件事
 
-        1. **这不是安全问题？** 安全问题请走
+        1. **是不是安全问题？** 安全问题请走
            [私有漏洞报告](https://github.com/yunsjxh/R3ShieldCore/security/advisories/new)，
-           **不要**开公开 issue。
-        2. **读完了 [`SECURITY.md`](https://github.com/yunsjxh/R3ShieldCore/blob/main/SECURITY.md) 吗？**
+           不要开公开 issue。
+        2. **先读 [`SECURITY.md`](https://github.com/yunsjxh/R3ShieldCore/blob/main/SECURITY.md)。**
            "能用直 syscall 绕过"、"拦不住内核态操作"、"没有单实例互斥体" 都是
-           **已文档化的设计边界**，不是 bug。
-        3. **注意使用风险**：本工具会 hook 未文档化的 `Nt*` 接口，可能让目标进程
-           崩溃或死锁。请在**虚拟机或一次性环境**里复现。
+           已文档化的设计边界，不是 bug。
+        3. **注意使用风险：** 本工具会 hook 未文档化的 `Nt*` 接口，可能让目标进程
+           崩溃或死锁，请在虚拟机或一次性环境里复现。
 
   - type: checkboxes
     id: precheck
@@ -40,7 +40,7 @@ body:
     id: arch
     attributes:
       label: 出问题的架构
-      description: 32 位与 64 位是两份独立 DLL，**分别验证过吗？**
+      description: 32 位与 64 位是两份独立 DLL，请分别验证
       options:
         - x64（64 位进程）
         - x86（32 位进程）
