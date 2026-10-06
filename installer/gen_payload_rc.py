@@ -123,6 +123,18 @@ def main():
         print("  [缺] 以下文件不存在：")
         for m in missing:
             print("       " + m)
+        # ★ 只列"缺什么"是不够的 —— 开源用户 clone 下来直接跑本脚本时，
+        #   看到的是一串路径，不知道**下一步该做什么**。
+        #   所以按**来源**分组给出可执行的动作（铁律 97：不可诊断的失败等于没报）。
+        print("")
+        print("  怎么办（按文件来源分三类）：")
+        print("    · dist/R3ShieldCore-x64/ 下的二进制")
+        print("        bash build.sh Release     # 编引擎（产物在 R3ShieldCore/Release/）")
+        print("        bash deploy_dist.sh       # ★ 把产物搬进 dist/ 并验收（缺了就会缺这一批）")
+        print("    · driver/build/r3shieldcore_kernel.sys")
+        print("        bash driver/build_driver.sh   # 需要 WDK；驱动不签名只能在测试签名模式加载")
+        print("    · installer/uninstall.bat")
+        print("        这个文件在版本库里，缺了说明 clone/解压不完整。")
         return 1
 
     res_dir = os.path.join(out_dir, "_res")

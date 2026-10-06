@@ -102,6 +102,25 @@ bash build.sh Release x64  # 只编 x64
 > 不执行命令行构建；`MSBuild.exe` 被安全策略按名字拦截。脚本用的是同一套编译器、
 > 同样的参数，产物与 IDE 构建等价。详见 `build.sh` 顶部注释。
 
+### 装配发布目录（打包前**必须先做**）
+
+```bash
+bash deploy_dist.sh                  # -> dist/R3ShieldCore-x64/
+```
+
+`build.sh` 只把产物写进 `R3ShieldCore/Release/`，**不会**碰 `dist/`。
+`deploy_dist.sh` 负责搬运 + 编译 `dskill.exe` + 验收：
+
+1. 校验 `Release/` 里 4 个引擎产物都在（缺了就明说"先跑 `build.sh`"）；
+2. 编 `tools/dskill.cpp` → `dist/R3ShieldCore-x64/dskill.exe`（逃生门工具）；
+3. 按约定布局拷贝 —— **exe 放根、DLL 必须放 `64/` 与 `32/`**
+   （注入器按目录名选架构，放错位置等于 32 位进程完全没有防护）；
+4. 调 `check_dist_sync.sh` 验收，判据是**内容相等（md5）**而不是"文件存在"。
+
+> 这一步以前是**手工 `cp`**，代价是出过一次真实事故：x86 DLL 停在旧代次构建，
+> 发布包"文件都在、大小也对、闸门也全绿"，而 32 位进程一条事件都没有。
+> 详见 `check_dist_sync.sh` 顶部注释。
+
 ### 构建内核驱动（可选）
 
 ```bash
@@ -113,11 +132,18 @@ bash driver/build_driver.sh Debug
 > 测试签名模式（`bcdedit /set testsigning on`）；正式发布需 EV 代码签名证书。
 > 详见 `driver/README.md`。
 
-### 构建安装包
+### 构建安装包（单文件原生 GUI 安装器）
 
 ```bash
-bash installer/build_installer.sh    # -> dist/R3ShieldCore-Setup.exe
+bash installer/build_setup.sh        # -> dist/R3ShieldCore-Setup.exe
 ```
+
+> 需要 MSYS2 `ucrt64` 的 `gcc` + `windres`（payload 以 zlib 压缩后作为 RCDATA 内嵌）。
+> 产物自检（**不碰系统**）：`python installer/selftest_setup.py`
+> （`--verify` / `--extract` 只读；第 4 层"真机装→卸"需要管理员）。
+>
+> `installer/build_installer.sh` 是**老路**（iexpress 自解压），仅作兼容保留，
+> 产物固定叫 `dist/R3ShieldCore-Setup-iexpress.exe`，不会覆盖上面的正式产物。
 
 ### 打包绿色版
 
