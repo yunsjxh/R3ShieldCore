@@ -1,0 +1,41 @@
+LIBRARY "r3shieldcore-lib.dll"
+EXPORTS
+	InjectInit
+	GlobalHookSessionStart
+	GlobalHookSessionHandleNewProcesses
+	GlobalHookSessionDrainEvents
+	GlobalHookSessionDroppedEventCount
+	GlobalHookSessionSetObserver
+	GlobalHookSessionReadPromptStats
+	GlobalHookSessionReadHighRiskStats
+	GlobalHookSessionEnd
+	GlobalHookSessionSetMode
+	GlobalHookSessionCheckHighRiskProcess
+	GlobalHookSessionSelfExit
+
+; =====================================================================
+; !! KEEP THIS FILE PURE ASCII. NO NON-ASCII COMMENTS. !!
+; =====================================================================
+; New exports go at the END: ordinal numbers are assigned in file order,
+; so inserting in the middle shifts every later ordinal.
+;
+; WHY NO NON-ASCII (tested 2026-09-25, MSVC 14.42, link.exe):
+;   A comment line containing certain non-ASCII characters makes link.exe
+;   STOP parsing the remaining EXPORTS entries. It emits no error and no
+;   warning -- the export is just silently missing from the table.
+;   Symptom was: GlobalHookSessionSetMode (the last entry) absent from the
+;   built DLL, so the engine's GetProcAddress returned NULL and the GUI
+;   mode button did nothing while the console said
+;   "DLL does not support runtime mode switching".
+;
+;   Reproduced with a minimal .def (9 plain exports + 1 comment line +
+;   1 export): ASCII comment -> 10 exports; comment with a non-ASCII
+;   character -> 9 exports, no diagnostics. The exact triggering character
+;   is unstable (some non-ASCII comments are harmless, some are not), so
+;   the only safe rule is: keep the whole file ASCII.
+;
+;   Also verified: the DLL was rebuilt at the right time and the symbol was
+;   present in main.obj (dumpbin /symbols) -- so the loss happens purely
+;   inside the .def parser. If an export ever "disappears", check this file
+;   FIRST with: dumpbin /exports <dll>
+; =====================================================================

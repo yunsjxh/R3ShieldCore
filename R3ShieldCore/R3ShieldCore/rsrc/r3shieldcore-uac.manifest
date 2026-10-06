@@ -1,0 +1,79 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!--
+  R3ShieldCore 引擎 exe 的应用程序清单。
+
+  ⚠️ 存在意义：**双击就要求管理员权限**。
+
+     <requestedExecutionLevel level="requireAdministrator"/>
+       → 启动时由 UAC 弹「是否允许此应用对你的设备进行更改？」
+       → 用户点「是」以后进程才起来，且**令牌里已经带 Administrator**。
+
+  ⚠️ 为什么必须提权（不提权引擎是残的）：
+     · 全局注入要 OpenProcess(PROCESS_ALL_ACCESS) 打进别的进程
+       —— 没提权会被拒（实测 err=5）。
+     · SetDebugPrivilege 拿不到 SeDebugPrivilege —— 部分进程直接注入不进去。
+     · 服务 API / 驱动 hook 的目标服务受 ACL 保护，普通用户改不动。
+     · 自我保护要剥别人对自己进程的句柄权限，也要提权才有效。
+
+  ★ 历史：v30（2026-10-01）曾把执行级别改成 highestAvailable（不强制管理员），
+    同日**已回退** —— 不提权时上述能力全部失效，实用价值不足。
+    见 docs/HANDOVER.md §3.10l。
+
+  ⚠️ 与 compatibility.manifest 的关系：
+     **这一份是替代品，不是补充** —— 一个 exe 只能有一个 application manifest。
+     compatibility.manifest 里的内容（OS 支持声明、DPI、长路径）在这里**全部保留**。
+
+  ⚠️ 提权那一段（requireAdministrator）由 build.sh 的
+     /MANIFESTUAC:level='requireAdministrator' 生成，**不写在这个文件里** ——
+     两边都写会让 mt.exe 撞车（level 值冲突，LNK1327）。
+
+  ⚠️ 嵌入方式（build.sh 的 build_demo）：
+     link 加 /MANIFEST:EMBED
+         + /MANIFESTINPUT:R3ShieldCore/rsrc/r3shieldcore-uac.manifest
+         + /MANIFESTUAC:level='requireAdministrator'
+     ⚠️ 选项必须用正斜杠、且要靠 MSYS_NO_PATHCONV=1 关掉路径转换 ——
+        写成 -MANIFESTINPUT: 时 link 不报错但清单静默丢失（本项目已实测过一次）。
+-->
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0"
+          xmlns:asmv3="urn:schemas-microsoft-com:asm.v3">
+
+  <!--
+    ⚠️ 提权**不在这里写** —— link 会自动生成 trustInfo 片段，
+       两边都写会撞车：mt.exe 报
+         "manifest authoring error c1010001:
+          Values of attribute "level" not equal in different manifest snippets"
+       正确的做法是用 link 的 /MANIFESTUAC:level='requireAdministrator'
+       （见 build.sh），由它生成这一段。本清单只管 OS 声明 / DPI /
+       长路径 / comctl32 依赖。
+  -->
+  <dependency>
+    <dependentAssembly>
+      <assemblyIdentity type="win32" name="Microsoft.Windows.Common-Controls"
+                        version="6.0.0.0" processorArchitecture="*"
+                        publicKeyToken="6595b64144ccf1df" language="*"/>
+    </dependentAssembly>
+  </dependency>
+
+  <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">
+    <application>
+      <!-- Windows Vista -->
+      <supportedOS Id="{e2011457-1546-43c5-a5fe-008deee3d3f0}"/>
+      <!-- Windows 7 -->
+      <supportedOS Id="{35138b9a-5d96-4fbd-8e2d-a2440225f93a}"/>
+      <!-- Windows 8 -->
+      <supportedOS Id="{4a2f28e3-53b9-4441-ba9c-d69d4a4a6e38}"/>
+      <!-- Windows 8.1 -->
+      <supportedOS Id="{1f676c76-80e1-4239-95bb-83d0f6d0da78}"/>
+      <!-- Windows 10 / 11 -->
+      <supportedOS Id="{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}"/>
+    </application>
+  </compatibility>
+
+  <asmv3:application>
+    <asmv3:windowsSettings>
+      <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true</dpiAware>
+      <dpiAwareness xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">PerMonitorV2</dpiAwareness>
+      <longPathAware xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">true</longPathAware>
+    </asmv3:windowsSettings>
+  </asmv3:application>
+</assembly>

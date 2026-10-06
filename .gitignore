@@ -1,0 +1,124 @@
+# ============================================================================
+#  R3 ShieldCore —— .gitignore
+#
+#  原则：**源码进仓库，产物不进**。
+#  本项目开发时用了 MSVC 直接调用（不是 MSBuild 工程），所以中间产物散落在
+#  源码目录旁边（obj/ x64/ Release/ Debug/ *.tlog ...）—— 全部忽略。
+# ============================================================================
+
+# ---- 编译产物 ----
+*.obj
+*.o
+*.res
+*.tlog
+*.log
+*.pdb
+*.ilk
+*.idb
+*.exp
+*.lib
+*.map
+*.iobj
+*.ipdb
+
+# ---- 第三方预编译库例外（构建必需，必须进仓库）----
+#   MinHook 以预编译 .lib 形式 vendored，不是本项目的编译输出
+!R3ShieldCore/R3ShieldCoreLib/libraries/MinHook/*.lib
+
+# ---- 构建输出目录（递归，任何层级）----
+obj/
+x64/
+Debug/
+Release/
+RelV53/
+build_svc/
+ArkTest/
+BuildCheck/
+Release-x*/
+Dist/
+build/
+
+# ---- 可执行/驱动产物 ----
+#   ★ 例外：dist/ 下的正式安装包要发布（见文件末尾 ! 规则）
+*.exe
+*.dll
+*.sys
+*.zip
+
+# ---- 测试 / 调试残留 ----
+_t/
+_selftest_install/
+_cleanup_backup/
+*.old-*
+*.bak-*
+*.out
+*.out.p*
+*.pp
+
+# 测试运行输出（verify_log_mode.sh 等写入；每次跑都重新生成）
+tools/logrun/*.txt
+tools/shots/
+_selftest_install/
+
+# 探针/诊断输出（*_out.txt / probe*.txt / *_enum*.txt / *trace*.log 等）
+tools/*_out.txt
+tools/probe*.txt
+tools/probe*.log
+tools/click_*.txt
+tools/dump*.txt
+tools/*_enum*.txt
+tools/diag_autostart*.txt
+tools/toastclick_out.txt
+#   ★ 例外：gbk_gate_fixture.txt 是 check_source_gbk.py 的**负对照夹具**，要进仓库
+!tools/gbk_gate_fixture.txt
+
+# ---- 发布目录（绿色版解包产物，属构建输出，由 build_dist_zip.sh 生成）----
+#   源码仓库只放源码；二进制走 GitHub Releases。
+dist/R3ShieldCore-x64/
+dist/R3ShieldCore-x64.zip
+
+# ---- 编辑器 / 系统 ----
+.vs/
+.vscode/
+*.user
+*.suo
+*.sln.docstates
+desktop.ini
+Thumbs.db
+.DS_Store
+
+# ---- AI 助手工作目录（★ 绝不能开源：含本机路径、证书信息、内部诊断全文）----
+.workbuddy-ai/
+.workbuddy/
+#   上面两个目录里有 MEMORY/HANDOVER/交接记录，属于**开发笔记**而非产品代码。
+#   若你想发布其中某部分，请手动挑出来放进 docs/（人工审阅后再进仓库）。
+
+# ---- 本地构建脚本（用户按自己环境生成，不进仓库）----
+#   ★ 本项目原本把机器路径写死在 build.sh 里；改造后改为自动探测，
+#     若仍有人想保留本地覆盖，可放 build.local.sh（下面忽略）
+build.local.sh
+env.local.sh
+
+# ---- Python ----
+__pycache__/
+*.pyc
+*.pyo
+
+# ---- 诊断输出（可能含本机信息）----
+*.etl
+*.dmp
+*.mdmp
+*.wer
+
+# ============================================================================
+#  例外：这些**要**进仓库
+# ============================================================================
+# 正式发布的安装包与绿色版压缩包（若要随 release 发布，取消下面注释）
+#   ★ 默认注释掉：建议走 GitHub Releases 传二进制，仓库里只放源码。
+# !dist/R3ShieldCore-Setup.exe
+# !dist/R3ShieldCore-x64.zip
+
+# 图标（构建时由 make_icon.py 生成，但生成器与产物都要有 —— 产物是锚点）
+!R3ShieldCore/R3ShieldCore/rsrc/r3shieldcore.ico
+
+# 部署用的 .bat / .ini 是**源码**，不是产物 —— 上面的 *.exe 规则不影响它们
