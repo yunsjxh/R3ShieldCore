@@ -4,9 +4,14 @@
 #  ★ 本项目是 Windows 项目，且脚本/源码里有**多套编码约定**：
 #     · .sh / .py / .cpp / .h  —— UTF-8（无 BOM）
 #     · .bat / .cmd           —— GBK(CP936) + CRLF（cmd.exe 的硬要求）
-#     · .ps1                  —— UTF-8 + BOM（PowerShell 5.1 认 BOM）
-#     · .ini                  —— GBK（引擎按 ANSI 读）
+#     · .ps1                  —— UTF-8 + BOM（PowerShell 5.1 认 BOM；行尾用 LF）
+#     · .ini                  —— ★ UTF-8（不是 GBK！）+ CRLF（引擎两种行尾都认）
 #    这里显式声明，避免 git 在签出时自动改行尾、破坏 .bat 的执行。
+#
+#  ★ 声明必须**跟文件的真实状态一致**：写 CRLF 而文件其实是 LF 的话，
+#    签出时会被静默改掉一整批文件，于是"我的工作区"和"别人 clone 下来的"
+#    并不是同一份东西 —— 而所有本地验证都还是绿的。
+#    实测：本仓 12 个 .ps1 里有 11 个是 LF，所以 .ps1 声明成 LF。
 # ============================================================================
 
 # 默认：文本文件统一用 LF 存储，签出时按平台
@@ -30,8 +35,11 @@
 *.bat     text eol=crlf
 *.cmd     text eol=crlf
 
-# ---- PowerShell：CRLF（5.1 友好）----
-*.ps1     text eol=crlf
+# ---- 配置文件：CRLF（引擎按行读，两种都认；跟现有文件保持一致）----
+*.ini     text eol=crlf
+
+# ---- PowerShell：LF（跟现有文件一致；PS 对两种行尾都认）----
+*.ps1     text eol=lf
 
 # ---- VS 工程文件：CRLF ----
 *.sln     text eol=crlf
@@ -50,6 +58,15 @@
 *.png     binary
 *.jpg     binary
 *.zip     binary
+
+# ---- dist/ 是**装配目录**：整棵树不做任何转换 ----
+#   为什么：dist/ 里的文件会**逐字节**被打进安装包，而且有 md5 闸门
+#   （extract_setup_payload.py 拿包里的字节跟 dist/ 比）。
+#   如果 git 在签出时改了行尾，那么"我本机构建的安装包"和
+#   "别人 clone 后重建的安装包"字节就不一样了 —— 两边各自的闸门都还是绿的。
+#   所以这里显式关掉转换：写进去什么样，签出来就什么样。
+#   ★ 注意：这条必须放在 *.bat / *.ini 规则**之后**，后写的规则覆盖前面的。
+dist/**  -text
 
 # ---- 语言统计：不要把这些算进代码量 ----
 *.md      linguist-documentation
