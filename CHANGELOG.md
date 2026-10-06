@@ -11,6 +11,13 @@
 
 ## [未发布]
 
+- 修复：`LICENSE` 还原为 **GPL-3.0 逐字原文**。此前在文件顶部加了 20 行版权声明，
+  导致 GitHub 判定为 `Other / NOASSERTION` 而非 GPL-3.0（仓库侧栏许可证标识丢失）。
+  项目版权声明改由 README §12 与 THIRD-PARTY-NOTICES.md 承载。
+  同时把 `R3ShieldCore/LICENSE` 一并归一（它离官方文本差 3 行 ——
+  上游把 GPL 附录里的 `<one line to give the program's name…>` 占位符
+  替换成了自己的名字）。
+
 - 文档：README 末尾加 **Star History** 图表（star-history.com 实时生成）
 - 文档：README 顶部补**项目简介**（监控哪 18 类行为、有几种拦截选择、规模、隐私姿态）
 - 文档：README 顶部改为「使用前必读」警示块，明确写出**项目不成熟 / 容易被绕过 /

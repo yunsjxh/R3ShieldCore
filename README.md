@@ -447,8 +447,13 @@ python installer/selftest_setup.py --no-gui --no-install   # 安装程序自测�
 
 ## 12. 许可
 
-[GNU General Public License v3.0](LICENSE)。
-Copyright (C) 2026 yunsjxh。
+[GNU General Public License v3.0](LICENSE)。Copyright (C) 2026 yunsjxh。
+
+> `LICENSE` 是 GPL-3.0 的**逐字原文**（含官方附录的占位符），一个字节都没改 ——
+> GPL 自己写着 "changing it is not allowed"。本项目的版权声明就在上面这行，
+> 以及 [`THIRD-PARTY-NOTICES.md`](THIRD-PARTY-NOTICES.md) 顶部。
+> **别往 `LICENSE` 里加东西**：加了之后 GitHub 会把它识别成 `Other` 而不是
+> GPL-3.0，仓库侧栏的许可证标识就没了。
 
 本项目的注入/hook 框架派生自
 [m417z/global-inject-demo](https://github.com/m417z/global-inject-demo)
