@@ -209,11 +209,21 @@ bash build_dist_zip.sh               # -> dist/R3ShieldCore-x64.zip
 ```bash
 bash build_ut.sh             # 规则层单元测试（秒级）
 bash build_guard_ut.sh       # guard 层单元测试（链 MinHook）
-python installer/selftest_setup.py   # 安装程序自测
+python installer/selftest_setup.py --no-gui --no-install   # 安装程序自测（★ 推荐）
 ```
+
+> ⚠️ **安装程序自测的第 4 层会真的启动引擎。** 引擎的全局注入会 hook 本机
+> **所有**进程（包括编辑器 / IDE）。所以第 4 层必须**显式**加 `--run-engine`
+> 才会跑；不加时它报 `[SKIP]` 并计入结论行，**不会静默跳过**。
+> **要跑第 4 层，请在虚拟机或另一台机器上跑。**
+>
+> 平时只需 `--no-gui --no-install`：第 1-2 层**只读**，验证内嵌资源完整性
+> 并逐字节比对解出来的 payload。
 
 `tools/` 下还有大量**只读探针**（`*probe*`），用于验证 hook 是否真的挂上、
 规则是否真的命中 —— 它们本身就是本项目"用实验代替猜测"工作方式的产物。
+> ⚠️ 但 `tools/` 里的 `test_gui.sh` / `accept_file_modes.sh` / `test_ask_mode.sh` /
+> `test_selfprotect.sh` 属于**验收脚本**，它们会启动引擎 —— 同样请在隔离环境跑。
 
 ## 已知边界
 
