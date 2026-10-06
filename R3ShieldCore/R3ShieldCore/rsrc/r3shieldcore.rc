@@ -1,0 +1,48 @@
+/* ============================================================================
+ *  r3shieldcore.rc —— R3 ShieldCore 引擎 exe 的资源脚本（图标 / 版本信息）
+ *
+ *  为什么需要这个文件
+ *  ==================
+ *  在此之前引擎 exe **没有任何资源区**，于是三处图标全是系统的空白默认图标：
+ *    · 资源管理器 / 桌面上看到的 exe 图标；
+ *    · 窗口标题栏左上角 + 任务栏按钮（GUI 里写死了 LoadIcon(IDI_APPLICATION)）；
+ *    · Alt+Tab 切换器。
+ *  安装程序早就有了自己的 101 ICON（installer/r3sc_setup.rc），
+ *  但引擎本身没有 —— 装完以后"主程序"反而是那个最不像正经软件的一个。
+ *
+ *  ★ 图标资源 ID 用 1（不是 101）
+ *  =============================
+ *  两个 exe 的资源是**各自独立**的，ID 撞不撞无所谓。这里用 1 是因为
+ *  它是 Windows 的**约定俗成**值：壳层在"exe 没有图标资源"时退回的
+ *  默认图标就是按 ID 1 找的。写 1 最不容易出意外。
+ *  ★★ 但代码里**必须**用 LoadIcon(hInstance, MAKEINTRESOURCE(IDI_APP_ICON))
+ *      —— 不能写 LoadIcon(nullptr, ...)：传 nullptr 时 Windows 只去
+ *      **系统模块**里找，永远看不到我们自己编进去的这个图标。
+ *      GUI 里原来那两行 LoadIcon(nullptr, IDI_APPLICATION) 就是这个毛病。
+ *
+ *  ★ 编译方式
+ *  ==========
+ *  这个文件由 build.sh 用 SDK 的 **rc.exe** 编译（不是 windres）：
+ *      rc.exe /nologo /fo <tmp>\r3shieldcore.res /I <rsrc目录> r3shieldcore.rc
+ *  原因：
+ *    · rc.exe 是 MSVC 工具链的原生资源编译器，与 cl/link 同源，最稳；
+ *    · rc.exe 是 Unicode 程序，即使项目根目录带中文也没问题，
+ *      处理中文路径没有问题 —— 不像 windres（ANSI，必须先进纯 ASCII 暂存目录）。
+ *  ★ 但 rc.exe 的**预处理**对 `#include` 的路径解析依赖 /I 与 cwd，
+ *    所以 build.sh 里是先 cd 到 R3ShieldCore/ 再把相对路径喂给 rc.exe 的
+ *    （与 cl.exe 相同的约定，见 build.sh 开头的注释）。
+ *
+ *  ★ 版本信息为什么不在这里写
+ *  ==========================
+ *  link.exe 会**自动**根据 /VERSION:65.0.0.0 生成一份 VS_VERSION_INFO。
+ *  如果这里再写一份，资源表里会出现两个 VERSION 条目 —— 资源管理器读到的
+ *  可能是没有 FileDescription 的那一份（实测：详细信息里产品名是空的）。
+ *  所以版本信息统一交给 build.sh 的 /VERSION 开关，本文件只管图标。
+ *  （对比：installer/r3sc_setup.rc 是 gcc 链接的，没有那个开关，
+ *    所以它**必须**手写 VS_VERSION_INFO —— 两边不一样是因为链接器不同。）
+ * ==========================================================================*/
+
+#include <winresrc.h>
+
+/* 引擎 exe 的图标。ID 用 1（约定值），代码里按 MAKEINTRESOURCE(1) 取。 */
+1 ICON "r3shieldcore.ico"

@@ -1,0 +1,63 @@
+/* ============================================================================
+ *  r3sc_setup.rc —— 安装程序的资源脚本（图标 / manifest / 版本信息）
+ *
+ *  ★ 编译时必须带 `-c 65001`（windres 的"代码页"参数）。
+ *    不带的话 windres 会按 CP936 解码本文件里的路径 —— 本项目根目录带中文，
+ *    结果是"找不到文件"或者更糟：编出一个空资源，而构建报成功。
+ *
+ *  ★ payload 资源（21 个文件）由 installer/gen_payload_rc.py 生成到
+ *    payload.rc，在文件末尾 #include 进来。两个文件在构建时都会被放到
+ *    同一个纯 ASCII 暂存目录里，所以这里的相对 include 是安全的。
+ *
+ *  ★ manifest 的资源 ID 是 1、类型 24（RT_MANIFEST）；payload 清单的资源
+ *    ID 也是 1、但类型是 RCDATA(10)。Windows 按 (类型, ID) 定位资源，
+ *    所以两者不冲突 —— 但看代码时容易吓一跳，这里说明一下。
+ * ==========================================================================*/
+
+#include <winresrc.h>
+
+/* ---- 图标：窗口左上角 / 资源管理器 / 控制面板都会用 ---- */
+101 ICON "app.ico"
+
+/* ---- 应用程序 manifest ----
+ *  这里声明 requireAdministrator，UAC 由**系统**在进程启动时处理。
+ *  这比"脚本里自己 Start-Process -Verb RunAs"干净得多：
+ *    · 没有"父进程先退出、解压目录被删掉"的竞态（铁律 122）；
+ *    · 不需要 PowerShell 中转（省一次进程创建）；
+ *    · 拿到的令牌一开始就是 High，所有后续操作都在同一个进程里。 */
+1 24 "setup.manifest"
+
+/* ---- 版本信息 ----
+ *  语言块 080404b0 = 简体中文(0x0804) + Unicode(0x04b0)
+ *  Translation 的值必须和语言块对应，否则资源管理器里"详细信息"是空的。 */
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION    65,0,0,0
+ PRODUCTVERSION 65,0,0,0
+ FILEFLAGSMASK  0x3fL
+ FILEFLAGS      0x0L
+ FILEOS         0x40004L
+ FILETYPE       0x1L
+ FILESUBTYPE    0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "080404b0"
+        BEGIN
+            VALUE "CompanyName",      "R3 ShieldCore"
+            VALUE "FileDescription",  "R3 ShieldCore 安装程序"
+            VALUE "FileVersion",      "65.0.0.0"
+            VALUE "InternalName",     "r3shieldcore-setup"
+            VALUE "LegalCopyright",   "R3 ShieldCore"
+            VALUE "OriginalFilename", "R3ShieldCore-Setup.exe"
+            VALUE "ProductName",      "R3 ShieldCore"
+            VALUE "ProductVersion",   "65.0.0.0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x804, 1200
+    END
+END
+
+/* ---- payload（21 个文件 + 清单 + 卸载脚本），由脚本生成 ---- */
+#include "payload.rc"

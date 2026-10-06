@@ -1,0 +1,56 @@
+# ============================================================================
+#  .gitattributes —— R3 ShieldCore
+#
+#  ★ 本项目是 Windows 项目，且脚本/源码里有**多套编码约定**：
+#     · .sh / .py / .cpp / .h  —— UTF-8（无 BOM）
+#     · .bat / .cmd           —— GBK(CP936) + CRLF（cmd.exe 的硬要求）
+#     · .ps1                  —— UTF-8 + BOM（PowerShell 5.1 认 BOM）
+#     · .ini                  —— GBK（引擎按 ANSI 读）
+#    这里显式声明，避免 git 在签出时自动改行尾、破坏 .bat 的执行。
+# ============================================================================
+
+# 默认：文本文件统一用 LF 存储，签出时按平台
+* text=auto
+
+# ---- Shell / Python / MSVC 源码：LF，UTF-8 ----
+*.sh      text eol=lf
+*.py      text eol=lf
+*.cpp     text eol=lf
+*.h       text eol=lf
+*.c       text eol=lf
+*.def     text eol=lf
+*.rc      text eol=lf
+*.manifest text eol=lf
+*.md      text eol=lf
+*.yml     text eol=lf
+*.yaml    text eol=lf
+.gitignore text eol=lf
+
+# ---- Windows 批处理：必须 CRLF（LF 会让 cmd 解析出错）----
+*.bat     text eol=crlf
+*.cmd     text eol=crlf
+
+# ---- PowerShell：CRLF（5.1 友好）----
+*.ps1     text eol=crlf
+
+# ---- VS 工程文件：CRLF ----
+*.sln     text eol=crlf
+*.vcxproj text eol=crlf
+*.filters text eol=crlf
+*.props   text eol=crlf
+
+# ---- 二进制：不做任何行尾转换 ----
+*.exe     binary
+*.dll     binary
+*.sys     binary
+*.lib     binary
+*.obj     binary
+*.res     binary
+*.ico     binary
+*.png     binary
+*.jpg     binary
+*.zip     binary
+
+# ---- 语言统计：不要把这些算进代码量 ----
+*.md      linguist-documentation
+docs/**   linguist-documentation
