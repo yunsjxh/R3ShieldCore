@@ -27,10 +27,48 @@ x64 的 Windows 从 Vista 起就要求内核驱动有签名。到 Win10 1607+，
 | 项目 | 状态 | 影响 |
 |---|---|---|
 | WDK | ✅ 已装，在 **10.0.28000.0** | 能编（注意：**不是** `build.sh` 用的 26100） |
-| Secure Boot | ✅ **已关闭**（`UEFISecureBootEnabled=0`） | 自签名驱动**可以**加载 |
-| testsigning | ❌ 未开启 | 需 `bcdedit` + 重启 |
+| Secure Boot | ✅ **已关闭**（`UEFISecureBootEnabled=0`） | 自签名驱动**可以**加载（实测，见 1.2.1） |
+| HVCI / 内存完整性 | ✅ **关闭**（`Enabled=0`） | 同上 |
+| testsigning | ❌ 未开启（实测**不需要**） | 只有换到强制机器上才需要 |
 | **BitLocker** | ⚠️ **已启用**（启动项含 `FVEBOOT`） | **改启动配置会触发恢复密钥提示** |
 | 当前用户 | 非管理员 | 安装/签名需提权 |
+
+### 1.2.1 实测：自签驱动到底能不能加载（2026-10-06）
+
+**别再靠 signtool 的结论推断** —— 直接建服务 + `StartService`，看内核实际返回什么。
+工具：`tools/drvload_probe.cpp`（`bash build_drvload_probe.sh` 构建；
+`--dump-config` 只读自检，`--start-type boot|system|demand`，默认自动回滚）。
+
+**结果（2×2，两条腿都必须跑）：**
+
+| 启动类型 | 镜像 | `StartService` | 关键证据 |
+|---|---|---|---|
+| `BOOT_START` | 已签名 | ✅ **成功**（状态 4 = RUNNING） | SCM 7045 `StartType=引导启动` |
+| `DEMAND_START` | 已签名 | ✅ **成功**（状态 4 = RUNNING） | CI 3076 |
+| `DEMAND_START` | **去掉签名**（同字节） | ❌ **失败 577 / 0xC0000428** | SCM 7000 `%%577`、CI 3004、App Popup 26 |
+| `BOOT_START` | **去掉签名**（同字节） | ❌ **失败 577 / 0xC0000428** | 同上 |
+
+**结论（两句话）：**
+
+1. **签名是必要条件** —— 同一份字节只把 PE 安全目录清零，就从"成功"变成"被拒"。
+2. **但它不是充分条件** —— CI 事件 3076 原文自己写着：*"...did not meet the
+   Authenticode signing level requirements ... **However, due to code integrity
+   auditing policy, the image was allowed to load.**"*
+   也就是说，本机能跑是**「有签名」+「本机 CI 处于审计模式」**两个条件同时成立的结果
+   （`CI\Policy`：`EmodePolicyRequired=0`）。
+
+> ⚠️ **所以：本机能加载 ≠ 别的机器能加载。**
+> 换到**强制模式**的机器（HVCI / 内存完整性开启、Secure Boot 开启且走 1607+ 引导策略、
+> 或 WDAC enforce 策略）上，这个自签驱动**会被拒**。
+> **分发必须走上面的 B / C 两条路**；A（testsigning）只是开发机自测。
+>
+> 好消息：**本机自测连 testsigning 都不用开**（实测如此），
+> 也就**不用去动 `bcdedit`**，顺带避开了 1.2 里那个 BitLocker 恢复密钥的坑。
+
+> ℹ️ 别被 CI 事件 3089 里的 `PublisherName` 带偏：它报的是**策略/交叉证书**数据
+> （本项目实测报了某 2018 年的 VeriSign 交叉证书），**不是本文件签名者**。
+> 想确认本文件签名者，看 `SHA1 Flat Hash`（= 文件哈希）并用
+> `Get-AuthenticodeSignature` 回读。
 
 > ### ⚠️ BitLocker 警告（最容易出事的一步）
 >
