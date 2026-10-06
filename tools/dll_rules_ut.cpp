@@ -71,7 +71,7 @@ int wmain()
 		{ L"C:\\Windows\\SysWOW64\\user32.dll",      D_LoadLibrary, false, false, "SysWOW64" },
 		{ L"C:\\Program Files\\App\\x.dll",          D_LoadLibrary, false, false, "系统 Program Files" },
 		{ L"D:\\Program Files\\PowerShell\\7\\x.dll", D_LoadLibrary, false, false, "非系统盘 Program Files（实测噪音源）" },
-		{ L"D:\\Program Files\\WorkBuddy\\x.dll",    D_LoadLibrary, false, false, "自装软件目录" },
+		{ L"D:\\Program Files\\MyApp\\x.dll",    D_LoadLibrary, false, false, "自装软件目录" },
 		{ L"",                                       D_LoadLibrary, false, false, "空路径不判高危" },
 	};
 

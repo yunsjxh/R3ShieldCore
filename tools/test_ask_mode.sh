@@ -76,8 +76,8 @@ log_all_open=0
 hook_hive=1
 hook_set_info=1
 log=$LOGFILE_NAME
-exclude=D:\\Program Files\\WorkBuddyAI
-exclude=C:$USERPROFILE\\.workbuddy-ai
+exclude=D:\\Program Files\\MyApp
+exclude=C:$USERPROFILE\\.mytool
 EOF
 
 echo "=============================================="

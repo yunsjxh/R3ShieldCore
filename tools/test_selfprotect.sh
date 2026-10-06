@@ -31,13 +31,40 @@ PROJECT_ROOT="$R3SC_PROJECT_ROOT"
 ROOT="$PROJECT_ROOT"
 TOOLS="$ROOT/tools"
 REL="$ROOT/R3ShieldCore/Release"
-BYPASS_DIR="$USERPROFILE/.workbuddy-ai"   # 在 ini 的 exclude 里 → 该目录下的程序不会被注入
+# ★ 这个目录是**本脚本自己搭的前提**（见下面那段），不依赖随包 ini。
+#   两套写法各管一边：
+#     _WIN  —— 写进 ini（引擎按 Windows 路径前缀匹配，所以用反斜杠）
+#     无后缀 —— bash 里 mkdir/cp 用（POSIX 路径）
+BYPASS_DIR_WIN="$USERPROFILE\\.r3sc_bypass"
+BYPASS_DIR="$(cygpath -u "$BYPASS_DIR_WIN" 2>/dev/null || printf '%s' "$USERPROFILE/.r3sc_bypass")"
 STAMP="$(date +%Y%m%d-%H%M%S)"
 OUTDIR="$TOOLS/selfprotect-$STAMP"
 WITH_ESCAPE=0
 for a in "$@"; do [ "$a" = "--with-escape" ] && WITH_ESCAPE=1; done
 
 mkdir -p "$OUTDIR"
+
+# ---- "不被注入的目录"由本脚本自己搭，不依赖随包配置 ----
+#   早先这里直接用 $USERPROFILE 下一个固定的隐藏目录，前提是"随包
+#   r3shieldcore.ini 里有一条指向它的 exclude"。那条随包项已经删掉了 ——
+#   它是**开发机专属路径**，对别人的机器毫无意义，也不该进发布物。
+#   现在改成：测试开始时把 BYPASS_DIR 写进 ini 的 never_inject，结束时还原。
+#   ⇒ 脚本自足，不再依赖任何跟机器有关的发布配置。
+INI_FILE="$REL/r3shieldcore.ini"
+INI_BAK="$OUTDIR/r3shieldcore.ini.bak"
+if [ -f "$INI_FILE" ]; then
+    cp -f "$INI_FILE" "$INI_BAK"
+    # 幂等：已经声明过就不重复加
+    if ! grep -qi "^never_inject=.*r3sc_bypass" "$INI_FILE"; then
+        printf '\r\nnever_inject=%s\\\r\n' "$BYPASS_DIR_WIN" >> "$INI_FILE"
+    fi
+    trap 'cp -f "$INI_BAK" "$INI_FILE" 2>/dev/null' EXIT INT TERM
+    echo "已把 $BYPASS_DIR_WIN 写进 $INI_FILE（测试结束自动还原）"
+else
+    echo "⚠️ 找不到 $INI_FILE —— 引擎读的可能是别处的配置，"
+    echo "   那么「不被注入目录」这个前提未必成立，第 2 步的判定要打折看。"
+fi
+mkdir -p "$BYPASS_DIR"
 
 pass=0; fail=0
 ok()   { echo "  [PASS] $1"; pass=$((pass+1)); }

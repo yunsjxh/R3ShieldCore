@@ -274,55 +274,55 @@ int main()
 	// ★ 这个匹配器决定"哪些进程**完全不受监控**"。它比内置名单更危险：
 	//   内置名单只认 %SystemRoot% 下的系统进程，而用户名单是任意路径。
 	//   所以必须钉死两件事：
-	//     ① 目录前缀**不能**溢出到同前缀的别的目录（`WorkBuddyAI` vs `WorkBuddyAI-evil`）；
+	//     ① 目录前缀**不能**溢出到同前缀的别的目录（`MyApp` vs `MyApp-evil`）；
 	//     ② 配置写坏（空 / 纯分隔符）时**一个都不免**（安全方向）。
 	//
 	{
-		const WCHAR* kProbe = L"D:\\Program Files\\WorkBuddyAI\\WorkBuddyAI.exe";
+		const WCHAR* kProbe = L"D:\\Program Files\\MyApp\\MyApp.exe";
 
 		Check(InjectPolicy::MatchesNeverInjectPath(kProbe,
-			L"D:\\Program Files\\WorkBuddyAI\\WorkBuddyAI.exe"),
+			L"D:\\Program Files\\MyApp\\MyApp.exe"),
 			"完整 exe 路径精确命中", "");
 
 		Check(InjectPolicy::MatchesNeverInjectPath(kProbe,
-			L"D:\\Program Files\\WorkBuddyAI"),
+			L"D:\\Program Files\\MyApp"),
 			"目录前缀（无结尾 \\）命中", "");
 
 		Check(InjectPolicy::MatchesNeverInjectPath(kProbe,
-			L"D:\\Program Files\\WorkBuddyAI\\"),
+			L"D:\\Program Files\\MyApp\\"),
 			"目录前缀（有结尾 \\）命中", "");
 
 		Check(InjectPolicy::MatchesNeverInjectPath(kProbe,
-			L"d:\\program files\\workbuddyai"),
+			L"d:\\program files\\myapp"),
 			"大小写不敏感", "");
 
 		Check(InjectPolicy::MatchesNeverInjectPath(
-			L"D:/Program Files/WorkBuddyAI/WorkBuddyAI.exe",
-			L"D:\\Program Files\\WorkBuddyAI"),
+			L"D:/Program Files/MyApp/MyApp.exe",
+			L"D:\\Program Files\\MyApp"),
 			"路径里用 / 也认边界", "");
 
 		Check(InjectPolicy::MatchesNeverInjectPath(
-			L"D:\\Program Files\\WorkBuddyAI\\WorkBuddyAI.exe",
-			L"D:/Program Files/WorkBuddyAI"),
+			L"D:\\Program Files\\MyApp\\MyApp.exe",
+			L"D:/Program Files/MyApp"),
 			"前缀写成 / 也命中（手写 ini 常见）", "");
 
 		// ★ 路径边界 —— 本函数存在的唯一理由
 		Check(!InjectPolicy::MatchesNeverInjectPath(
-			L"D:\\Program Files\\WorkBuddyAI-evil\\malware.exe",
-			L"D:\\Program Files\\WorkBuddyAI"),
-			"**不**命中同前缀的另一目录 WorkBuddyAI-evil", "");
+			L"D:\\Program Files\\MyApp-evil\\malware.exe",
+			L"D:\\Program Files\\MyApp"),
+			"**不**命中同前缀的另一目录 MyApp-evil", "");
 		Check(!InjectPolicy::MatchesNeverInjectPath(
-			L"D:\\Program Files\\WorkBuddyAI2\\x.exe",
-			L"D:\\Program Files\\WorkBuddyAI"),
-			"**不**命中同前缀的另一目录 WorkBuddyAI2", "");
+			L"D:\\Program Files\\MyApp2\\x.exe",
+			L"D:\\Program Files\\MyApp"),
+			"**不**命中同前缀的另一目录 MyApp2", "");
 		Check(!InjectPolicy::MatchesNeverInjectPath(
-			L"D:\\Program Files\\WorkBuddyAIX.exe",
-			L"D:\\Program Files\\WorkBuddyAI"),
+			L"D:\\Program Files\\MyAppX.exe",
+			L"D:\\Program Files\\MyApp"),
 			"**不**命中同前缀的另一文件名", "");
 
 		Check(!InjectPolicy::MatchesNeverInjectPath(
 			L"C:\\Windows\\System32\\cmd.exe",
-			L"D:\\Program Files\\WorkBuddyAI"),
+			L"D:\\Program Files\\MyApp"),
 			"完全不同的路径不命中", "");
 
 		// 盘根前缀：`C:\` 应当命中 C: 盘下的一切（且不能溢出到 `C:\` 之外）

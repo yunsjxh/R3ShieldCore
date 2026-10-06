@@ -106,13 +106,15 @@ static void CheckMainConfig(const std::filesystem::path& dir)
 	//   `FormCreate`（启动后几十~几百 ms）里写 MBR —— 差的就是这一点。
 	Check("inject_shell_thin=1（shell/服务宿主瘦注入开着，双击与提权启动才有同步注入路）",
 		(policy.Flags2 & R3ShieldCore::FlagInjectShellThin) != 0);
-	// ★ v49：用户自定义"绝不注入"名单必须真的被解析器读进来 —— 发布随包默认带
-	//   WorkBuddyAI 一条（避免给宿主工具自身注入 hook 造成自锁/性能损耗）。
-	//   这条同样是"改 ini 一行就能悄悄失效"的项，必须真解析后断言。
-	//   ★ 顺带钉住"完整路径前缀"语义：只认前缀，不是文件名匹配。
-	Check("never_inject 有 1 条，且为 D:\\Program Files\\WorkBuddyAI\\（v49 用户免注入名单生效）",
-		policy.NeverInjectCount == 1 &&
-		wcscmp(policy.NeverInjectPaths[0], L"D:\\Program Files\\WorkBuddyAI\\") == 0,
+	// ★ v49：用户自定义"绝不注入"名单必须真的被解析器读进来。
+	//   ★ 随包默认是**空的（0 条）**，这是刻意的：早先这里写死过一条
+	//     `D:\Program Files\<某开发机上的程序>\` —— 那是本机专属路径，
+	//     对别人的机器毫无意义，还等于把"作者用什么工具"写进了发布物。
+	//   所以这条断言改成"默认必须为空"，专门防止有人又把某台机器的路径
+	//   写回随包 ini。（"完整路径前缀"的语义由 tools/inject_policy_ut.cpp
+	//   用夹具单独钉住，不依赖随包默认值。）
+	Check("never_inject 随包默认为空（0 条：不放任何本机专属路径）",
+		policy.NeverInjectCount == 0,
 		std::to_string(static_cast<unsigned long>(policy.NeverInjectCount)) + " 条");
 
 	// ★ v62/v63：ARK 页（全机进程视图 + 分组排序）。三个键随包必须都是预期值。
@@ -191,12 +193,15 @@ static void CheckPreset(const std::filesystem::path& distDir, const std::filesys
 	// ★ v42：预设也不能把瘦注入漏掉 —— 否则用预设覆盖后同步注入路就没了
 	Check((std::string(e.what) + "：未列出的项仍为默认（inject_shell_thin 开）").c_str(),
 		(p.Flags2 & R3ShieldCore::FlagInjectShellThin) != 0);
-	// ★ v49：预设也各带一条 never_inject —— 用预设覆盖主配置后，宿主工具仍必须免注入。
-	//   这条同时验证"预设是完整可用配置"：光有 r3shieldcore.ini 带 never_inject 不够，
-	//   用户一旦切到预设，免注入就没了。
-	Check((std::string(e.what) + "：never_inject 有 1 条（v49 免注入名单随预设生效）").c_str(),
-		p.NeverInjectCount == 1 &&
-		wcscmp(p.NeverInjectPaths[0], L"D:\\Program Files\\WorkBuddyAI\\") == 0,
+	// ★ v49：预设也必须把 never_inject 的**默认语义**带对。
+	//   ★ 现在的随包默认是"空"（0 条）—— 早先这里写死过一条开发机专属路径，
+	//     已经从 5 个 ini 里去掉（见 tools/verify_dist_ini.cpp 上面主配置那段）。
+	//   所以预设的断言同样改成"必须为空"，作用有两个：
+	//     1) 防止有人把某台机器的路径又写回某个预设；
+	//     2) 顺带证明"预设是完整可用配置"—— 预设里的每一项都会被独立解析，
+	//        不会因为主配置改了而跟着漂。
+	Check((std::string(e.what) + "：never_inject 随包默认为空（0 条）").c_str(),
+		p.NeverInjectCount == 0,
 		std::to_string(static_cast<unsigned long>(p.NeverInjectCount)) + " 条");
 	// ★ v63：ARK 也是"预设里没列出的项" —— 用预设覆盖后必须仍落到内置默认
 	//   （开 + 2000/1000）。否则用户一切预设，ARK 就静默关了，

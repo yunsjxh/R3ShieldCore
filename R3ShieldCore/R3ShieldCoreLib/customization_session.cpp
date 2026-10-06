@@ -373,7 +373,7 @@ void CustomizationSession::UninitSession() noexcept
 	// 那一步会释放 trampoline，而此刻进程里可能还有线程正卡在 hook 里
 	// （ask 模式下甚至停在等用户点按钮上，最长几十秒）。释放后那个线程
 	// 返回时就是野指针 —— WER 报 "r3shieldcore-lib.dll_unloaded"，
-	// 异常码 c0000005。实测打崩过 WorkBuddyAI.exe 和 OfficeClickToRun.exe。
+	// 异常码 c0000005。实测打崩过 MyApp.exe 和 OfficeClickToRun.exe。
 
 	// 1) 让还在等用户答复的 Ask() 立刻收手，别让宿主线程白等满超时。
 	R3ShieldCorePrompt::NotifyShutdown();

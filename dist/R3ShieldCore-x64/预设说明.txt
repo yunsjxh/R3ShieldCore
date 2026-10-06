@@ -315,7 +315,7 @@
 #  例：
 #    exclude=C:\Program Files\YourApp
 #    exclude=D:\MyData
-#    never_inject=D:\Program Files\WorkBuddyAI\
+#    never_inject=D:\Program Files\MyApp\
 #
 #  ⚠️ 即便是 block 模式，如果你有程序会往"非豁免路径"写东西又被拦，
 #     把它的目录加进 exclude 即可（仅注册表判据；要"整个不管"用 never_inject）。

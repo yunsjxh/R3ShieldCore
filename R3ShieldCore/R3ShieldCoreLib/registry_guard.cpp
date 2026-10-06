@@ -120,7 +120,7 @@ namespace
 	//
 	// 收尾时必须等它归零才能 MH_Uninitialize()：那一步会释放 trampoline，
 	// 而还在 hook 里的线程返回时会跳进去 —— 实测会让宿主进程 c0000005 崩在
-	// "r3shieldcore-lib.dll_unloaded"（曾打崩 WorkBuddyAI.exe）。
+	// "r3shieldcore-lib.dll_unloaded"（曾打崩 MyApp.exe）。
 	//
 	volatile LONG g_activeHooks = 0;
 

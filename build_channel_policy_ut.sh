@@ -62,7 +62,7 @@ MSYS_NO_PATHCONV=1 "$LINK" -nologo -SUBSYSTEM:CONSOLE \
     "$OBJDIR_REL/functions.obj" \
     "$OBJDIR_REL/inject_policy.obj" \
     "$OBJDIR_REL/logger.obj" \
-    kernel32.lib advapi32.lib || exit 1
+    kernel32.lib advapi32.lib wtsapi32.lib || exit 1
 
 echo ""
 "./tools/channel_policy_ut.exe"

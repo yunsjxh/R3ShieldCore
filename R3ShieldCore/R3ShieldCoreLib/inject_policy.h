@@ -94,7 +94,7 @@ namespace InjectPolicy
 	//       （`D:\App` 命中 `D:\App\x.exe`，**不**命中 `D:\App2\x.exe`）。
 	//
 	//   为什么必须带"路径边界"：只做前缀匹配时，配置写
-	//   `D:\Program Files\WorkBuddyAI` 会连 `D:\Program Files\WorkBuddyAI-evil\x.exe`
+	//   `D:\Program Files\MyApp` 会连 `D:\Program Files\MyApp-evil\x.exe`
 	//   一起命中 ⇒ 白送一个"改个目录名就免注入"的后门
 	//   （与铁律 42「豁免必须不可伪造」同族）。
 	//

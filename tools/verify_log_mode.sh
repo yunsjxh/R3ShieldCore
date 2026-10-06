@@ -64,9 +64,9 @@ hook_driver=1
 hook_net=1
 hook_dns=1
 hook_net_all=1
-exclude=D:\Program Files\WorkBuddy
-exclude=$USERPROFILE\.workbuddy-ai
-exclude=$USERPROFILE\.workbuddy
+exclude=D:\Program Files\MyApp
+exclude=$USERPROFILE\.sampletool-a
+exclude=$USERPROFILE\.sampletool-b
 INIEOF
 
 > "$EV"

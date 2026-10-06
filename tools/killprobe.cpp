@@ -6,8 +6,8 @@
 // 用法: killprobe.exe <pid> [delayMs] [outFile]
 //
 // 从两个位置各跑一次做对照：
-//   tools\killprobe.exe                          —— 不在 exclude 里，会被引擎注入
-//   C:\Users\<user>\.workbuddy-ai\killprobe.exe  —— 在 exclude 里，不会被注入
+//   tools\killprobe.exe                          —— 不在名单里，会被引擎注入
+//   %USERPROFILE%\.r3sc_bypass\killprobe.exe   —— 在 never_inject 里，不会被注入
 //
 // 判读：若两处都能把引擎杀掉 → 引擎无自我保护；
 //       若只有「被注入」的那次被拦，说明保护只在注入方进程里生效。

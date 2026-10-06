@@ -42,7 +42,7 @@ static void Check(const char* name, bool ok)
 }
 
 // 名单里放一条真实形态的路径（与发布 ini 默认值一致）。
-static const WCHAR kNeverInject[] = L"D:\\Program Files\\WorkBuddyAI\\";
+static const WCHAR kNeverInject[] = L"D:\\Program Files\\MyApp\\";
 
 static int RunChild(DWORD enginePid)
 {
@@ -68,7 +68,7 @@ static int RunChild(DWORD enginePid)
 	}
 
 	Check("NeverInjectCount == 1", p->NeverInjectCount == 1);
-	Check("NeverInjectPaths[0] 逐字等于 D:\\Program Files\\WorkBuddyAI\\",
+	Check("NeverInjectPaths[0] 逐字等于 D:\\Program Files\\MyApp\\",
 		p->NeverInjectCount >= 1 && wcscmp(p->NeverInjectPaths[0], kNeverInject) == 0);
 	Check("Mode 也读得到（证明读到的是完整 Policy，不是残段）",
 		p->Mode == static_cast<ULONG>(R3ShieldCore::Mode::Block));

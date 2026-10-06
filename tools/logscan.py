@@ -7,7 +7,7 @@
     python tools/logscan.py dist/R3ShieldCore-x64 --grep tasklist
     python tools/logscan.py --runs               # 只按时间片列每次运行
 
-为什么需要它（都是踩过的坑，见 .workbuddy-ai/memory/MEMORY-4-build-test.md 铁律 45）：
+为什么需要它（都是踩过的坑，铁律 45）：
   * r3shieldcore-console.log 用 GBK（printf），r3shieldcore-events.log 用 UTF-8（ConsoleLog）
     —— 同一个目录里两种编码，必须先探测再解码，否则 grep 中文永远不命中。
   * 两份日志都是**追加**的，一份文件里可能混着好几次运行 ⇒ 必须按时间戳切片。

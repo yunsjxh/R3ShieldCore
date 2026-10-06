@@ -155,7 +155,7 @@ namespace
 	//
 	// 为什么**内置**、而不是让用户写进 ini：
 	//   VMware Tools 是**每个虚拟机 guest 都有的通用组件**（对照
-	//   `never_inject=D:\Program Files\WorkBuddyAI\` 那种本机特有路径），
+	//   `never_inject=D:\Program Files\MyApp\` 那种本机特有路径），
 	//   而且本包有 **5 个预设 ini** —— 写 ini 就得 5 处同步维护，
 	//   漏一个预设就变成"换个模式就失效"。
 	//
@@ -336,7 +336,7 @@ namespace InjectPolicy
 	//   那个是**裸前缀** —— `D:\App` 会命中 `D:\App2\x.exe`。对"排除目录"
 	//   够用（多排一个目录只影响日志噪音），但这里是**免注入**：
 	//   命中 = 该进程及其子进程统统不受监控。裸前缀等于给攻击者留一个
-	//   "把目录改名成 `WorkBuddyAI2` 就免注入"的后门（铁律 42 同族）。
+	//   "把目录改名成 `MyApp2` 就免注入"的后门（铁律 42 同族）。
 	//
 	bool MatchesNeverInjectPath(PCWSTR imagePath, PCWSTR prefix) noexcept
 	{
@@ -362,7 +362,7 @@ namespace InjectPolicy
 		// ★ 逐字符比较，并且**把 `/` 与 `\` 视为等价**。
 		//
 		// 为什么要归一化分隔符：前缀是**用户手写**在 ini 里的，写成
-		// `D:/Program Files/WorkBuddyAI` 太常见了；而 `imagePath` 来自
+		// `D:/Program Files/MyApp` 太常见了；而 `imagePath` 来自
 		// `QueryFullProcessImageNameW`，**只会**返回 `\`。不归一化的话
 		// 用户配置会**静默失效**（名单看起来写了、其实一条都不命中）——
 		// 这正是铁律 33 那类"配置写对了但引擎不认"的坑。

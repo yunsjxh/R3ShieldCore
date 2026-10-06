@@ -64,7 +64,15 @@ namespace GuardStub
 	void SetPromptOpen(bool open) noexcept { g_promptOpen = open; }
 	void ResetPolicy() noexcept
 	{
-		g_policy = {};
+		// ★ 这里**不能**写 `g_policy = {};` —— MSVC 14.51.36231 对
+		//   「大聚合体 + 花括号赋值」会报 C1001 内部编译器错误
+		//   （已最小复现：`g_policy = {};` 和 `g_policy = Policy{};` 都 ICE，
+		//     而声明处的 `Policy g_policy = {};` 反而没事 —— 所以问题只在
+		//     **赋值**这一种形式上，全仓其它 `T x = {};` 都不受影响）。
+		//   后果不是"编译报错"，而是 build_guard_ut.sh 直接中断 ⇒
+		//   **guard 层单测从来没跑过**（铁律 137 同族：闸门是死的却看着像绿的）。
+		//   用 ZeroMemory 绕开聚合体赋值，x64/x86 都已验证。
+		ZeroMemory(&g_policy, sizeof(g_policy));
 		// 默认给一个"高危开关打开"的 Policy，贴近真实 ini（high_risk=1）。
 		g_policy.Flags = R3ShieldCore::FlagHighRiskGuard;
 		g_askAttempts.store(0);

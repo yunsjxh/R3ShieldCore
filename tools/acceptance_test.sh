@@ -188,11 +188,11 @@ hook_reads=0
 log_all_open=0
 #
 # 排除路径，前缀匹配，可重复。命中则一个 hook 都不挂（零开销）。
-exclude=D:\Program Files\WorkBuddyAI
-exclude=$USERPROFILE\.workbuddy-ai
+exclude=D:\Program Files\MyApp
+exclude=$USERPROFILE\.mytool
 INI
 
 reset_test_key
 echo ""
-echo "Default config restored (mode=log + WorkBuddy whitelist). Test key removed."
+echo "Default config restored (mode=log + sample whitelist). Test key removed."
 exit "$FAIL"

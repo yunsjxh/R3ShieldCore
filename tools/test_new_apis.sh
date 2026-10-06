@@ -90,8 +90,8 @@ log_all_open=0
 hook_hive=$hook_hive
 hook_set_info=$hook_setinfo
 log=$logfile
-exclude=D:\\Program Files\\WorkBuddyAI
-exclude=C:$USERPROFILE\\.workbuddy-ai
+exclude=D:\\Program Files\\MyApp
+exclude=C:$USERPROFILE\\.mytool
 EOF
 }
 
