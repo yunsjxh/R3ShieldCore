@@ -21,6 +21,7 @@
 //
 //  用法：
 //    drvload_probe.exe <driver.sys> [服务名] [--keep] [--start-type boot|system|demand]
+//                      [--no-pause] [--log <path>]
 // ============================================================================
 
 #define WIN32_LEAN_AND_MEAN
@@ -43,6 +44,7 @@
 //    没法重定向 stdout（-Verb 与 -Redirect* 互斥）。所以自己写日志文件。
 // ---------------------------------------------------------------------------
 static FILE* g_log = nullptr;
+static bool  g_nopause = false;   // --no-pause：脚本/提权场景确定性地不等回车
 static bool IsElevated();   // 前向声明（定义在下面）
 
 static void LogOpen(const wchar_t* path) { g_log = _wfopen(path, L"wb"); }
@@ -139,9 +141,11 @@ static void DumpLoadPrereqs()
 static void MaybePause()
 {
     // ★ 铁律 157：双击时窗口随进程退出关闭 → 自停一次。
-    //   但**自动化运行**必须不阻塞：用 R3SC_NOPAUSE=1 关掉等待。
-    //   （不用"有没有控制台"判断 —— Start-Process 起的进程也有自己的控制台。）
-    bool nopause = false;
+    //   但**自动化运行**必须不阻塞。两条路都要有：
+    //     ① 环境变量 R3SC_NOPAUSE=1 —— 同控制台调用时够用；
+    //     ② --no-pause 开关 —— UAC 提权会换令牌、环境变量不保证传进去
+    //        （Start-Process -Verb RunAs 实测会停在"按回车"⇒ -Wait 永久阻塞）。
+    bool nopause = g_nopause;
     wchar_t env[8]{};
     if (GetEnvironmentVariableW(L"R3SC_NOPAUSE", env, 8) && env[0] == L'1')
         nopause = true;
@@ -275,11 +279,15 @@ int wmain(int argc, wchar_t** argv)
     setlocale(LC_ALL, "");
 
     if (argc < 2) {
-        printf("用法: drvload_probe.exe <driver.sys> [服务名] [--keep] [--start-type boot|system|demand]\n");
+        printf("用法: drvload_probe.exe <driver.sys> [服务名] [--keep] [--start-type boot|system|demand] [--no-pause]\n");
         printf("      drvload_probe.exe --dump-config     # 只读前提自检，不碰驱动\n");
         MaybePause();
         return 2;
     }
+
+    // 预扫描 --no-pause：--dump-config 与用法分支都走早返回，不经过下面的参数循环
+    for (int i = 1; i < argc; i++)
+        if (std::wstring(argv[i]) == L"--no-pause") g_nopause = true;
 
     // --dump-config：只读前提，不建服务、不加载。
     if (std::wstring(argv[1]) == L"--dump-config") {
@@ -303,6 +311,7 @@ int wmain(int argc, wchar_t** argv)
     for (int i = 2; i < argc; i++) {
         std::wstring a = argv[i];
         if (a == L"--keep") keep = true;
+        else if (a == L"--no-pause") g_nopause = true;
         else if (a == L"--log" && i + 1 < argc) logPath = argv[++i];
         else if (a == L"--start-type" && i + 1 < argc) {
             std::wstring t = argv[++i];
@@ -312,6 +321,19 @@ int wmain(int argc, wchar_t** argv)
         }
         else svc = a;
     }
+
+    // 目标文件名**按服务名派生**，不写死：写死会让两个不同服务撞同一个文件，
+    // 而加载成功后该文件被内核引用（重启前删不掉/覆盖不了）⇒ 第二次测试会
+    // 静默地拿旧镜像去测。文件名只用 [a-z0-9_-]，避免大小写/空格在 SCM 里出岔子。
+    std::wstring leaf;
+    for (wchar_t c : svc) {
+        if ((c >= L'a' && c <= L'z') || (c >= L'0' && c <= L'9') || c == L'-' || c == L'_')
+            leaf.push_back(c);
+        else if (c >= L'A' && c <= L'Z')
+            leaf.push_back((wchar_t)(c - L'A' + L'a'));
+    }
+    if (leaf.empty()) leaf = L"drvloadtest";
+    leaf += L".sys";
 
     LogOpen(logPath.c_str());
 
@@ -324,6 +346,7 @@ int wmain(int argc, wchar_t** argv)
            startType == SERVICE_BOOT_START ? L"BOOT_START" :
            startType == SERVICE_SYSTEM_START ? L"SYSTEM_START" : L"DEMAND_START");
     printf("  当前提权   : %ls\n", IsElevated() ? L"是" : L"否");
+    printf("  落盘文件名 : %ls\n", leaf.c_str());
 
     // ---- 0. 源文件存在性 ----
     WIN32_FILE_ATTRIBUTE_DATA fad{};
@@ -342,7 +365,7 @@ int wmain(int argc, wchar_t** argv)
     // ---- 1. 复制到 drivers 目录（内核从那里加载）----
     wchar_t dst[MAX_PATH]; 
     GetSystemDirectoryW(dst, MAX_PATH);
-    std::wstring dstPath = std::wstring(dst) + L"\\drivers\\r3shieldcore_loadtest.sys";
+    std::wstring dstPath = std::wstring(dst) + L"\\drivers\\" + leaf;
     printf("\n[1/5] 复制驱动到 %ls ...\n", dstPath.c_str());
     if (!CopyFileW(src.c_str(), dstPath.c_str(), FALSE)) {
         printf("      [FAIL] 复制失败 (err=%lu)\n", (unsigned long)GetLastError());
@@ -368,7 +391,7 @@ int wmain(int argc, wchar_t** argv)
         printf("      （清掉了一个已存在的同名服务）\n");
     }
 
-    std::wstring bin = L"System32\\drivers\\r3shieldcore_loadtest.sys";
+    std::wstring bin = L"System32\\drivers\\" + leaf;
     SC_HANDLE hSvc = CreateServiceW(
         hScm, svc.c_str(), L"R3ShieldCore Driver Load Probe",
         SERVICE_ALL_ACCESS, SERVICE_KERNEL_DRIVER, startType,
