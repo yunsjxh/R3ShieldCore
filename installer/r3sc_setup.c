@@ -793,24 +793,87 @@ static int install_driver(BOOL boot)
         return 0;
     }
 
-    /* 1) 落地驱动文件 */
-    ensure_dir(drvdir);
-    if (!CopyFileW(srcsys, drvfile, FALSE)) {
-        logmsg(L"       [警告] 复制驱动文件失败 (err=%lu) —— 跳过驱动安装。", GetLastError());
-        return 0;
-    }
-    logmsg(L"       驱动文件 -> %s", drvfile);
-
-    /* 2) 老服务先删掉，避免 sc create 报 1073（服务已存在） */
+    /* 1) ★ 先让**旧实例放手**，再落地驱动文件 —— 顺序不能反。
+     *
+     *   踩过的坑（自测第 4 步「第二次安装 --drv-start=auto」稳定复现）：
+     *   原来的顺序是「先 CopyFileW 覆盖 System32\drivers\<sys>，再 sc stop/delete」。
+     *   第一次安装已经 `sc start` 把驱动加载了 ⇒ 那个 .sys 在内核里映射着，
+     *   文件被独占 ⇒ CopyFileW 报 err=32 ERROR_SHARING_VIOLATION ⇒ 函数**提前
+     *   return 0**，后面那段「删旧服务 + 按新启动类型重建」**根本没执行**。
+     *   症状极具误导性：`sc qc` 回读到的还是第一次安装留下的 BOOT_START，
+     *   看着像"start= auto 没生效"，实际是**整个驱动分支被跳过了**。
+     *   （铁律 94「只信字段回读」+ 铁律 140「覆盖安装第一步让旧实例放手」。）
+     *
+     *   驱动实现了 DriverUnload（driver/r3shieldcore_kernel.c:206），
+     *   所以 `sc stop` 能真的把它卸掉、把文件放开。 */
     _snwprintf(cmd, 2047, L"\"%s\" query \"%s\"", sc, DRV_SVC);
     if (run_cmd_capture(cmd, out, 4096) == 0) {
+        int i, gone = 0;
         _snwprintf(cmd, 2047, L"\"%s\" stop \"%s\"", sc, DRV_SVC);
         run_cmd_hidden(cmd);
-        Sleep(1200);
+        /* ★ 有界等待「服务真的消失」，而不是盲等一个固定值 ——
+         *   卸不掉时（比如 DriverUnload 卡住）等多久都没用，必须能超时。 */
+        for (i = 0; i < 40; i++) {
+            _snwprintf(cmd, 2047, L"\"%s\" query \"%s\"", sc, DRV_SVC);
+            if (run_cmd_capture(cmd, out, 4096) != 0) { gone = 1; break; }
+            Sleep(150);
+        }
         _snwprintf(cmd, 2047, L"\"%s\" delete \"%s\"", sc, DRV_SVC);
         run_cmd_hidden(cmd);
-        logmsg(L"       已清理旧服务。");
+        /* ★ 删完必须**回读**：`sc delete` 对「仍加载中」的服务也返回 0
+         *   （它只是标记为删除，服务对象要等驱动卸载后才真的消失）。
+         *   只信返回码 ⇒ 以为"已清理"，随后 sc create 报 1073 被当成失败。 */
+        if (!gone) {
+            for (i = 0; i < 40; i++) {
+                _snwprintf(cmd, 2047, L"\"%s\" query \"%s\"", sc, DRV_SVC);
+                if (run_cmd_capture(cmd, out, 4096) != 0) { gone = 1; break; }
+                Sleep(150);
+            }
+        }
+        if (gone) {
+            logmsg(L"       已清理旧服务（已回读确认服务对象消失）。");
+        } else {
+            logmsg(L"       [警告] 旧服务 %s 还在（驱动没能卸载）—— "
+                   L"继续尝试直接覆盖驱动文件。", DRV_SVC);
+        }
     }
+
+    /* 2) 落地驱动文件
+     *   ★ 口径与 payload 展开一致（见 unzip_entry）：有界重试跨过"刚卸载、
+     *     句柄还没真正释放"的短窗口，再不行就**改名挪开**旧文件重写 ——
+     *     改名对"以 FILE_SHARE_DELETE 打开"的持有者有效，而且即使挪不掉
+     *     也不破坏原文件（比直接失败强）。 */
+    ensure_dir(drvdir);
+    {
+        int attempt, copied = 0;
+        for (attempt = 0; attempt < 20 && !copied; attempt++) {
+            if (CopyFileW(srcsys, drvfile, FALSE)) { copied = 1; break; }
+            /* 只有"被占用/拒绝访问"值得重试；路径不存在之类重试也没用。 */
+            if (GetLastError() != ERROR_SHARING_VIOLATION &&
+                GetLastError() != ERROR_ACCESS_DENIED &&
+                GetLastError() != ERROR_LOCK_VIOLATION) {
+                break;
+            }
+            Sleep(150);
+        }
+        if (!copied) {
+            WCHAR aside[PATH_MAX_W + 16];
+            _snwprintf(aside, PATH_MAX_W + 15, L"%s.old-%lu", drvfile,
+                       (unsigned long)GetTickCount());
+            aside[PATH_MAX_W + 15] = 0;
+            if (MoveFileExW(drvfile, aside, MOVEFILE_REPLACE_EXISTING) &&
+                CopyFileW(srcsys, drvfile, FALSE)) {
+                logmsg(L"       [信息] 旧驱动文件被占用，已挪到 %s 后重写。", aside);
+                copied = 1;
+            }
+        }
+        if (!copied) {
+            logmsg(L"       [警告] 复制驱动文件失败 (err=%lu) —— 跳过驱动安装。",
+                   GetLastError());
+            return 0;
+        }
+    }
+    logmsg(L"       驱动文件 -> %s", drvfile);
 
     /* 3) 注册服务
        ★ sc 的参数解析怪癖：`binPath=` 后面**必须**跟一个空格再跟值，
