@@ -7,7 +7,7 @@
 
 ---
 
-## 1. 先读这一节：三个绕不过去的前提
+## 1. 三个前提
 
 ### 1.1 内核驱动必须有签名，这不是可选项
 
@@ -120,7 +120,7 @@ driver\install_driver.bat
 powershell -ExecutionPolicy Bypass -File driver\verify_autostart.ps1
 ```
 
-**为什么第 ⑦ 步要等 10 分钟**：`sc query` 显示 RUNNING **证明不了**"开机自启"——
+第 ⑦ 步要等 10 分钟，是因为：`sc query` 显示 RUNNING **证明不了**"开机自启"——
 你刚手动 `sc start` 过的状态和它一模一样。真正能区分两者的，是驱动自报的
 `LoadSinceBootMs`（驱动被加载时系统已开机多少毫秒）：
 
@@ -142,7 +142,7 @@ powershell -ExecutionPolicy Bypass -File driver\verify_autostart.ps1
 | 抢救方式 | 安全模式 / `uninstall_driver.bat` | 只能 WinRE 离线删文件 |
 | 相对收益 | 早于**所有**用户态代码 | 比 AUTO_START 再早几百毫秒 |
 
-**结论（2026-10-05 变更后）**：用户明确要求「最早启动」，所以选了 `BOOT_START`。
+结论（2026-10-05 变更后）：用户明确要求「最早启动」，所以选了 `BOOT_START`。
 这一档换来的收益是「在用户态代码开始跑之前最早」，代价是上表后四行。
 既然选了它，就必须靠**驱动自身足够克制**来抵消风险 —— 本驱动正是这么写的：
 
@@ -179,7 +179,7 @@ powershell -ExecutionPolicy Bypass -File driver\verify_autostart.ps1
 
 - **`LoadSinceBootMs` 用 `KeQueryInterruptTime()`**，在 `DriverEntry` 的**第一件事**里取
   —— 在任何可能失败的操作之前。这样即使后面建设备失败，"我什么时候被加载的"也已经拿到了。
-  （顺带一提：`KeQueryInterruptTime` 在新 WDK 里是**宏**，直接读 `KUSER_SHARED_DATA`，
+  （`KeQueryInterruptTime` 在新 WDK 里是**宏**，直接读 `KUSER_SHARED_DATA`，
   所以它**不出现在导入表里**。这是正常的，也更快。）
 - **建设备失败不返回错误**（仍返回 `STATUS_SUCCESS`）。本驱动存在的意义是"被加载"，
   因为设备名冲突这种小事让整个加载失败，是把手段当成了目的。失败原因会 `DbgPrint`
@@ -189,7 +189,7 @@ powershell -ExecutionPolicy Bypass -File driver\verify_autostart.ps1
 - **结构体两侧布局钉死**：驱动与探针各有一个编译期断言（`sizeof == 40`）。
   布局不一致会读到错位的垃圾，而且**不会报错**。
 
-### 4.3 反过来说：这些"没有"是刻意的
+### 4.3 这些"没有"是刻意的
 
 判据（直接跑一遍就能复现）：
 
@@ -231,7 +231,7 @@ bcdedit /set testsigning off     # ★ 同样会触发 BitLocker 恢复密钥提
 
 然后重启。
 
-### 5.3 本驱动**没有**做的事（所以它不会导致这些问题）
+### 5.3 本驱动没有做的事（所以它不会导致这些问题）
 
 - 不拦截任何系统调用 / 文件 / 注册表 / 进程
 - 不保护任何进程
@@ -241,7 +241,7 @@ bcdedit /set testsigning off     # ★ 同样会触发 BitLocker 恢复密钥提
 
 ---
 
-## 6. 构建说明（三个必须知道的坑）
+## 6. 构建说明（三个坑）
 
 ### 6.1 WDK 版本和 `build.sh` **不是**同一个
 
