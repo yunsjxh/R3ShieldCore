@@ -90,6 +90,7 @@ DIST_FILES = [
     "r3shieldcore-blockallsafe.ini", "r3shieldcore-safe-first.ini",
     "start.bat", "stop.bat", "unlock-acl.bat", "verify-v26.bat", "netcheck-diag.bat",
     "dskill.exe",
+    "r3shieldcore-cfg.exe",
     "配置详解.md", "模式选择说明.md", "部署指南.md", "预设说明.txt",
 ]
 DRIVER_REL = "driver/r3shieldcore_kernel.sys"

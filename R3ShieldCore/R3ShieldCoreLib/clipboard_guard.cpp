@@ -1,5 +1,6 @@
 #include "stdafx.h"
 #include "clipboard_guard.h"
+#include "clipboard_spoof_codec.h"
 #include "registry_guard.h"
 #include "r3shieldcore_channel.h"
 #include "r3shieldcore_prompt.h"
@@ -12,6 +13,7 @@
 // 挂载点（都在 user32）：
 //   OpenClipboard    ← 打开剪贴板（读写的敲门砖）→ 只记录
 //   GetClipboardData ← 真正取走内容              → 高危
+//   CloseClipboard   ← ★ v70：只为**回收替换块**而挂（见下面"句柄所有权"）
 //
 // ⚠️ 噪音控制的要点：
 //   OpenClipboard 频率不低（每次粘贴、每次截图工具、输入法都会调），
@@ -28,21 +30,25 @@ namespace
 	// ------------------------------------------------------------------
 	typedef BOOL(WINAPI* OpenClipboardPtr)(HWND);
 	typedef HANDLE(WINAPI* GetClipboardDataPtr)(UINT);
+	typedef BOOL(WINAPI* CloseClipboardPtr)();
 
 	OpenClipboardPtr pOriginalOpenClipboard = nullptr;
 	GetClipboardDataPtr pOriginalGetClipboardData = nullptr;
+	CloseClipboardPtr pOriginalCloseClipboard = nullptr;
 
 	bool g_installed = false;
 	bool g_bypass = false;
 	int g_hookCount = 0;
 	volatile LONG g_activeHooks = 0;
 
-	enum class Action
-	{
-		Pass,
-		Record,
-		Block,
-	};
+	// ★ v70：CloseClipboard 挂上了才允许替换 —— 否则替换出来的块无人回收。
+	bool g_closeHookReady = false;
+
+	// v74：决策档位收敛到共享 ABI（`R3ShieldCore::Action`，见
+	//   shared/r3shieldcore/r3shieldcore_shared.h）。本文件**不再**自己定义。
+	//   ★ 本面的 `Spoof` 落地形态：`GetClipboardData` **成功**返回，但返回的
+	//     句柄指向我们造的中性化内容（v70），并在 `CloseClipboard` 回收。
+	using Action = R3ShieldCore::Action;
 
 	LONG64 NowFileTime() noexcept
 	{
@@ -81,7 +87,124 @@ namespace
 		return R3ShieldCore::Verdict::Deny;
 	}
 
-	Action Evaluate(R3ShieldCore::ClipboardOp op, R3ShieldCore::Event& event, bool allowAsk) noexcept
+	// ==================================================================
+	// v70：替换（Spoof）—— 判据 + 伪造句柄的生命周期
+	// ==================================================================
+	//
+	// ★★ 这个面**特有**的坑：**句柄所有权**。
+	//
+	//   契约（MSDN）：`GetClipboardData` 返回的 `HANDLE` **归剪贴板所有**，
+	//   调用方**不得** `GlobalFree` / `DeleteObject`（它只该 `GlobalLock` +
+	//   `GlobalUnlock`），有效期到 `CloseClipboard` 为止。
+	//
+	//   ⇒ 所以替换不是"改个指针"就完了，而是三件事：
+	//     ① 自己造一块（`clipboard_spoof_codec.h`）；
+	//     ② 把**原句柄**换成自己的，让调用方拿去用；
+	//     ③ 等调用方用完之后再释放 —— **早了**对方读到已释放内存（崩溃），
+	//        **晚了**就是泄漏。唯一正确的时刻是 `CloseClipboard`。
+	//
+	//   ⇒ 因此 v70 多挂了一个 `CloseClipboard`（只为回收，不改它的行为）。
+	//     若它没挂上，**本次一律不启用替换**（`g_closeHookReady`）——
+	//     宁可退回"拒绝"，也不能造出一批无人回收的块。
+	//
+	// 为什么槽是**进程级固定数组**而不是 thread_local：剪贴板由"打开它的
+	//   线程"持有，但 `GetClipboardData` 的调用方**未必是那个线程**（同进程
+	//   另一线程读剪贴板是合法的）。thread_local 会漏掉别人的槽 ⇒ 泄漏。
+	//   槽的占用用 `InterlockedCompareExchange` 抢，不需要临界区。
+	constexpr int kMaxFakeSlots = 16;
+
+	struct FakeSlot
+	{
+		volatile LONG inUse;
+		UINT format;
+		HANDLE handle;
+	};
+
+	FakeSlot g_fakeSlots[kMaxFakeSlots] = {};
+	volatile LONG g_fakeTracked = 0;   // 累计登记数（诊断）
+	volatile LONG g_fakeOverflow = 0;  // 槽不够用的次数（**必须可见**，铁律 178）
+	volatile LONG g_fakeReleased = 0;  // 累计回收数（诊断）
+
+	bool SpoofClipboardEnabled() noexcept
+	{
+		// ⚠️ 前置条件：CloseClipboard 挂上了，否则块无法回收。
+		if (!g_closeHookReady) {
+			return false;
+		}
+		R3ShieldCore::Policy* policy = R3ShieldCoreChannel::Policy();
+		return policy && (policy->Flags2 & R3ShieldCore::FlagSpoofClipboard) != 0;
+	}
+
+	void TrackFake(UINT format, HANDLE fake) noexcept
+	{
+		if (!fake) {
+			return;
+		}
+
+		for (int i = 0; i < kMaxFakeSlots; ++i) {
+			if (InterlockedCompareExchange(&g_fakeSlots[i].inUse, 1, 0) == 0) {
+				g_fakeSlots[i].format = format;
+				g_fakeSlots[i].handle = fake;
+				InterlockedIncrement(&g_fakeTracked);
+				return;
+			}
+		}
+
+		// 槽满 —— 正常"open/close 配对 + 最多 6 种可伪造格式"下不可达。
+		// ★ 这里的取舍：**宁可泄漏，也不提前释放**。提前释放 ⇒ 调用方拿到
+		//   已释放的内存 ⇒ 宿主进程崩溃；泄漏几 KB 只是浪费。
+		//   （铁律 97：不能只有"没生效"，所以这里必须留下痕迹。）
+		InterlockedIncrement(&g_fakeOverflow);
+		LOG(L"ClipboardGuard: 伪造句柄槽已满(%d)，本次块不再登记（选择泄漏，不提前释放）", kMaxFakeSlots);
+	}
+
+	void ReleaseAllFakes() noexcept
+	{
+		for (int i = 0; i < kMaxFakeSlots; ++i) {
+			if (InterlockedCompareExchange(&g_fakeSlots[i].inUse, 0, 1) == 1) {
+				const UINT format = g_fakeSlots[i].format;
+				HANDLE handle = g_fakeSlots[i].handle;
+				g_fakeSlots[i].handle = nullptr;
+				g_fakeSlots[i].format = 0;
+				R3ShieldCoreClipboardSpoof::FreeFake(format, handle);
+				InterlockedIncrement(&g_fakeReleased);
+			}
+		}
+	}
+
+	// 「本应拒绝」时的统一出口。
+	//
+	// ★ v70：开关打开 **且该格式造得出合法替代物** ⇒ 替换；否则 ⇒ 拒绝
+	//   （原行为，一字不改）。
+	//
+	// ⚠️ 为什么"格式不支持"要**回落拒绝**而不是"照原样返回"：造不出未知格式
+	//    的合法布局，硬造一个长度不对的块会让调用方读越界/解析错 —— 那是
+	//    "替换"**新引入**的崩溃面。回落拒绝 = v70 之前的行为，安全。
+	// ⚠️ 返回 Spoof 时，detour 层**不得**返回 nullptr —— 要真调原函数、
+	//    再把返回的句柄换成我们的。
+	// ⚠️ 本函数**不**负责置 FlagEvent2Spoofed：那是 detour 层按"替代物是否
+	//    真的造出来了"置的。
+	Action RejectOrSpoof(R3ShieldCore::Event& event, UINT format) noexcept
+	{
+		const bool formatOk = R3ShieldCoreClipboardSpoof::ClassifyFormat(format)
+			!= R3ShieldCoreClipboardSpoof::FakeKind::Unsupported;
+
+		if (formatOk && SpoofClipboardEnabled()) {
+			// 替换不是"被拦"：不置 FlagEventBlocked，不计 HighRiskBlocked。
+			event.Decision = static_cast<ULONG>(R3ShieldCore::Decision::Spoofed);
+			return Action::Spoof;
+		}
+
+		event.Decision = static_cast<ULONG>(R3ShieldCore::Decision::Blocked);
+		event.Flags |= R3ShieldCore::FlagEventBlocked;
+		if (R3ShieldCore::ChannelHeader* channel = R3ShieldCoreChannel::Channel()) {
+			InterlockedIncrement(&channel->HighRiskBlocked);
+		}
+		return Action::Block;
+	}
+
+	Action Evaluate(R3ShieldCore::ClipboardOp op, R3ShieldCore::Event& event,
+		bool allowAsk, UINT format) noexcept
 	{
 		event.ObjectType = static_cast<ULONG>(R3ShieldCore::ObjectType::Clipboard);
 		event.Op = static_cast<ULONG>(op);
@@ -126,12 +249,8 @@ namespace
 		const bool canAsk = allowAsk && (mode == static_cast<ULONG>(R3ShieldCore::Mode::Ask));
 		if (!canAsk) {
 			if (mode == static_cast<ULONG>(R3ShieldCore::Mode::Block)) {
-				event.Decision = static_cast<ULONG>(R3ShieldCore::Decision::Blocked);
-				event.Flags |= R3ShieldCore::FlagEventBlocked;
-				if (R3ShieldCore::ChannelHeader* channel = R3ShieldCoreChannel::Channel()) {
-					InterlockedIncrement(&channel->HighRiskBlocked);
-				}
-				return Action::Block;
+				// ★ v70：本应拒绝 ⇒ 看是否改走"替换"（不支持的格式仍回落拒绝）。
+				return RejectOrSpoof(event, format);
 			}
 
 			event.Decision = static_cast<ULONG>(R3ShieldCore::Decision::WouldBlock);
@@ -160,12 +279,8 @@ namespace
 			return Action::Record;
 		}
 
-		event.Decision = static_cast<ULONG>(R3ShieldCore::Decision::Blocked);
-		event.Flags |= R3ShieldCore::FlagEventBlocked;
-		if (R3ShieldCore::ChannelHeader* channel = R3ShieldCoreChannel::Channel()) {
-			InterlockedIncrement(&channel->HighRiskBlocked);
-		}
-		return Action::Block;
+		// 用户点了"拒绝"（或超时按兜底结论）：★ v70 —— 同样走 RejectOrSpoof。
+		return RejectOrSpoof(event, format);
 	}
 
 	// 常用剪贴板格式名。只是给用户看个大概 —— 格式号可以是任意注册格式，
@@ -198,7 +313,9 @@ namespace
 
 		// 只记录：allowAsk = false，且即使判定返回 Block 也不会拦开。
 		// 走到 Open 的调用绝大多数是正常粘贴/复制，不该打断。
-		Evaluate(R3ShieldCore::ClipboardOp::Open, event, false);
+		// ⚠️ format 传 0：Open 没有格式概念，它永远走不到 RejectOrSpoof
+		//    （规则层把 Open 判为非高危）。
+		Evaluate(R3ShieldCore::ClipboardOp::Open, event, false, 0);
 
 		const BOOL result = pOriginalOpenClipboard(newOwner);
 		event.Status = result ? 0u : static_cast<ULONG>(GetLastError());
@@ -229,7 +346,7 @@ namespace
 		event.ValueNameLength = static_cast<ULONG>(wcslen(event.ValueName));
 		event.Status = 0;
 
-		const Action action = Evaluate(R3ShieldCore::ClipboardOp::Read, event, true);
+		const Action action = Evaluate(R3ShieldCore::ClipboardOp::Read, event, true, format);
 		if (action == Action::Block) {
 			event.Status = ERROR_ACCESS_DENIED;
 			Publish(event);
@@ -240,7 +357,59 @@ namespace
 
 		const HANDLE result = pOriginalGetClipboardData(format);
 		event.Status = result ? 0u : static_cast<ULONG>(GetLastError());
+
+		// ★ v70：替换 —— 真调已经发生（剪贴板状态真实），现在把**返回的句柄**
+		//    换成我们自己的中性化块，并**返回它**（调用者看不出区别）。
+		//
+		// ⚠️ 真调**失败**（该格式此刻不在剪贴板上）⇒ 没有内容可泄露，
+		//    如实返回失败，不伪造一个"成功"。
+		// ⚠️ 造不出来（分配失败 / 格式其实是 HBITMAP 但句柄不是位图）
+		//    ⇒ **如实返回真实句柄**并留日志：这是"替换没做成"，不能假装成功
+		//    （铁律 97：不能只有"没生效"）。Decision 仍是 Spoofed，但
+		//    FlagEvent2Spoofed 不置 —— 事后能区分这两种情况。
+		HANDLE returned = result;
+		if (action == Action::Spoof && result) {
+			HANDLE fake = R3ShieldCoreClipboardSpoof::BuildFake(format, result);
+			if (fake) {
+				TrackFake(format, fake);
+				returned = fake;
+				event.Flags2 |= R3ShieldCore::FlagEvent2Spoofed;
+			}
+			else {
+				// ⚠️ 这条日志里带 **ASCII** 子串 `spoof_clipboard`，不是给用户看的
+				//    装饰 —— 它是 `check_dist_sync.sh` 的 v70 代次标记：
+				//    `strings -el`（16 位）只输出 ASCII 可打印字符，纯中文标记
+				//    永远查不到（会变成恒 FAIL）。改动这条日志时别把标记删了。
+				LOG(L"ClipboardGuard: 剪贴板替换失败（spoof_clipboard，格式 %u 造不出替代物），本次返回真实内容", format);
+			}
+		}
+
 		Publish(event);
+
+		InterlockedDecrement(&g_activeHooks);
+		return returned;
+	}
+
+	// ------------------------------------------------------------------
+	// hook：CloseClipboard（★ v70 新增，只为**回收替换块**）
+	// ------------------------------------------------------------------
+	//
+	// 它**不改** CloseClipboard 的行为（不拦、不改返回值），只是"顺手"在
+	// 契约终点把我们的替代物还回去。
+	//
+	// ⚠️ 只在**原函数成功**时回收：CloseClipboard 成功 ⇒ 说明本线程/本进程
+	//    确实是持有者，且这一轮会话已结束 ⇒ 登记在册的块都成了"没人该再用"
+	//    的过期块。若原函数**失败**（本来就没开着），贸然回收会误伤另一个
+	//    线程**正在进行**的会话里的块 —— 那会让对方读到已释放内存。
+	BOOL WINAPI CloseClipboard_Hook()
+	{
+		InterlockedIncrement(&g_activeHooks);
+
+		const BOOL result = pOriginalCloseClipboard();
+
+		if (result) {
+			ReleaseAllFakes();
+		}
 
 		InterlockedDecrement(&g_activeHooks);
 		return result;
@@ -342,6 +511,18 @@ namespace ClipboardGuard
 			reinterpret_cast<LPVOID*>(&pOriginalOpenClipboard), true);
 		QueueHook("user32.dll", "GetClipboardData", reinterpret_cast<LPVOID>(GetClipboardData_Hook),
 			reinterpret_cast<LPVOID*>(&pOriginalGetClipboardData), true);
+
+		// ★ v70：CloseClipboard 是**替换块的唯一回收点**。
+		//   没挂上 ⇒ 本次**不启用替换**（`SpoofClipboardEnabled` 会返回 false）
+		//   —— 宁可退回"拒绝"，也不能造出一批无人回收的块。
+		//   见 `RejectOrSpoof` / `g_closeHookReady` 的注释。
+		g_closeHookReady = QueueHook("user32.dll", "CloseClipboard",
+			reinterpret_cast<LPVOID>(CloseClipboard_Hook),
+			reinterpret_cast<LPVOID*>(&pOriginalCloseClipboard), true);
+		if (!g_closeHookReady) {
+			LOG(L"ClipboardGuard: CloseClipboard 未挂上 ⇒ 本次不启用剪贴板替换"
+				L"（替换出来的块将无人回收）");
+		}
 
 		g_installed = true;
 

@@ -17,6 +17,12 @@ selftest_gbk_gate.py —— `check_source_gbk.py` 的**负对照自测**（v66�
       这既是"它会红"的证明，也是"它只在真该红的时候红"的证明
       （夹具里同时放了宽字面量 / u8 字面量 / 豁免行，它们**必须**一处都不报）。
 
+★ v75 加第 ⑥ 节：`--wide` 模式（铁律 226）。
+    `--wide` 把检测器对准**宽**字面量（L"..."）—— 它们不会被 C4566 丢字，
+    但经 WideCharToMultiByte(CP_ACP) 输出时，CP936 编不出的字符会变成 `?`。
+    判据方向**正好相反**：这时 W1/W2 **必须**命中，N1/N2 **必须**一处不报。
+    ⇒ 同一个夹具、同一套标记，把"选中的字面量类别相反"这件事也断言了。
+
 夹具：`tools/gbk_gate_fixture.txt`（故意叫 .txt，免得被 `--all` 收进去）。
 判据**按标记定位行号**，不硬编码 —— 夹具插删行不会让自测悄悄失效。
 
@@ -214,6 +220,37 @@ def main():
             os.remove(tmp)
         except OSError:
             pass
+
+    # ---- ⑥ ★ --wide 模式：把检测器对准宽字面量（v75，铁律 226）----------
+    #
+    #   同一个词法器、同一个判据（能不能 CP936 编码），只是"选中的字面量
+    #   类别"相反。这条断言同时证明两件事：
+    #     · 不是**恒绿** —— 宽字面量里的坏字符真能被查出来（W1/W2 命中）；
+    #     · 不是**恒红** —— 它确实**只**查宽字面量，窄字面量一处不报
+    #       （N1/N2 = 0），u8 / 豁免行也不报。
+    print("\n--- ⑥ --wide 模式：只查宽字面量（v75）---")
+    bad_wide, err3 = gate.scan(FIXTURE, include_comments=False, wide_only=True)
+    if not check(bad_wide is not None and err3 is None,
+                 "scan(--wide) 无错误", "err=%s" % err3):
+        return 1
+
+    got_wide = {}
+    for line, col, ch, cp, w, pre in bad_wide:
+        got_wide[line] = got_wide.get(line, 0) + 1
+
+    check(got_wide.get(line_of["W1"], 0) == 2, "W1 行检出 2 处（--wide）",
+          "实际=%d" % got_wide.get(line_of["W1"], 0))
+    check(got_wide.get(line_of["W2"], 0) == 1, "W2 行检出 1 处（--wide，\\u 转义）",
+          "实际=%d" % got_wide.get(line_of["W2"], 0))
+    for mark in ("N1", "N2", "U1", "E1"):
+        got = got_wide.get(line_of[mark], 0)
+        check(got == 0, "%-4s 行在 --wide 下不被检出" % mark, "实际=%d" % got)
+    check(len(bad_wide) == 3, "--wide 模式合计 = 3 处", "实际=%d" % len(bad_wide))
+
+    r_wide = subprocess.run([sys.executable, os.path.join(HERE, "check_source_gbk.py"),
+                             "--wide", FIXTURE], capture_output=True, text=True)
+    check(r_wide.returncode == 1, "坏夹具 --wide -> 退出码 1",
+          "实际=%d" % r_wide.returncode)
 
     print("\n=== 结果：%d 通过 / %d 失败 ===" % (g_pass, g_fail))
     return 0 if g_fail == 0 else 1

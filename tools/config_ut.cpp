@@ -12,6 +12,17 @@ namespace
 		std::cout << (condition ? "PASS " : "FAIL ") << name << '\n';
 		return condition;
 	}
+
+	// ★ 铁律 173：大聚合体的**花括号赋值**（`policy = {};`）会让 MSVC 抛
+	//   C1001「内部编译器错误」—— 报错位置是"第 N 个"，看着像语法错，
+	//   实际是编译器自己崩了，**闸门整条编不出来**（表现出来只是"没输出"）。
+	//   本文件里这种赋值原本 25 处；v70 加到第 26 处时 UT 直接编不过。
+	//   修法 = 换成 ZeroMemory（`Policy` 是 POD，语义完全一样），
+	//   编译器不再为每次赋值造一个临时聚合体。
+	void ResetPolicy(R3ShieldCore::Policy& p)
+	{
+		ZeroMemory(&p, sizeof(p));
+	}
 }
 
 int main()
@@ -47,7 +58,7 @@ int main()
 		std::ofstream ini(dir / L"r3shieldcore.ini", std::ios::binary | std::ios::trunc);
 		ini << "inject_shell_thin=0\n";
 	}
-	policy = {};
+	ResetPolicy(policy);
 	R3ShieldCoreConfig::Load(policy, dir);
 	failed += !Check("inject_shell_thin=0 disables thin inject",
 		(policy.Flags2 & R3ShieldCore::FlagInjectShellThin) == 0);
@@ -58,7 +69,7 @@ int main()
 		std::ofstream ini(dir / L"r3shieldcore.ini", std::ios::binary | std::ios::trunc);
 		ini << "inject_shell_thin=1\n";
 	}
-	policy = {};
+	ResetPolicy(policy);
 	R3ShieldCoreConfig::Load(policy, dir);
 	failed += !Check("inject_shell_thin=1 enables thin inject",
 		(policy.Flags2 & R3ShieldCore::FlagInjectShellThin) != 0);
@@ -68,7 +79,7 @@ int main()
 		std::ofstream ini(dir / L"r3shieldcore.ini", std::ios::binary | std::ios::trunc);
 		ini << "inject_shell_thin=1   # 瘦注入\n";
 	}
-	policy = {};
+	ResetPolicy(policy);
 	R3ShieldCoreConfig::Load(policy, dir);
 	failed += !Check("inject_shell_thin inline comment stripped -> 1",
 		(policy.Flags2 & R3ShieldCore::FlagInjectShellThin) != 0);
@@ -78,7 +89,7 @@ int main()
 		std::ofstream ini(dir / L"r3shieldcore.ini", std::ios::binary | std::ios::trunc);
 		ini << "inject_shell_thin=off\n";
 	}
-	policy = {};
+	ResetPolicy(policy);
 	R3ShieldCoreConfig::Load(policy, dir);
 	failed += !Check("inject_shell_thin=off disables thin inject",
 		(policy.Flags2 & R3ShieldCore::FlagInjectShellThin) == 0);
@@ -87,7 +98,7 @@ int main()
 		std::ofstream ini(dir / L"r3shieldcore.ini", std::ios::binary | std::ios::trunc);
 		ini << "inject_shell_thin=on\n";
 	}
-	policy = {};
+	ResetPolicy(policy);
 	R3ShieldCoreConfig::Load(policy, dir);
 	failed += !Check("inject_shell_thin=on enables thin inject",
 		(policy.Flags2 & R3ShieldCore::FlagInjectShellThin) != 0);
@@ -96,7 +107,7 @@ int main()
 		std::ofstream ini(dir / L"r3shieldcore.ini", std::ios::binary | std::ios::trunc);
 		ini << "hook_raw_disk=1\n";
 	}
-	policy = {};
+	ResetPolicy(policy);
 	R3ShieldCoreConfig::Load(policy, dir);
 	// ★ 交叉检查：改 hook_raw_disk 不能顺手把瘦注入关掉（两条独立的位）
 	failed += !Check("hook_raw_disk=1 keeps thin-inject untouched (independent bits)",
@@ -107,7 +118,7 @@ int main()
 		std::ofstream ini(dir / L"r3shieldcore.ini", std::ios::binary | std::ios::trunc);
 		ini << "hook_raw_disk=0\n";
 	}
-	policy = {};
+	ResetPolicy(policy);
 	R3ShieldCoreConfig::Load(policy, dir);
 	failed += !Check("hook_raw_disk=0 disables raw-disk hook",
 		(policy.Flags2 & R3ShieldCore::FlagHookRawDisk) == 0);
@@ -118,7 +129,7 @@ int main()
 		std::ofstream ini(dir / L"r3shieldcore.ini", std::ios::binary | std::ios::trunc);
 		ini << "hook_raw_disk=1\n";
 	}
-	policy = {};
+	ResetPolicy(policy);
 	R3ShieldCoreConfig::Load(policy, dir);
 	failed += !Check("hook_raw_disk=1 enables raw-disk hook",
 		(policy.Flags2 & R3ShieldCore::FlagHookRawDisk) != 0);
@@ -150,7 +161,7 @@ int main()
 		ini << "exclude=C:\\a#b\n";
 		ini << "exclude=D:\\x  ; 行内分号注释\n";
 	}
-	policy = {};
+	ResetPolicy(policy);
 	R3ShieldCoreConfig::Load(policy, dir);
 	failed += !Check("inline comment: mode=block # ... parses as block",
 		policy.Mode == static_cast<ULONG>(R3ShieldCore::Mode::Block));
@@ -246,7 +257,7 @@ int main()
 			<< "protect_reg=Software\\Trailing   # 行内注释\n";
 		ini.close();
 
-		policy = {};
+		ResetPolicy(policy);
 		R3ShieldCoreConfig::Load(policy, dir);
 
 		failed += !Check("protect_reg: 3 条有效前缀被读进来（注释/空值被跳过）",
@@ -450,6 +461,619 @@ int main()
 			failed += !Check("ark 三键各自独立（0 / 3000 / 750 互不影响）",
 				!e2.ArkEnabled && e2.ArkScanMs == 3000 && e2.ArkRefreshMs == 750);
 		}
+	}
+
+	// ---- v69：限定注入范围 test_inject_only= + mode=test ----
+	//
+	// 为什么补这一节：v69 把测试模式从**命令行**（`--test-inject-only=`）改成
+	// **配置驱动**（`mode=test` + `test_inject_only=`）。改动集中在两处：
+	//   ① `r3shieldcore_config.cpp` 的解析（本文件钉住）；
+	//   ② `functions.cpp` 的注入决策（`MatchesTestInjectList`，需要引擎才能跑，
+	//      由 tools/spoof_e2e.sh 的端到端矩阵负责）。
+	// ②跑不起来（要提权、要注入）⇒ ①必须在这里钉死，否则"配置改了但没生效"
+	// 和"决策写错了"两种故障长得一模一样（铁律 100：没看见 / 没规则 / 判据错
+	// 要分得开）。
+	//
+	// ★ 本节还钉住一条**容易在重构中被弄丢**的设计：**注入范围与拦截行为解耦**
+	//   —— `test_inject_only=` 与 `mode=` **无关**，只要名单非空就生效。
+	//   为什么必须解耦：spoof（截屏替换）只在"本应拒绝"时才生效，而
+	//   `mode=test` 的决策行为 = `log`（全部放行）⇒ 若白名单只认 `mode=test`，
+	//   那就永远验证不到替换路径（为验证而加的模式，恰好让被验证的功能不触发）。
+	{
+		// ---- 缺文件：默认**不**限定注入范围，也**不**带 FlagTestMode ----
+		std::filesystem::remove(dir / L"r3shieldcore.ini", ec);
+		ResetPolicy(policy);
+		R3ShieldCoreConfig::Load(policy, dir);
+		failed += !Check("test_inject_only: missing config -> count 0（默认全局注入）",
+			policy.TestInjectCount == 0);
+		failed += !Check("test_inject_only: missing config -> FlagTestMode 关",
+			(policy.Flags2 & R3ShieldCore::FlagTestMode) == 0);
+
+		// ---- mode=test ⇒ Mode::Log + FlagTestMode ----
+		{
+			std::ofstream ini(dir / L"r3shieldcore.ini", std::ios::binary | std::ios::trunc);
+			ini << "mode=test\n";
+			ini.close();
+			ResetPolicy(policy);
+			R3ShieldCoreConfig::Load(policy, dir);
+			failed += !Check("mode=test -> Mode 落到 Log（不新增 Mode 枚举值）",
+				policy.Mode == static_cast<ULONG>(R3ShieldCore::Mode::Log));
+			failed += !Check("mode=test -> FlagTestMode 置位（引擎据此要求名单非空）",
+				(policy.Flags2 & R3ShieldCore::FlagTestMode) != 0);
+			// ★ fail-closed 的**触发条件**本身也要钉住：写了 test 却没给名单。
+			failed += !Check("mode=test 且名单为空 -> 计数 0（引擎据此拒绝启动）",
+				policy.TestInjectCount == 0);
+		}
+
+		// ---- mode= 是**权威**的：后面再写一行 mode=block 必须清掉 FlagTestMode ----
+		//   否则会留下"最后一行是 block，但引擎仍要求白名单非空"的半开状态，
+		//   而且**不可见**（铁律 97）。
+		{
+			std::ofstream ini(dir / L"r3shieldcore.ini", std::ios::binary | std::ios::trunc);
+			ini << "mode=test\n";
+			ini << "mode=block\n";
+			ini.close();
+			ResetPolicy(policy);
+			R3ShieldCoreConfig::Load(policy, dir);
+			failed += !Check("mode=block 覆盖 mode=test -> Mode 为 Block",
+				policy.Mode == static_cast<ULONG>(R3ShieldCore::Mode::Block));
+			failed += !Check("mode=block 覆盖 mode=test -> FlagTestMode 被清掉（mode= 权威）",
+				(policy.Flags2 & R3ShieldCore::FlagTestMode) == 0);
+		}
+
+		// ---- ★ 解耦：名单**与 mode= 无关**（block 下也照样读进来）----
+		//   这是端到端三格矩阵能成立的前提（A/B 格是 mode=block）。
+		{
+			std::ofstream ini(dir / L"r3shieldcore.ini", std::ios::binary | std::ios::trunc);
+			ini << "mode=block\n";
+			ini << "test_inject_only=probe.exe\n";
+			ini.close();
+			ResetPolicy(policy);
+			R3ShieldCoreConfig::Load(policy, dir);
+			failed += !Check("解耦：mode=block + 名单 -> 名单照样被读进来（count 1）",
+				policy.TestInjectCount == 1);
+			failed += !Check("解耦：mode=block 不置 FlagTestMode",
+				(policy.Flags2 & R3ShieldCore::FlagTestMode) == 0);
+			failed += !Check("解耦：第 1 条内容正确",
+				policy.TestInjectCount >= 1
+				&& std::wstring(policy.TestInjectPaths[0]) == L"probe.exe");
+		}
+
+		// ---- 可重复 / 逗号分隔 / 空值 / 行内注释 / 路径形式 ----
+		{
+			std::ofstream ini(dir / L"r3shieldcore.ini", std::ios::binary | std::ios::trunc);
+			ini << "mode=test\n";
+			ini << "test_inject_only=a.exe\n";                       // 可重复
+			ini << "test_inject_only=b.exe, c.exe\n";                // 一行逗号分隔 + 空格
+			ini << "test_inject_only=\n";                            // 空值必须被忽略
+			ini << "test_inject_only=   \n";                         // 纯空白必须被忽略
+			ini << "test_inject_only=D:\\dev\\my target.exe   # 说明\n"; // 路径 + 行内注释
+			ini.close();
+			ResetPolicy(policy);
+			R3ShieldCoreConfig::Load(policy, dir);
+			failed += !Check("test_inject_only: 4 条有效（空值/纯空白被跳过）",
+				policy.TestInjectCount == 4);
+			failed += !Check("test_inject_only: 第 1 条 = a.exe",
+				policy.TestInjectCount >= 1
+				&& std::wstring(policy.TestInjectPaths[0]) == L"a.exe");
+			failed += !Check("test_inject_only: 逗号分隔被切开 -> 第 2 条 = b.exe",
+				policy.TestInjectCount >= 2
+				&& std::wstring(policy.TestInjectPaths[1]) == L"b.exe");
+			failed += !Check("test_inject_only: 逗号后的空格被去掉 -> 第 3 条 = c.exe",
+				policy.TestInjectCount >= 3
+				&& std::wstring(policy.TestInjectPaths[2]) == L"c.exe");
+			failed += !Check("test_inject_only: 行内注释被切、路径原样保留",
+				policy.TestInjectCount >= 4
+				&& std::wstring(policy.TestInjectPaths[3]) == L"D:\\dev\\my target.exe");
+		}
+
+		// ---- 上限：超出的必须被**丢弃**，绝不能越界写 ----
+		//   ⚠️ "静默丢弃"本身可接受（横幅会打实际生效条数），但**越界**不行。
+		{
+			std::ofstream ini(dir / L"r3shieldcore.ini", std::ios::binary | std::ios::trunc);
+			ini << "mode=test\n";
+			for (int i = 0; i < 24; ++i) {
+				ini << "test_inject_only=p" << i << ".exe\n";
+			}
+			ini.close();
+			ResetPolicy(policy);
+			R3ShieldCoreConfig::Load(policy, dir);
+			failed += !Check("test_inject_only: 超过上限被截断到 MaxTestInjectPaths（不越界）",
+				policy.TestInjectCount == R3ShieldCore::MaxTestInjectPaths);
+			failed += !Check("test_inject_only: 截断后最后一条是第 15 个（顺序不乱）",
+				policy.TestInjectCount >= R3ShieldCore::MaxTestInjectPaths
+				&& std::wstring(policy.TestInjectPaths[R3ShieldCore::MaxTestInjectPaths - 1]) == L"p15.exe");
+		}
+
+		// ---- ★ 交叉检查：白名单与黑名单是**两个独立字段** ----
+		//   写错一个（把 never_inject 接到 TestInjectPaths 上）会表现为
+		//   "配了白名单结果全局都不注入了" —— 极端后果，必须钉住。
+		{
+			std::ofstream ini(dir / L"r3shieldcore.ini", std::ios::binary | std::ios::trunc);
+			ini << "mode=test\n";
+			ini << "test_inject_only=only.exe\n";
+			ini << "never_inject=D:\\never\\blocked.exe\n";
+			ini.close();
+			ResetPolicy(policy);
+			R3ShieldCoreConfig::Load(policy, dir);
+			failed += !Check("白名单/黑名单各自独立：count 各为 1",
+				policy.TestInjectCount == 1 && policy.NeverInjectCount == 1);
+			failed += !Check("白名单/黑名单内容没串（白名单 = only.exe）",
+				policy.TestInjectCount >= 1
+				&& std::wstring(policy.TestInjectPaths[0]) == L"only.exe");
+			failed += !Check("白名单/黑名单内容没串（黑名单 = D:\\never\\blocked.exe）",
+				policy.NeverInjectCount >= 1
+				&& std::wstring(policy.NeverInjectPaths[0]) == L"D:\\never\\blocked.exe");
+		}
+	}
+
+	// ---- v70：剪贴板替换 spoof_clipboard= ----
+	//
+	// 为什么补这一节：v70 把「回传数据替换」从**屏幕**扩到**剪贴板**。改动分两层：
+	//   ① `r3shieldcore_config.cpp` 的解析（本文件钉住）；
+	//   ② `clipboard_guard.cpp` 的决策 + 伪造（需要注入才能跑 ⇒ 由
+	//      `tools/spoof_clipboard_probe.cpp` 的机制探针 + 端到端夹具负责）。
+	//
+	// ★ 本节重点钉住**两条容易在重构里被弄丢的性质**：
+	//   · 默认**关**（这是"主动欺骗"能力，默认配置行为必须与旧版一致）；
+	//   · 与 `spoof_screen` **是两个独立的位**（配错一个会表现为
+	//     "开了剪贴板替换结果截屏也被替换了" —— 极端后果，必须钉住）。
+	{
+		// ---- 缺文件：默认关 ----
+		std::filesystem::remove(dir / L"r3shieldcore.ini", ec);
+		ResetPolicy(policy);
+		R3ShieldCoreConfig::Load(policy, dir);
+		failed += !Check("spoof_clipboard: missing config -> 默认关",
+			(policy.Flags2 & R3ShieldCore::FlagSpoofClipboard) == 0);
+
+		// ---- 开 / 关 ----
+		{
+			std::ofstream ini(dir / L"r3shieldcore.ini", std::ios::binary | std::ios::trunc);
+			ini << "spoof_clipboard=1\n";
+			ini.close();
+			ResetPolicy(policy);
+			R3ShieldCoreConfig::Load(policy, dir);
+			failed += !Check("spoof_clipboard=1 -> 置位",
+				(policy.Flags2 & R3ShieldCore::FlagSpoofClipboard) != 0);
+		}
+		{
+			std::ofstream ini(dir / L"r3shieldcore.ini", std::ios::binary | std::ios::trunc);
+			ini << "spoof_clipboard=0\n";
+			ini.close();
+			ResetPolicy(policy);
+			R3ShieldCoreConfig::Load(policy, dir);
+			failed += !Check("spoof_clipboard=0 -> 不置位",
+				(policy.Flags2 & R3ShieldCore::FlagSpoofClipboard) == 0);
+		}
+		{
+			// on/off 别名 + 最后一行权威
+			std::ofstream ini(dir / L"r3shieldcore.ini", std::ios::binary | std::ios::trunc);
+			ini << "spoof_clipboard=on\n";
+			ini << "spoof_clipboard=off\n";
+			ini.close();
+			ResetPolicy(policy);
+			R3ShieldCoreConfig::Load(policy, dir);
+			failed += !Check("spoof_clipboard: on/off 别名可用且最后一行权威",
+				(policy.Flags2 & R3ShieldCore::FlagSpoofClipboard) == 0);
+		}
+		{
+			std::ofstream ini(dir / L"r3shieldcore.ini", std::ios::binary | std::ios::trunc);
+			ini << "spoof_clipboard=1 # 打开剪贴板替换\n";   // 行内注释
+			ini.close();
+			ResetPolicy(policy);
+			R3ShieldCoreConfig::Load(policy, dir);
+			failed += !Check("spoof_clipboard: 行内注释被切掉后仍为 1",
+				(policy.Flags2 & R3ShieldCore::FlagSpoofClipboard) != 0);
+		}
+
+		// ---- ★ 交叉检查：两个 spoof 位**互不干扰**（双向）----
+		//   单向断言只能证明"没被清掉"，证明不了"没被点亮"。
+		{
+			std::ofstream ini(dir / L"r3shieldcore.ini", std::ios::binary | std::ios::trunc);
+			ini << "spoof_screen=1\n";
+			ini.close();
+			ResetPolicy(policy);
+			R3ShieldCoreConfig::Load(policy, dir);
+			failed += !Check("交叉：只开 spoof_screen -> 剪贴板替换仍为关（负对照）",
+				(policy.Flags2 & R3ShieldCore::FlagSpoofClipboard) == 0);
+			failed += !Check("交叉：只开 spoof_screen -> 截屏替换确实开了",
+				(policy.Flags2 & R3ShieldCore::FlagSpoofScreen) != 0);
+		}
+		{
+			std::ofstream ini(dir / L"r3shieldcore.ini", std::ios::binary | std::ios::trunc);
+			ini << "spoof_clipboard=1\n";
+			ini.close();
+			ResetPolicy(policy);
+			R3ShieldCoreConfig::Load(policy, dir);
+			failed += !Check("交叉：只开 spoof_clipboard -> 截屏替换仍为关（负对照）",
+				(policy.Flags2 & R3ShieldCore::FlagSpoofScreen) == 0);
+			failed += !Check("交叉：只开 spoof_clipboard -> 剪贴板替换确实开了",
+				(policy.Flags2 & R3ShieldCore::FlagSpoofClipboard) != 0);
+		}
+		{
+			std::ofstream ini(dir / L"r3shieldcore.ini", std::ios::binary | std::ios::trunc);
+			ini << "spoof_screen=1\n";
+			ini << "spoof_clipboard=1\n";
+			ini.close();
+			ResetPolicy(policy);
+			R3ShieldCoreConfig::Load(policy, dir);
+			failed += !Check("交叉：两个都开 -> 两个位都亮",
+				(policy.Flags2 & R3ShieldCore::FlagSpoofScreen) != 0
+				&& (policy.Flags2 & R3ShieldCore::FlagSpoofClipboard) != 0);
+		}
+
+		// ---- ★ 位值不能撞：两个常量必须不同（防手滑写成同一个 0x 值）----
+		failed += !Check("FlagSpoofScreen 与 FlagSpoofClipboard 不是同一位",
+			R3ShieldCore::FlagSpoofScreen != R3ShieldCore::FlagSpoofClipboard);
+	}
+
+	// ---- v71：注册表值替换 spoof_reg= ----
+	//
+	// 为什么补这一节：v71 把「回传数据替换」从**屏幕 / 剪贴板**扩到**注册表值**。
+	// 改动分两层：
+	//   ① `r3shieldcore_config.cpp` 的解析（本文件钉住）；
+	//   ② `registry_guard.cpp` 的决策 + 数据区清零（需要注入才能跑 ⇒ 由
+	//      `tools/spoof_reg_probe.cpp` 的机制探针负责）。
+	//
+	// ★ 本节重点钉住三条性质：
+	//   · 默认**关**；
+	//   · 与 `spoof_screen` / `spoof_clipboard` 是**三个独立的位**
+	//     （配错一个会表现为"开了注册表替换结果剪贴板也被换了" —— 必须钉住）；
+	//   · 三个常量两两不同（防手滑写成同一个 0x 值）。
+	{
+		// ---- 缺文件：默认关 ----
+		std::filesystem::remove(dir / L"r3shieldcore.ini", ec);
+		ResetPolicy(policy);
+		R3ShieldCoreConfig::Load(policy, dir);
+		failed += !Check("spoof_reg: missing config -> 默认关",
+			(policy.Flags2 & R3ShieldCore::FlagSpoofRegistry) == 0);
+
+		// ---- 开 / 关 ----
+		{
+			std::ofstream ini(dir / L"r3shieldcore.ini", std::ios::binary | std::ios::trunc);
+			ini << "spoof_reg=1\n";
+			ini.close();
+			ResetPolicy(policy);
+			R3ShieldCoreConfig::Load(policy, dir);
+			failed += !Check("spoof_reg=1 -> 置位",
+				(policy.Flags2 & R3ShieldCore::FlagSpoofRegistry) != 0);
+		}
+		{
+			std::ofstream ini(dir / L"r3shieldcore.ini", std::ios::binary | std::ios::trunc);
+			ini << "spoof_reg=0\n";
+			ini.close();
+			ResetPolicy(policy);
+			R3ShieldCoreConfig::Load(policy, dir);
+			failed += !Check("spoof_reg=0 -> 不置位",
+				(policy.Flags2 & R3ShieldCore::FlagSpoofRegistry) == 0);
+		}
+		{
+			// on/off 别名 + 最后一行权威
+			std::ofstream ini(dir / L"r3shieldcore.ini", std::ios::binary | std::ios::trunc);
+			ini << "spoof_reg=on\n";
+			ini << "spoof_reg=off\n";
+			ini.close();
+			ResetPolicy(policy);
+			R3ShieldCoreConfig::Load(policy, dir);
+			failed += !Check("spoof_reg: on/off 别名可用且最后一行权威",
+				(policy.Flags2 & R3ShieldCore::FlagSpoofRegistry) == 0);
+		}
+		{
+			std::ofstream ini(dir / L"r3shieldcore.ini", std::ios::binary | std::ios::trunc);
+			ini << "spoof_reg=1 # 打开注册表值替换\n";   // 行内注释
+			ini.close();
+			ResetPolicy(policy);
+			R3ShieldCoreConfig::Load(policy, dir);
+			failed += !Check("spoof_reg: 行内注释被切掉后仍为 1",
+				(policy.Flags2 & R3ShieldCore::FlagSpoofRegistry) != 0);
+		}
+
+		// ---- ★ 交叉检查：三个 spoof 位**互不干扰**（双向）----
+		//   单向断言只能证明"没被清掉"，证明不了"没被点亮"。
+		{
+			std::ofstream ini(dir / L"r3shieldcore.ini", std::ios::binary | std::ios::trunc);
+			ini << "spoof_screen=1\n";
+			ini << "spoof_clipboard=1\n";
+			ini.close();
+			ResetPolicy(policy);
+			R3ShieldCoreConfig::Load(policy, dir);
+			failed += !Check("交叉：只开 screen+clipboard -> 注册表替换仍为关（负对照）",
+				(policy.Flags2 & R3ShieldCore::FlagSpoofRegistry) == 0);
+		}
+		{
+			std::ofstream ini(dir / L"r3shieldcore.ini", std::ios::binary | std::ios::trunc);
+			ini << "spoof_reg=1\n";
+			ini.close();
+			ResetPolicy(policy);
+			R3ShieldCoreConfig::Load(policy, dir);
+			failed += !Check("交叉：只开 spoof_reg -> 截屏替换仍为关（负对照）",
+				(policy.Flags2 & R3ShieldCore::FlagSpoofScreen) == 0);
+			failed += !Check("交叉：只开 spoof_reg -> 剪贴板替换仍为关（负对照）",
+				(policy.Flags2 & R3ShieldCore::FlagSpoofClipboard) == 0);
+			failed += !Check("交叉：只开 spoof_reg -> 注册表替换确实开了",
+				(policy.Flags2 & R3ShieldCore::FlagSpoofRegistry) != 0);
+		}
+		{
+			std::ofstream ini(dir / L"r3shieldcore.ini", std::ios::binary | std::ios::trunc);
+			ini << "spoof_screen=1\n";
+			ini << "spoof_clipboard=1\n";
+			ini << "spoof_reg=1\n";
+			ini.close();
+			ResetPolicy(policy);
+			R3ShieldCoreConfig::Load(policy, dir);
+			failed += !Check("交叉：三个都开 -> 三个位都亮",
+				(policy.Flags2 & R3ShieldCore::FlagSpoofScreen) != 0
+				&& (policy.Flags2 & R3ShieldCore::FlagSpoofClipboard) != 0
+				&& (policy.Flags2 & R3ShieldCore::FlagSpoofRegistry) != 0);
+		}
+
+		// ---- ★ 位值两两不同（防手滑写成同一个 0x 值）----
+		failed += !Check("FlagSpoofRegistry 与 FlagSpoofScreen 不是同一位",
+			R3ShieldCore::FlagSpoofRegistry != R3ShieldCore::FlagSpoofScreen);
+		failed += !Check("FlagSpoofRegistry 与 FlagSpoofClipboard 不是同一位",
+			R3ShieldCore::FlagSpoofRegistry != R3ShieldCore::FlagSpoofClipboard);
+	}
+
+	// ---- v72：注册表枚举隐藏 spoof_reg_enum= ----
+	//
+	// 为什么补这一节：v72 把「回传数据替换」从**单点取值**扩到**枚举遍历**
+	// （`NtEnumerateKey` / `NtEnumerateValueKey`）。改动同样分两层：
+	//   ① `r3shieldcore_config.cpp` 的解析（本文件钉住）；
+	//   ② `registry_guard.cpp` 的决策 + 索引重映射（需要注入才能跑 ⇒ 由
+	//      `tools/spoof_reg_enum_probe.cpp` 的机制探针 + `tools/v72_guard_ut.cpp`
+	//      的纯逻辑单测负责）。
+	//
+	// ★ 本节重点钉住四条性质：
+	//   · 默认**关**；
+	//   · 与 `spoof_screen` / `spoof_clipboard` / `spoof_reg` 是**四个独立的位**
+	//     （配错一个会表现为"开了枚举隐藏结果单点取值也被换了" —— 必须钉住）；
+	//   · 四个常量**两两不同**（防手滑写成同一个 0x 值）；
+	//   · ★ 枚举位**不能**被 `spoof_reg` 顺带点亮（铁律 199：放宽一个开关不能
+	//     顺带打开别的行为 —— 枚举隐藏会让调用方**看不到**某些项，破坏性比单点
+	//     取值大得多，必须由用户显式打开）。
+	{
+		// ---- 缺文件：默认关 ----
+		std::filesystem::remove(dir / L"r3shieldcore.ini", ec);
+		ResetPolicy(policy);
+		R3ShieldCoreConfig::Load(policy, dir);
+		failed += !Check("spoof_reg_enum: missing config -> 默认关",
+			(policy.Flags2 & R3ShieldCore::FlagSpoofRegistryEnum) == 0);
+
+		// ---- 开 / 关 ----
+		{
+			std::ofstream ini(dir / L"r3shieldcore.ini", std::ios::binary | std::ios::trunc);
+			ini << "spoof_reg_enum=1\n";
+			ini.close();
+			ResetPolicy(policy);
+			R3ShieldCoreConfig::Load(policy, dir);
+			failed += !Check("spoof_reg_enum=1 -> 置位",
+				(policy.Flags2 & R3ShieldCore::FlagSpoofRegistryEnum) != 0);
+		}
+		{
+			std::ofstream ini(dir / L"r3shieldcore.ini", std::ios::binary | std::ios::trunc);
+			ini << "spoof_reg_enum=0\n";
+			ini.close();
+			ResetPolicy(policy);
+			R3ShieldCoreConfig::Load(policy, dir);
+			failed += !Check("spoof_reg_enum=0 -> 不置位",
+				(policy.Flags2 & R3ShieldCore::FlagSpoofRegistryEnum) == 0);
+		}
+		{
+			// on/off 别名 + 最后一行权威
+			std::ofstream ini(dir / L"r3shieldcore.ini", std::ios::binary | std::ios::trunc);
+			ini << "spoof_reg_enum=on\n";
+			ini << "spoof_reg_enum=off\n";
+			ini.close();
+			ResetPolicy(policy);
+			R3ShieldCoreConfig::Load(policy, dir);
+			failed += !Check("spoof_reg_enum: on/off 别名可用且最后一行权威",
+				(policy.Flags2 & R3ShieldCore::FlagSpoofRegistryEnum) == 0);
+		}
+		{
+			std::ofstream ini(dir / L"r3shieldcore.ini", std::ios::binary | std::ios::trunc);
+			ini << "spoof_reg_enum=1 # 打开注册表枚举隐藏\n";   // 行内注释
+			ini.close();
+			ResetPolicy(policy);
+			R3ShieldCoreConfig::Load(policy, dir);
+			failed += !Check("spoof_reg_enum: 行内注释被切掉后仍为 1",
+				(policy.Flags2 & R3ShieldCore::FlagSpoofRegistryEnum) != 0);
+		}
+
+		// ---- ★ 交叉检查：四个 spoof 位**互不干扰**（双向）----
+		//   单向断言只能证明"没被清掉"，证明不了"没被点亮"。
+		{
+			std::ofstream ini(dir / L"r3shieldcore.ini", std::ios::binary | std::ios::trunc);
+			ini << "spoof_screen=1\n";
+			ini << "spoof_clipboard=1\n";
+			ini << "spoof_reg=1\n";
+			ini.close();
+			ResetPolicy(policy);
+			R3ShieldCoreConfig::Load(policy, dir);
+			failed += !Check("交叉：只开 screen+clipboard+reg -> 枚举隐藏仍为关（负对照）",
+				(policy.Flags2 & R3ShieldCore::FlagSpoofRegistryEnum) == 0);
+		}
+		{
+			std::ofstream ini(dir / L"r3shieldcore.ini", std::ios::binary | std::ios::trunc);
+			ini << "spoof_reg_enum=1\n";
+			ini.close();
+			ResetPolicy(policy);
+			R3ShieldCoreConfig::Load(policy, dir);
+			failed += !Check("交叉：只开 spoof_reg_enum -> 截屏替换仍为关（负对照）",
+				(policy.Flags2 & R3ShieldCore::FlagSpoofScreen) == 0);
+			failed += !Check("交叉：只开 spoof_reg_enum -> 剪贴板替换仍为关（负对照）",
+				(policy.Flags2 & R3ShieldCore::FlagSpoofClipboard) == 0);
+			failed += !Check("交叉：只开 spoof_reg_enum -> 注册表值替换仍为关（负对照）",
+				(policy.Flags2 & R3ShieldCore::FlagSpoofRegistry) == 0);
+			failed += !Check("交叉：只开 spoof_reg_enum -> 枚举隐藏确实开了",
+				(policy.Flags2 & R3ShieldCore::FlagSpoofRegistryEnum) != 0);
+		}
+		{
+			std::ofstream ini(dir / L"r3shieldcore.ini", std::ios::binary | std::ios::trunc);
+			ini << "spoof_screen=1\n";
+			ini << "spoof_clipboard=1\n";
+			ini << "spoof_reg=1\n";
+			ini << "spoof_reg_enum=1\n";
+			ini.close();
+			ResetPolicy(policy);
+			R3ShieldCoreConfig::Load(policy, dir);
+			failed += !Check("交叉：四个都开 -> 四个位都亮",
+				(policy.Flags2 & R3ShieldCore::FlagSpoofScreen) != 0
+				&& (policy.Flags2 & R3ShieldCore::FlagSpoofClipboard) != 0
+				&& (policy.Flags2 & R3ShieldCore::FlagSpoofRegistry) != 0
+				&& (policy.Flags2 & R3ShieldCore::FlagSpoofRegistryEnum) != 0);
+		}
+
+		// ---- ★ 位值两两不同（防手滑写成同一个 0x 值）----
+		//   到 v72 一共四个位 ⇒ 完整两两组合共 6 对。前面两节已钉住
+		//   (Screen,Clipboard) / (Registry,Screen) / (Registry,Clipboard)，
+		//   这里补齐含新位的 3 对，凑齐 6 对。
+		failed += !Check("FlagSpoofRegistryEnum 与 FlagSpoofScreen 不是同一位",
+			R3ShieldCore::FlagSpoofRegistryEnum != R3ShieldCore::FlagSpoofScreen);
+		failed += !Check("FlagSpoofRegistryEnum 与 FlagSpoofClipboard 不是同一位",
+			R3ShieldCore::FlagSpoofRegistryEnum != R3ShieldCore::FlagSpoofClipboard);
+		failed += !Check("FlagSpoofRegistryEnum 与 FlagSpoofRegistry 不是同一位",
+			R3ShieldCore::FlagSpoofRegistryEnum != R3ShieldCore::FlagSpoofRegistry);
+	}
+
+	// ---- v73：摄像头帧替换 spoof_camera= ----
+	//
+	// 为什么补这一节：v73 把「回传数据替换」扩到**流式**的摄像头帧。
+	// 改动同样分两层：
+	//   ① `r3shieldcore_config.cpp` 的解析（本文件钉住）；
+	//   ② `camera_guard.cpp` 的 vtable patch + 逐帧中性化（需要注入才能跑
+	//      ⇒ 由 `tools/spoof_camera_probe.cpp` 的机制探针 + `tools/v73_guard_ut.cpp`
+	//      的纯逻辑单测负责）。
+	//
+	// ★ 本节重点钉住五条性质：
+	//   · 默认**关**；
+	//   · 与 `spoof_screen` / `spoof_clipboard` / `spoof_reg` / `spoof_reg_enum`
+	//     是**五个独立的位**；
+	//   · 五个常量**两两不同**（防手滑写成同一个 0x 值）；
+	//   · ★ `hook_camera=1`（挂载开关）**不能**顺带点亮它（铁律 199：
+	//     放宽一个开关不能顺带打开别的行为 —— 摄像头替换会把"打开失败"
+	//     变成"打开成功但内容是假的"，语义变化比拒绝大得多）；
+	//   · ★ 反过来它**不能**被前四个 spoof 开关顺带点亮。
+	{
+		// ---- 缺文件：默认关 ----
+		std::filesystem::remove(dir / L"r3shieldcore.ini", ec);
+		ResetPolicy(policy);
+		R3ShieldCoreConfig::Load(policy, dir);
+		failed += !Check("spoof_camera: missing config -> 默认关",
+			(policy.Flags2 & R3ShieldCore::FlagSpoofCamera) == 0);
+
+		// ---- 开 / 关 ----
+		{
+			std::ofstream ini(dir / L"r3shieldcore.ini", std::ios::binary | std::ios::trunc);
+			ini << "spoof_camera=1\n";
+			ini.close();
+			ResetPolicy(policy);
+			R3ShieldCoreConfig::Load(policy, dir);
+			failed += !Check("spoof_camera=1 -> 置位",
+				(policy.Flags2 & R3ShieldCore::FlagSpoofCamera) != 0);
+		}
+		{
+			std::ofstream ini(dir / L"r3shieldcore.ini", std::ios::binary | std::ios::trunc);
+			ini << "spoof_camera=0\n";
+			ini.close();
+			ResetPolicy(policy);
+			R3ShieldCoreConfig::Load(policy, dir);
+			failed += !Check("spoof_camera=0 -> 不置位",
+				(policy.Flags2 & R3ShieldCore::FlagSpoofCamera) == 0);
+		}
+		{
+			// on/off 别名 + 最后一行权威
+			std::ofstream ini(dir / L"r3shieldcore.ini", std::ios::binary | std::ios::trunc);
+			ini << "spoof_camera=on\n";
+			ini << "spoof_camera=off\n";
+			ini.close();
+			ResetPolicy(policy);
+			R3ShieldCoreConfig::Load(policy, dir);
+			failed += !Check("spoof_camera: on/off 别名可用且最后一行权威",
+				(policy.Flags2 & R3ShieldCore::FlagSpoofCamera) == 0);
+		}
+		{
+			std::ofstream ini(dir / L"r3shieldcore.ini", std::ios::binary | std::ios::trunc);
+			ini << "spoof_camera=1 # 打开摄像头帧替换\n";   // 行内注释
+			ini.close();
+			ResetPolicy(policy);
+			R3ShieldCoreConfig::Load(policy, dir);
+			failed += !Check("spoof_camera: 行内注释被切掉后仍为 1",
+				(policy.Flags2 & R3ShieldCore::FlagSpoofCamera) != 0);
+		}
+
+		// ---- ★ 负对照：挂载开关 `hook_camera=1` 不能顺带点亮替换 ----
+		{
+			std::ofstream ini(dir / L"r3shieldcore.ini", std::ios::binary | std::ios::trunc);
+			ini << "hook_camera=1\n";
+			ini.close();
+			ResetPolicy(policy);
+			R3ShieldCoreConfig::Load(policy, dir);
+			failed += !Check("交叉：只开 hook_camera -> 帧替换仍为关（负对照，铁律 199）",
+				(policy.Flags2 & R3ShieldCore::FlagSpoofCamera) == 0);
+		}
+
+		// ---- ★ 交叉检查：五个 spoof 位**互不干扰**（双向）----
+		//   单向断言只能证明"没被清掉"，证明不了"没被点亮"。
+		{
+			std::ofstream ini(dir / L"r3shieldcore.ini", std::ios::binary | std::ios::trunc);
+			ini << "spoof_screen=1\n";
+			ini << "spoof_clipboard=1\n";
+			ini << "spoof_reg=1\n";
+			ini << "spoof_reg_enum=1\n";
+			ini.close();
+			ResetPolicy(policy);
+			R3ShieldCoreConfig::Load(policy, dir);
+			failed += !Check("交叉：只开前四个 -> 摄像头帧替换仍为关（负对照）",
+				(policy.Flags2 & R3ShieldCore::FlagSpoofCamera) == 0);
+		}
+		{
+			std::ofstream ini(dir / L"r3shieldcore.ini", std::ios::binary | std::ios::trunc);
+			ini << "spoof_camera=1\n";
+			ini.close();
+			ResetPolicy(policy);
+			R3ShieldCoreConfig::Load(policy, dir);
+			failed += !Check("交叉：只开 spoof_camera -> 截屏替换仍为关（负对照）",
+				(policy.Flags2 & R3ShieldCore::FlagSpoofScreen) == 0);
+			failed += !Check("交叉：只开 spoof_camera -> 剪贴板替换仍为关（负对照）",
+				(policy.Flags2 & R3ShieldCore::FlagSpoofClipboard) == 0);
+			failed += !Check("交叉：只开 spoof_camera -> 注册表值替换仍为关（负对照）",
+				(policy.Flags2 & R3ShieldCore::FlagSpoofRegistry) == 0);
+			failed += !Check("交叉：只开 spoof_camera -> 枚举隐藏仍为关（负对照）",
+				(policy.Flags2 & R3ShieldCore::FlagSpoofRegistryEnum) == 0);
+			failed += !Check("交叉：只开 spoof_camera -> 摄像头帧替换确实开了",
+				(policy.Flags2 & R3ShieldCore::FlagSpoofCamera) != 0);
+		}
+		{
+			std::ofstream ini(dir / L"r3shieldcore.ini", std::ios::binary | std::ios::trunc);
+			ini << "spoof_screen=1\n";
+			ini << "spoof_clipboard=1\n";
+			ini << "spoof_reg=1\n";
+			ini << "spoof_reg_enum=1\n";
+			ini << "spoof_camera=1\n";
+			ini.close();
+			ResetPolicy(policy);
+			R3ShieldCoreConfig::Load(policy, dir);
+			failed += !Check("交叉：五个都开 -> 五个位都亮",
+				(policy.Flags2 & R3ShieldCore::FlagSpoofScreen) != 0
+				&& (policy.Flags2 & R3ShieldCore::FlagSpoofClipboard) != 0
+				&& (policy.Flags2 & R3ShieldCore::FlagSpoofRegistry) != 0
+				&& (policy.Flags2 & R3ShieldCore::FlagSpoofRegistryEnum) != 0
+				&& (policy.Flags2 & R3ShieldCore::FlagSpoofCamera) != 0);
+		}
+
+		// ---- ★ 位值两两不同（防手滑写成同一个 0x 值）----
+		//   到 v73 一共五个位 ⇒ 完整两两组合共 10 对。前面三节已钉住 6 对：
+		//   (Screen,Clipboard) / (Registry,Screen) / (Registry,Clipboard) /
+		//   (Enum,Screen) / (Enum,Clipboard) / (Enum,Registry)。
+		//   这里补齐含新位的 4 对，凑齐 10 对。
+		failed += !Check("FlagSpoofCamera 与 FlagSpoofScreen 不是同一位",
+			R3ShieldCore::FlagSpoofCamera != R3ShieldCore::FlagSpoofScreen);
+		failed += !Check("FlagSpoofCamera 与 FlagSpoofClipboard 不是同一位",
+			R3ShieldCore::FlagSpoofCamera != R3ShieldCore::FlagSpoofClipboard);
+		failed += !Check("FlagSpoofCamera 与 FlagSpoofRegistry 不是同一位",
+			R3ShieldCore::FlagSpoofCamera != R3ShieldCore::FlagSpoofRegistry);
+		failed += !Check("FlagSpoofCamera 与 FlagSpoofRegistryEnum 不是同一位",
+			R3ShieldCore::FlagSpoofCamera != R3ShieldCore::FlagSpoofRegistryEnum);
 	}
 
 	std::filesystem::remove_all(dir, ec);

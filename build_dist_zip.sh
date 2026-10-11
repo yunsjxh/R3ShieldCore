@@ -53,6 +53,7 @@ ENTRIES=(
     "stop.bat"
     "unlock-acl.bat"
     "dskill.exe"
+    "r3shieldcore-cfg.exe"
     "netcheck-diag.bat"
     "verify-v26.bat"
     "配置详解.md"
@@ -84,6 +85,19 @@ echo ""
 if ! bash check_dist_sync.sh "$SRC_DIR"; then
     echo ""
     echo "打包中止：发布目录与构建产物不同步。"
+    exit 1
+fi
+
+# ★ 闸门：随包 ini 必须**真的解析成预期配置**（链引擎侧同一个解析器）。
+#   理由见 build_verify_dist.sh 头部：`tools/verify_dist_ini.cpp` 这个闸门
+#   早就存在，但**一直没接进任何流水线** —— 于是某次把 `mode=block` 手改成
+#   `mode=ask` 的漂移一路飘进 dist：文档 / 预设 / 断言三处都写 block，
+#   只有 ini 是 ask，直到手工跑一次才发现。**闸门不接进流水线 = 没有闸门。**
+#   ⚠️ 必须在 check_dist_sync 之后：先证"文件是刚构建的那份"，再证"那份的内容对"。
+echo ""
+if ! bash build_verify_dist.sh x64 "$SRC_DIR"; then
+    echo ""
+    echo "打包中止：随包 ini 未通过发布闸门（解析结果与预期不符）。"
     exit 1
 fi
 

@@ -1,0 +1,141 @@
+# 摄像头「帧替换」可行性探针 —— 实测输出（2026-10-10，v73 落地同期）
+# 生成命令：bash build_spoof_camera_probe.sh && tools/spoof_camera_probe.exe [--use-camera]（x64）
+# 说明：stdout 原样转码（GBK -> UTF-8），未做任何改写。
+# ★ 本机有 2 个视频采集设备 ⇒ 真机端到端**已在本机跑通**（第二段，--use-camera）。
+# ★ v73 相对 v71 同期的变化：探针改成 #include 生产同款 camera_spoof_codec.h（铁律 195），
+#   Part D 扩到 25 条（含 D0a~D0i 共 9 条 SDK GUID 交叉校验、D5/D5b/D5c 布局判据、
+#   D6 反向对照、D7 越界哨兵、D8~D10 stride 规则），Part E 的 E6 改成
+#   「把计划写进副本再与调用方拿到的字节 memcmp」—— 证的是**调用方视角**。
+
+################################################################
+# 第一段：默认模式（不开硬件）—— 合成媒体源验证机制链
+################################################################
+
+=== 摄像头「帧替换」可行性探针（自挂自测，不经过引擎）===
+（真摄像头测试：未启用；加 --use-camera 可打开硬件）
+
+CoInitializeEx=0x00000000  MFStartup=0x00000000
+
+--- C. 本机视频采集设备勘察（MFEnumDeviceSources）---
+  视频采集设备数 = 2
+
+--- A. 用合成媒体源验证机制链（自己写的 WAV）---
+  临时 WAV: C:\Users\user\AppData\Local\Temp\r3sc_cam_probe_21112.wav
+  [PASS] A1 拿到 IMFSourceReader（合成源）
+  媒体类型: major=73647561-0000... sub=00000001-0000...
+  [PASS] A2 当前媒体类型是音频（合成 WAV 源，与视频帧同构）
+  [PASS] A3 mfreadwrite.dll 已加载（vtable 判据有前提）
+  [PASS] A4 vtable[9] 落在 mfreadwrite.dll 范围内（槽号没记错）
+  [PASS] A5 成功 patch 掉 ReadSample 的 vtable 槽
+
+--- B. detour 调用与「调用方可见」验证 ---
+  [PASS] B1 detour 被调用了（hits>0）
+  [PASS] B2 第一次 ReadSample 成功且返回 sample
+  [PASS] B3 替换关着时，调用方拿到的是**真数据**（非空真对照）
+  [PASS] C1 真数据里确实有非 0 内容（非空真前提）
+  [PASS] C2 至少有一个样本被改写（rewritten>0）
+  [PASS] C3 **调用方看到的是全 0**（不是我们自己的副本）
+  [PASS] C4 没有 Lock 失败（缓冲区可写）
+
+--- D. 中性帧填充决策表（生产与探针共用 camera_spoof_codec.h）---
+  [PASS] D0a codec 的 RGB32 GUID == SDK MFVideoFormat_RGB32
+  [PASS] D0b codec 的 ARGB32 GUID == SDK MFVideoFormat_ARGB32
+  [PASS] D0c codec 的 RGB24 GUID == SDK MFVideoFormat_RGB24
+  [PASS] D0d codec 的 YUY2 GUID == SDK MFVideoFormat_YUY2
+  [PASS] D0e codec 的 UYVY GUID == SDK MFVideoFormat_UYVY
+  [PASS] D0f codec 的 NV12 GUID == SDK MFVideoFormat_NV12
+  [PASS] D0g codec 的 I420 GUID == SDK MFVideoFormat_I420
+  [PASS] D0h codec 的 IYUV GUID == SDK MFVideoFormat_IYUV
+  [PASS] D0i codec 的 YV12 GUID == SDK MFVideoFormat_YV12
+  [PASS] D1 RGB32 -> 全 0 策略（**恰好就是黑**，与 v67 屏幕面口径一致）
+  [PASS] D2 NV12 -> 平面 YUV 策略，名义步长 = 宽（**不是全 0** —— 全 0 在 YUV 里是饱和色）
+  [PASS] D3 YUY2 -> 紧凑 4:2:2 策略，名义步长 = 宽×2，Y 在前
+  [PASS] D3b UYVY -> 紧凑 4:2:2 策略，U 在前（**顺序不同**，填错就成花屏）
+  [PASS] D4 不认识的子类型 -> 规划失败（回落「拒绝」，铁律 194/196）
+  [PASS] D4b 尺寸为 0 -> 规划失败（防除零/防把空帧当有效帧）
+  [PASS] D5 NV12 640×480：Y 平面全 16、色度平面全 128（按真实平面切分）
+  [PASS] D5b YUY2：每 4 字节 = [Y16, U128, Y16, V128]（交错布局，不是整块填同一个值）
+  [PASS] D5c YUY2 与 UYVY 的填充结果**不同**（顺序真的按 packedOrder 走了）
+  [PASS] D6 反向对照：老规则（全 0）在 YUV 下**不等于**黑（首字节 0 != 16）
+  [PASS] D7 填充**不越过 len**（哨兵字节未被改 —— 长度不变是命门）
+  [PASS] D8 stride 传负数（自下而上帧）-> 取绝对值 640
+  [PASS] D9 stride < 名义值 -> 回落名义步长（不猜）
+  [PASS] D10 stride > 名义值（驱动 padding）-> 采用传入的 768
+
+--- E. 真摄像头帧（可选：--use-camera）---
+  [SKIP] 未传 --use-camera（默认不开硬件；跳过数已计入结论行）
+
+=== 结果：35 passed, 0 failed, 1 skipped ===
+
+
+################################################################
+# 第二段：真机模式（--use-camera）—— 真摄像头取帧
+################################################################
+
+=== 摄像头「帧替换」可行性探针（自挂自测，不经过引擎）===
+（真摄像头测试：已启用；加 --use-camera 可打开硬件）
+
+CoInitializeEx=0x00000000  MFStartup=0x00000000
+
+--- C. 本机视频采集设备勘察（MFEnumDeviceSources）---
+  视频采集设备数 = 2
+
+--- A. 用合成媒体源验证机制链（自己写的 WAV）---
+  临时 WAV: C:\Users\user\AppData\Local\Temp\r3sc_cam_probe_14332.wav
+  [PASS] A1 拿到 IMFSourceReader（合成源）
+  媒体类型: major=73647561-0000... sub=00000001-0000...
+  [PASS] A2 当前媒体类型是音频（合成 WAV 源，与视频帧同构）
+  [PASS] A3 mfreadwrite.dll 已加载（vtable 判据有前提）
+  [PASS] A4 vtable[9] 落在 mfreadwrite.dll 范围内（槽号没记错）
+  [PASS] A5 成功 patch 掉 ReadSample 的 vtable 槽
+
+--- B. detour 调用与「调用方可见」验证 ---
+  [PASS] B1 detour 被调用了（hits>0）
+  [PASS] B2 第一次 ReadSample 成功且返回 sample
+  [PASS] B3 替换关着时，调用方拿到的是**真数据**（非空真对照）
+  [PASS] C1 真数据里确实有非 0 内容（非空真前提）
+  [PASS] C2 至少有一个样本被改写（rewritten>0）
+  [PASS] C3 **调用方看到的是全 0**（不是我们自己的副本）
+  [PASS] C4 没有 Lock 失败（缓冲区可写）
+
+--- D. 中性帧填充决策表（生产与探针共用 camera_spoof_codec.h）---
+  [PASS] D0a codec 的 RGB32 GUID == SDK MFVideoFormat_RGB32
+  [PASS] D0b codec 的 ARGB32 GUID == SDK MFVideoFormat_ARGB32
+  [PASS] D0c codec 的 RGB24 GUID == SDK MFVideoFormat_RGB24
+  [PASS] D0d codec 的 YUY2 GUID == SDK MFVideoFormat_YUY2
+  [PASS] D0e codec 的 UYVY GUID == SDK MFVideoFormat_UYVY
+  [PASS] D0f codec 的 NV12 GUID == SDK MFVideoFormat_NV12
+  [PASS] D0g codec 的 I420 GUID == SDK MFVideoFormat_I420
+  [PASS] D0h codec 的 IYUV GUID == SDK MFVideoFormat_IYUV
+  [PASS] D0i codec 的 YV12 GUID == SDK MFVideoFormat_YV12
+  [PASS] D1 RGB32 -> 全 0 策略（**恰好就是黑**，与 v67 屏幕面口径一致）
+  [PASS] D2 NV12 -> 平面 YUV 策略，名义步长 = 宽（**不是全 0** —— 全 0 在 YUV 里是饱和色）
+  [PASS] D3 YUY2 -> 紧凑 4:2:2 策略，名义步长 = 宽×2，Y 在前
+  [PASS] D3b UYVY -> 紧凑 4:2:2 策略，U 在前（**顺序不同**，填错就成花屏）
+  [PASS] D4 不认识的子类型 -> 规划失败（回落「拒绝」，铁律 194/196）
+  [PASS] D4b 尺寸为 0 -> 规划失败（防除零/防把空帧当有效帧）
+  [PASS] D5 NV12 640×480：Y 平面全 16、色度平面全 128（按真实平面切分）
+  [PASS] D5b YUY2：每 4 字节 = [Y16, U128, Y16, V128]（交错布局，不是整块填同一个值）
+  [PASS] D5c YUY2 与 UYVY 的填充结果**不同**（顺序真的按 packedOrder 走了）
+  [PASS] D6 反向对照：老规则（全 0）在 YUV 下**不等于**黑（首字节 0 != 16）
+  [PASS] D7 填充**不越过 len**（哨兵字节未被改 —— 长度不变是命门）
+  [PASS] D8 stride 传负数（自下而上帧）-> 取绝对值 640
+  [PASS] D9 stride < 名义值 -> 回落名义步长（不猜）
+  [PASS] D10 stride > 名义值（驱动 padding）-> 采用传入的 768
+
+--- E. 真摄像头帧（可选：--use-camera）---
+  SetCurrentMediaType(RGB32) hr=0x00000000
+  视频帧: subtype=RGB32 尺寸=640x480
+          （GUID.Data1=0x00000016）
+  [PASS] E1 拿到视频媒体类型与帧尺寸
+  [PASS] E1b 子类型是已知的（帧长判据有前提，铁律 117）
+  读了 7 帧，最后一帧字节数=1228800；其中中性帧 7 / 真数据帧 0
+  [PASS] E2 读到至少一帧真实视频帧
+  [PASS] E3 帧字节数 == 宽×高×每像素字节数（子类型前提成立）
+  [PASS] E4 真实帧里有非 0 内容（非空真前提）
+  [PASS] E5 真实视频帧被改写了
+  [PASS] E6 ★ 调用方拿到的每一帧都 == 计划的中性帧（不是我们自己的副本）
+       （本次设备给的是 RGB 家族 -> 全 0 恰好等于黑）
+  [PASS] E7 真实设备是 RGB 家族 -> 全 0 即黑
+
+=== 结果：43 passed, 0 failed, 0 skipped ===

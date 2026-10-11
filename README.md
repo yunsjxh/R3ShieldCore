@@ -66,7 +66,7 @@
 │    ├─ Hook 层：17 个 guard 模块，约 110 处 MinHook inline hook，         │
 │    │           外加 2 组 COM vtable patch                                │
 │    ├─ 规则层：编译期定长规则表（`r3shieldcore_rules.cpp`，4400 行）      │
-│    └─ GUI：概览 / 事件日志 / 进程 / 配置 / ARK —— 五个页签，全 GDI 自绘  │
+│    └─ GUI：概览/事件日志/进程/配置/ARK/高级 —— 六个页签，全 GDI 自绘     │
 └──────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -114,6 +114,35 @@
 | 2 | `ask` | 命中高危规则 → **弹窗询问**，用户说了算 |
 | 3 | `block_all` | 完全拦截：探测范围内一律拒 —— 不看豁免、不看高危、不询问 |
 | 4 | `block_all_safe` | 同 `block_all`，但**放行「可信来源」的进程创建** |
+
+> ★ 另有一个 ini 写法 **`mode=test`**：它的**决策行为完全等同 `log`**（只记录、
+> 全部放行），额外**强制要求** `test_inject_only=` 非空（否则引擎拒绝启动）。
+> 它内部就是 `log` + 一个独立标志位，**不是第 6 种 Mode 值**（`Mode` 枚举仍是 5 个）。
+> 它只用于开发机上做验证 —— 见下面 §3.1。
+
+### 3.1 限定注入范围（`test_inject_only=`，★ 只给开发/验证用）
+
+引擎的正常工作是**全局注入**所有非系统进程。这一项把注入范围缩到**名单内的进程**，
+其余一律跳过 —— 于是可以在开发机上安全地跑真引擎做端到端验证（否则它会 hook 你的
+编辑器 / IDE）。
+
+| 键 | 默认 | 含义 |
+|---|---|---|
+| `test_inject_only` | 空（不限范围） | 可重复写多行，也支持一行逗号分隔；上限 16 条。含 `\` / `/` ⇒ **完整路径前缀**（带路径边界）；否则 ⇒ **镜像基名**（不区分大小写） |
+
+```ini
+mode=test                              # = log 行为 + 强制要求下面的名单非空
+test_inject_only=my_target.exe
+```
+
+> ★★ **「注入范围」与「拦截行为」是解耦的**：`test_inject_only=` 只要**非空就生效**，
+> **与 `mode=` 无关**。所以 `mode=block` + `test_inject_only=X` 是合法组合 ——
+> 只注入 X、同时在 X 身上真拦真记。这不是花哨：截屏「替换」这类动作**只在"本应拒绝"
+> 时才生效**，若把拦截行为也退化成 `log` 就永远验证不到它。
+>
+> ⚠️ 名单之外的进程**完全不受监控**（一个 hook 都没有），而且**它拉起的子进程也拿不到
+> 同步注入路**。验证完请把 `test_inject_only=` 整行删掉（或注释掉）再重启。
+> 引擎启动横幅会在名单非空时**吵出来**（条数 + 逐条内容 + 匹配规则）。
 
 ### ⚠️ 三条容易搞错的语义（都是代码里的显式决定，不是实现疏漏）
 
@@ -217,14 +246,21 @@ bash deploy_dist.sh --check  # 只验收，不重新装配
 
 1. 校验 `Release/` 里 4 个引擎产物都在（缺了就明说"先跑 `build.sh`"）；
 2. 编 `tools/dskill.cpp` → `dist/R3ShieldCore-x64/dskill.exe`（直 syscall 逃生门工具）；
-3. 按约定布局拷贝 —— **exe 放根，DLL 必须进 `64/` 与 `32/`**
+3. 编 `tools/r3shieldcore_cfg.cpp` → `dist/R3ShieldCore-x64/r3shieldcore-cfg.exe`
+   （独立「配置编辑 + 日志观察」工具，见 §8.4；这一步由 `build_cfgtool.sh` 完成，
+   它也能单独跑，并且**必须过一遍无界面自检**才出产物）；
+4. 按约定布局拷贝 —— **exe 放根，DLL 必须进 `64/` 与 `32/`**
    （注入器按目录名选架构，放错位置等于 32 位进程完全没有防护）；
-4. 调 `check_dist_sync.sh` 验收。
+5. 调 `check_dist_sync.sh` 验收。
 
 `check_dist_sync.sh` 的判据是**内容相等（md5）**，不是"文件存在"；另外还查
 `32/r3shieldcore-lib.dll` 存在、两侧 DLL 都含 `WTSQueryUserToken` 与
 `GlobalHookSessionSelfExit` 两个特性标记、以及 v66 代次标记（exe 含宽串
 `R3 Shield Core`，DLL 含 `System32\consent.exe` 等整行）。
+
+> `r3shieldcore-cfg.exe` 单独有一条判据：存在、体积合理、**且比源码新**。
+> 它由 `build_cfgtool.sh` 直接编进 `dist`，没有 `Release/` 那一侧的对照物，
+> 所以用"新鲜度"而不是 md5 —— 只查存在会让"改了源码没重编"静默通过。
 
 > 这一步以前是手工 `cp`，代价是出过一次真实事故：x86 DLL 停在旧代次构建，
 > 发布包"文件都在、大小也对、闸门也全绿"，而 32 位进程一条事件都没有。
@@ -319,6 +355,7 @@ bash build_dist_zip.sh     # -> dist/R3ShieldCore-x64.zip
 ├── build.sh                 引擎构建入口
 ├── scripts_env.sh           ★ 工具链自动探测（所有脚本共用）
 ├── deploy_dist.sh           装配发布目录
+├── build_cfgtool.sh         构建「配置与日志」工具（deploy_dist.sh 会调它）
 ├── README.md                本文档
 ├── LICENSE                  GPL-3.0 全文
 ├── THIRD-PARTY-NOTICES.md   ★ 第三方组件的许可原文（二进制分发必读）
@@ -363,7 +400,8 @@ bash build_dist_zip.sh     # -> dist/R3ShieldCore-x64.zip
 
 | 键 | 默认 | 含义 |
 |---|---|---|
-| `mode` | `log`（代码默认；随包 ini 设 `block`） | `log` / `block` / `ask` / `block_all` / `block_all_safe` |
+| `mode` | `log`（代码默认；随包 ini 设 `block`） | `log` / `block` / `ask` / `block_all` / `block_all_safe` / `test`（= `log` + 强制 `test_inject_only=` 非空，见 §3.1） |
+| `test_inject_only` | 空 | **限定注入范围**的白名单（可重复 / 逗号分隔，上限 16）。★ 与 `mode=` 解耦：名单非空就生效。见 §3.1 |
 | `prompt_timeout` | `30` | 询问超时（秒），1..600 |
 | `prompt_default` | `deny` | 超时结论：`allow` / `deny`（仅 `ask` 模式生效） |
 | `high_risk` | `on` | 高危规则总开关 |
@@ -412,6 +450,27 @@ bash build_dist_zip.sh     # -> dist/R3ShieldCore-x64.zip
 | `ark_refresh_ms` | `1000` | ARK 界面刷新，200..60000 |
 
 > 逐项详解见发布目录里的 `配置详解.md`（由 `tools/_gen_config_doc.py` 生成）。
+
+### 8.4 图形化改配置 / 看日志：`r3shieldcore-cfg.exe`
+
+随包附带的**独立**工具（`dist/R3ShieldCore-x64/r3shieldcore-cfg.exe`），双击即用：
+
+- **配置页** —— 把 ini 里的键做成表单（勾选 / 下拉 / 数值 / 多行列表），
+  带类型与范围校验；保存时**逐行改值、其余字节原样保留**（中文注释、空行、
+  被注释掉的示例都不动）。分组切换时改动会**累计**，不会因为切走而丢。
+- **日志页** —— 实时 tail 事件日志 / 控制台日志 / 服务日志，支持暂停、
+  关键字过滤、只看高危、只看被拦；高危标品红、被拦标红。
+
+它**不注入、不挂钩、不依赖引擎或服务在跑**，也**不要求管理员**
+（v66 起 `%ProgramData%\R3 Shield Core\` 下那份配置对普通用户可写）。
+读写的就是引擎真正在读的那份配置（判据与引擎的 `ResolveConfigPath` 一致）。
+
+界面**与引擎主窗口同一套外观**：相同的配色与字体（`Microsoft YaHei UI` /
+`Consolas`）、相同的 62px 标题区与圆角页签栏、相同的圆角自绘按钮与白面板 ——
+两个程序看起来是一套东西。
+
+> 保存后**引擎需重启才生效**。命令行还支持 `--selftest`（无界面自检，
+> 构建时必跑）与 `--section N` / `--page N`（截图、排障用）。
 
 ## 9. 自测与探针
 

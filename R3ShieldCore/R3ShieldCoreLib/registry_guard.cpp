@@ -1,5 +1,7 @@
 #include "stdafx.h"
 #include "registry_guard.h"
+#include "registry_spoof_codec.h"
+#include "registry_enum_codec.h"
 #include "r3shieldcore_channel.h"
 #include "r3shieldcore_prompt.h"
 #include "r3shieldcore_rules.h"
@@ -57,6 +59,22 @@ namespace
 	typedef NTSTATUS(NTAPI* NtCreateKeyPtr)(PHANDLE, ACCESS_MASK, const RG_OBJECT_ATTRIBUTES*, ULONG, RG_UNICODE_STRING*, ULONG, PULONG);
 	typedef NTSTATUS(NTAPI* NtOpenKeyPtr)(PHANDLE, ACCESS_MASK, const RG_OBJECT_ATTRIBUTES*);
 	typedef NTSTATUS(NTAPI* NtOpenKeyExPtr)(PHANDLE, ACCESS_MASK, const RG_OBJECT_ATTRIBUTES*, ULONG);
+
+	// ★ v75：事务注册表（KTM）。`NtXxxTransacted` 与对应的非事务版**签名只差一个
+	//   `TransactionHandle`**（Create 版还差位置：`TransactionHandle` 在 `Disposition` **之前**）。
+	//
+	//   ★ 为什么这是"缺口"而不是"新面"：值读 / 枚举 / 写三类操作在事务句柄上
+	//   **复用同一个 `NtQueryValueKey` / `NtEnumerateKey` / `NtSetValueKey`**
+	//   （这些 API 只看句柄，不区分句柄是不是事务的）⇒ v71 的值替换、v72 的枚举隐藏
+	//   **本来就在事务句柄上生效**。真正缺的只有**"打开 / 创建"这一步的准入判据**：
+	//   用 `NtOpenKeyTransacted` 打开受保护键时，原来那条 `NtOpenKey` 判据**不经过**
+	//   ⇒ 可以绕过"写不进 / 读不到 / 看不见"里的**第一道门**。
+	//
+	//   ⇒ 补的就是这三个"打开 / 创建"的事务变体，判据与 `Op::CreateKey` / `Op::OpenKey` 完全一致。
+	typedef NTSTATUS(NTAPI* NtCreateKeyTransactedPtr)(PHANDLE, ACCESS_MASK, const RG_OBJECT_ATTRIBUTES*, ULONG, RG_UNICODE_STRING*, ULONG, HANDLE, PULONG);
+	typedef NTSTATUS(NTAPI* NtOpenKeyTransactedPtr)(PHANDLE, ACCESS_MASK, const RG_OBJECT_ATTRIBUTES*, HANDLE);
+	typedef NTSTATUS(NTAPI* NtOpenKeyTransactedExPtr)(PHANDLE, ACCESS_MASK, const RG_OBJECT_ATTRIBUTES*, ULONG, HANDLE);
+
 	typedef NTSTATUS(NTAPI* NtSetValueKeyPtr)(HANDLE, const RG_UNICODE_STRING*, ULONG, ULONG, PVOID, ULONG);
 	typedef NTSTATUS(NTAPI* NtDeleteKeyPtr)(HANDLE);
 	typedef NTSTATUS(NTAPI* NtDeleteValueKeyPtr)(HANDLE, const RG_UNICODE_STRING*);
@@ -88,6 +106,12 @@ namespace
 	NtCreateKeyPtr pOriginalNtCreateKey = nullptr;
 	NtOpenKeyPtr pOriginalNtOpenKey = nullptr;
 	NtOpenKeyExPtr pOriginalNtOpenKeyEx = nullptr;
+
+	// v75：事务注册表（KTM）三个"打开 / 创建"变体。
+	NtCreateKeyTransactedPtr pOriginalNtCreateKeyTransacted = nullptr;
+	NtOpenKeyTransactedPtr pOriginalNtOpenKeyTransacted = nullptr;
+	NtOpenKeyTransactedExPtr pOriginalNtOpenKeyTransactedEx = nullptr;
+
 	NtSetValueKeyPtr pOriginalNtSetValueKey = nullptr;
 	NtDeleteKeyPtr pOriginalNtDeleteKey = nullptr;
 	NtDeleteValueKeyPtr pOriginalNtDeleteValueKey = nullptr;
@@ -124,12 +148,45 @@ namespace
 	//
 	volatile LONG g_activeHooks = 0;
 
-	enum class Action
+	// v74：决策档位收敛到共享 ABI（`R3ShieldCore::Action`，见
+	//   shared/r3shieldcore/r3shieldcore_shared.h）。本文件**不再**自己定义。
+	//   ★ 本面的 `Spoof` 有两种落地形态：值替换（v71，数据区清零）与
+	//     枚举隐藏（v72，索引重映射）。语义与其他面一致 —— 调用成功但内容是假的。
+	using Action = R3ShieldCore::Action;
+
+	// ★ v71：读替换的开关。判据只有一条 —— ini `spoof_reg=1`
+	//   （Policy::Flags2 的 FlagSpoofRegistry，默认关）。
+	//   触发点只有"受保护位置的值读取" —— 见 Evaluate 的 `!blockable` 分支。
+	bool SpoofRegEnabled() noexcept
 	{
-		Pass,   // 无需关注，直接放行
-		Record, // 放行并上报
-		Block,  // 拒绝
-	};
+		R3ShieldCore::Policy* policy = R3ShieldCoreChannel::Policy();
+		return policy && (policy->Flags2 & R3ShieldCore::FlagSpoofRegistry) != 0;
+	}
+
+	// 读类 hook 是否**如实上报**（ini `hook_reads=1`）。
+	//
+	// ★ v71 为什么要单列：挂载条件从 `hook_reads` 放宽成
+	//   `hook_reads || spoof_reg`（见 Install），于是会出现
+	//   "hook 挂了、但用户**没**要求记录所有读操作"这种组合。
+	//   那时读操作必须**静默**（返回 Action::Pass），否则 `hook_reads=0`
+	//   的"低噪音"承诺就被偷偷破坏了 —— 而用户根本不知道自己打开了记录。
+	bool HookReadsEnabled() noexcept
+	{
+		R3ShieldCore::Policy* policy = R3ShieldCoreChannel::Policy();
+		return policy && (policy->Flags & R3ShieldCore::FlagHookReads) != 0;
+	}
+
+	// ★ v72：枚举隐藏的开关。判据只有一条 —— ini `spoof_reg_enum=1`
+	//   （Policy::Flags2 的 FlagSpoofRegistryEnum，默认关）。
+	//
+	// ⚠️ 与 `SpoofRegEnabled`（值替换）是**两个独立的位**：值替换只改
+	//   某个值的**内容**（列表长度不变），枚举隐藏改的是**列表长度与顺序**。
+	//   风险画像不同 ⇒ 必须能单独关掉（铁律 199 同族）。
+	bool SpoofRegEnumEnabled() noexcept
+	{
+		R3ShieldCore::Policy* policy = R3ShieldCoreChannel::Policy();
+		return policy && (policy->Flags2 & R3ShieldCore::FlagSpoofRegistryEnum) != 0;
+	}
 
 	Action ExceptionAction(R3ShieldCore::Event& event) noexcept
 	{
@@ -991,6 +1048,14 @@ namespace
 	//   TargetKind::Key  → 正常情况，keyHandle 优先、objectName 兜底
 	//   TargetKind::Hive → KeyPath 直接取 objectName（键的目标位置），
 	//                      hive 文件本身另由调用方通过 CaptureFileHandlePath 填进 ValueName
+	// `spoofInfoClass` 只在 `op == QueryValueKey` 时由调用方传入
+	// （`NtQueryValueKey` 的 `KeyValueInformationClass`）。其余调用点用默认值 0。
+	//
+	// ★ 为什么要传进来而不是在 detour 里判：`Action::Spoof` 这个**决策**
+	//   必须一次做完（决定要不要替换），而"这个 InformationClass 有没有数据区"
+	//   是决策的一部分 —— 没有数据区的 class（`KeyValueBasicInformation`）
+	//   **不该**产生"替换"决策，否则日志里会出现一堆"说要替换但没东西可换"。
+	//   （铁律 97：决策与结果要对得上，别用"没生效"掩盖"压根不适用"。）
 	Action Evaluate(
 		R3ShieldCore::Op op,
 		HANDLE keyHandle,
@@ -998,7 +1063,8 @@ namespace
 		const RG_UNICODE_STRING* valueName,
 		ULONG desiredAccess,
 		R3ShieldCore::Event& event,
-		bool blockable) noexcept
+		bool blockable,
+		ULONG spoofInfoClass = 0) noexcept
 	{
 		ZeroMemory(&event, sizeof(event));
 
@@ -1081,6 +1147,68 @@ namespace
 		}
 
 		if (!blockable) {
+			// ★ v71：读操作的**替换**面。
+			//
+			// 触发条件（四条全中才替换，缺一条就落到下面的"只记录/静默"）：
+			//   ① 开关打开（ini `spoof_reg=1`）；
+			//   ② 是**值读取**（`QueryValueKey`）—— 枚举类操作有游标语义，
+			//      藏一个会让后面的整体前移，是独立的一步，这里不碰；
+			//   ③ 该 InformationClass **有数据区**（`KeyValueBasicInformation`
+			//      只有 Type + Name，没有秘密可藏）；
+			//   ④ 这个键路径是**受保护位置**（`protect_reg=` 前缀命中）。
+			//
+			// ⚠️ 这里**不做**任何"值类型"判断 —— 清零对每种类型都合法
+			//    （见 registry_spoof_codec.h 的说明）。
+			// ⚠️ 这里**不检查** `DataLength` 是否 > 0：那要看**真调之后**的
+			//    结构内容，detour 里才做（`LocateDataRegion` 会拒掉 0 长度）。
+			//    所以决策可能是 Spoof、而实际没清零 —— 那种情况 detour 层
+			//    **不置** `FlagEvent2Spoofed` 并留日志（铁律 97）。
+			if (op == R3ShieldCore::Op::QueryValueKey
+				&& SpoofRegEnabled()
+				&& R3ShieldCoreRegistrySpoof::HasDataRegion(spoofInfoClass)
+				&& R3ShieldCoreRules::IsProtectedRegistryPathForSpoof(event.KeyPath)) {
+				event.Decision = static_cast<ULONG>(R3ShieldCore::Decision::Spoofed);
+				return Action::Spoof;
+			}
+
+			// ★ v72：读操作的**枚举隐藏**面。
+			//
+			// 触发条件（三条全中，缺一条就落到下面的"只记录/静默"）：
+			//   ① 开关打开（ini `spoof_reg_enum=1`）；
+			//   ② 是**枚举类**操作（`EnumerateKey` / `EnumerateValueKey`）——
+			//      值读取（`QueryValueKey`）走的是 v71 的"清零"，不是隐藏；
+			//   ③ 被枚举的键**可能与 `protect_reg=` 相关**
+			//      （`CouldHaveProtectedChildRegistry`，**保守上界**）。
+			//
+			// ★ 这里判的是"**这个键值不值得扫一遍**"，**不是**"有没有项要藏"——
+			//   后者要看**真调之后每一项的名字**，detour 里才做。
+			//   所以决策可能是 Spoof、而这一次一项都没藏（受保护项恰好不在这批里）
+			//   —— 那种情况 detour 层**不上报**（枚举的绝大多数调用都属于这种，
+			//   上报会把日志刷爆），只有**真的藏掉了东西**才发事件 + 留日志。
+			//   ⚠️ 与 v71 的差别（诚实标注）：v71 是"决策=Spoof 就上报，
+			//   只是不置 `FlagEvent2Spoofed`"；这里改成"**真的藏了才上报**"。
+			//   理由是数量级：v71 一次调用对应一个值，v72 一次调用对应**列表里的
+			//   一个位置**，同一个键会被反复枚举 ⇒ 按 v71 的口径会产生
+			//   "N 个位置 N 条事件、其中 N-1 条什么也没做"的噪音。
+			if ((op == R3ShieldCore::Op::EnumerateKey
+					|| op == R3ShieldCore::Op::EnumerateValueKey)
+				&& SpoofRegEnumEnabled()
+				&& R3ShieldCoreRules::CouldHaveProtectedChildRegistry(event.KeyPath)) {
+				event.Decision = static_cast<ULONG>(R3ShieldCore::Decision::Spoofed);
+				return Action::Spoof;
+			}
+
+			// ★ v71：`hook_reads=0` 且不是替换目标 ⇒ **完全静默**。
+			//
+			// 为什么需要这一条：挂载条件放宽成 `hook_reads || spoof_reg` 之后，
+			// 会出现"为了替换而挂了读 hook，但用户没要求记录读操作"的组合。
+			// 此时若照旧 `Action::Record`，就等于**偷偷打开了读记录** ——
+			// 用户的 `hook_reads=0`（"噪音太大，默认关"）承诺被破坏，
+			// 而且他不知道为什么日志突然暴涨。
+			if (!HookReadsEnabled()) {
+				return Action::Pass;
+			}
+
 			// 读操作永远只记录。
 			event.Decision = static_cast<ULONG>(R3ShieldCore::Decision::Allowed);
 			return Action::Record;
@@ -1359,6 +1487,158 @@ namespace
 		}
 		else {
 			status = pOriginalNtOpenKeyEx(KeyHandle, DesiredAccess, ObjectAttributes, OpenOptions);
+
+			if (action == Action::Record) {
+				event.Status = static_cast<ULONG>(status);
+
+				if (status >= 0 && KeyHandle) {
+					__try {
+						RefineKeyPath(*KeyHandle, event);
+					}
+					__except (EXCEPTION_EXECUTE_HANDLER) {
+					}
+				}
+
+				Publish(event);
+			}
+		}
+
+		InterlockedDecrement(&g_activeHooks);
+		return status;
+	}
+
+	// ==================================================================
+	// ★ v75：事务注册表（KTM）—— 与上面三个**同一套判据**，只多一个 `TransactionHandle`。
+	//
+	//   为什么必须补：`NtCreateKey` / `NtOpenKey` 的 detour **不经过**事务变体
+	//   ⇒ 用 `NtOpenKeyTransacted` 打开受保护键，能绕过"写不进 / 读不到 / 看不见"
+	//   里的**第一道门**（准入）。一旦拿到句柄，后面的读 / 写 / 枚举都走
+	//   已被 v71 / v72 覆盖的那几个 API ⇒ 缺的就是这里。
+	//
+	//   ★ 事务**提交前**的写入对其它进程不可见，但**本事务内**读得到（读己之写）；
+	//   所以"事务里读到的也是被替换 / 清零后的值"由 v71 的 detour 保证，
+	//   与是不是事务**无关** —— 这也是"缺的只是准入"这句话的依据。
+	// ==================================================================
+	NTSTATUS NTAPI NtCreateKeyTransacted_Hook(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess,
+		const RG_OBJECT_ATTRIBUTES* ObjectAttributes, ULONG TitleIndex,
+		RG_UNICODE_STRING* Class, ULONG CreateOptions, HANDLE TransactionHandle,
+		PULONG Disposition)
+	{
+		InterlockedIncrement(&g_activeHooks);
+
+		R3ShieldCore::Event event;
+		Action action = Action::Pass;
+		NTSTATUS status = STATUS_UNSUCCESSFUL;
+
+		__try {
+			action = Evaluate(R3ShieldCore::Op::CreateKey, nullptr,
+				ObjectAttributes ? ObjectAttributes->ObjectName : nullptr, nullptr,
+				DesiredAccess, event, true);
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER) {
+			action = ExceptionAction(event);
+		}
+
+		if (action == Action::Block) {
+			event.Status = static_cast<ULONG>(STATUS_ACCESS_DENIED);
+			Publish(event);
+			status = STATUS_ACCESS_DENIED;
+		}
+		else {
+			status = pOriginalNtCreateKeyTransacted(KeyHandle, DesiredAccess, ObjectAttributes,
+				TitleIndex, Class, CreateOptions, TransactionHandle, Disposition);
+
+			if (action == Action::Record) {
+				event.Status = static_cast<ULONG>(status);
+
+				if (status >= 0 && KeyHandle) {
+					__try {
+						RefineKeyPath(*KeyHandle, event);
+					}
+					__except (EXCEPTION_EXECUTE_HANDLER) {
+					}
+				}
+
+				Publish(event);
+			}
+		}
+
+		InterlockedDecrement(&g_activeHooks);
+		return status;
+	}
+
+	NTSTATUS NTAPI NtOpenKeyTransacted_Hook(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess,
+		const RG_OBJECT_ATTRIBUTES* ObjectAttributes, HANDLE TransactionHandle)
+	{
+		InterlockedIncrement(&g_activeHooks);
+
+		R3ShieldCore::Event event;
+		Action action = Action::Pass;
+		NTSTATUS status = STATUS_UNSUCCESSFUL;
+
+		__try {
+			action = Evaluate(R3ShieldCore::Op::OpenKey, nullptr,
+				ObjectAttributes ? ObjectAttributes->ObjectName : nullptr, nullptr,
+				DesiredAccess, event, true);
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER) {
+			action = ExceptionAction(event);
+		}
+
+		if (action == Action::Block) {
+			event.Status = static_cast<ULONG>(STATUS_ACCESS_DENIED);
+			Publish(event);
+			status = STATUS_ACCESS_DENIED;
+		}
+		else {
+			status = pOriginalNtOpenKeyTransacted(KeyHandle, DesiredAccess, ObjectAttributes,
+				TransactionHandle);
+
+			if (action == Action::Record) {
+				event.Status = static_cast<ULONG>(status);
+
+				if (status >= 0 && KeyHandle) {
+					__try {
+						RefineKeyPath(*KeyHandle, event);
+					}
+					__except (EXCEPTION_EXECUTE_HANDLER) {
+					}
+				}
+
+				Publish(event);
+			}
+		}
+
+		InterlockedDecrement(&g_activeHooks);
+		return status;
+	}
+
+	NTSTATUS NTAPI NtOpenKeyTransactedEx_Hook(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess,
+		const RG_OBJECT_ATTRIBUTES* ObjectAttributes, ULONG OpenOptions, HANDLE TransactionHandle)
+	{
+		InterlockedIncrement(&g_activeHooks);
+
+		R3ShieldCore::Event event;
+		Action action = Action::Pass;
+		NTSTATUS status = STATUS_UNSUCCESSFUL;
+
+		__try {
+			action = Evaluate(R3ShieldCore::Op::OpenKey, nullptr,
+				ObjectAttributes ? ObjectAttributes->ObjectName : nullptr, nullptr,
+				DesiredAccess, event, true);
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER) {
+			action = ExceptionAction(event);
+		}
+
+		if (action == Action::Block) {
+			event.Status = static_cast<ULONG>(STATUS_ACCESS_DENIED);
+			Publish(event);
+			status = STATUS_ACCESS_DENIED;
+		}
+		else {
+			status = pOriginalNtOpenKeyTransactedEx(KeyHandle, DesiredAccess, ObjectAttributes,
+				OpenOptions, TransactionHandle);
 
 			if (action == Action::Record) {
 				event.Status = static_cast<ULONG>(status);
@@ -1973,7 +2253,17 @@ namespace
 	}
 
 	// ==================================================================
-	// 读类 hook —— 只记录，永不拦截。默认关闭，由 hook_reads 打开。
+	// 读类 hook —— 默认关闭（噪音大），由 hook_reads **或** spoof_reg 打开。
+	//
+	// ★ 它**永不拦截**（读操作不该拦：拦了程序会以为值不存在，行为完全不同），
+	//   但 v71 起它可以**替换**（把数据区清零）。
+	//
+	// ⚠️ `block_all` 下这条路的 `Evaluate` 会返回 `Action::Block`（全拦分支
+	//   抢在 `!blockable` 之前执行），而本 detour **不处理** Block ⇒ 等价于
+	//    放行。这是 v71 **之前就有**的行为，本轮**不动** ——
+	//    真要"全拦下连读也拒"，全系统的注册表读都会被拒，等于把机器弄瘫
+	//    （铁律 165 说的是"全拦下不做替换"，不是"全拦下把读也拒掉"）。
+	//    顺带这也让"`block_all` 下不做替换"这条**天然成立**。
 	// ==================================================================
 	NTSTATUS NTAPI NtQueryValueKey_Hook(HANDLE KeyHandle, const RG_UNICODE_STRING* ValueName,
 		ULONG KeyValueInformationClass, PVOID KeyValueInformation,
@@ -1985,7 +2275,10 @@ namespace
 		Action action = Action::Pass;
 
 		__try {
-			action = Evaluate(R3ShieldCore::Op::QueryValueKey, KeyHandle, nullptr, ValueName, 0, event, false);
+			// ★ v71：把 InformationClass 一并交给决策层 —— "这个 class 有没有
+			//   数据区"是**决策**的一部分（没有数据区就不该产生替换决策）。
+			action = Evaluate(R3ShieldCore::Op::QueryValueKey, KeyHandle, nullptr, ValueName, 0,
+				event, false, KeyValueInformationClass);
 		}
 		__except (EXCEPTION_EXECUTE_HANDLER) {
 			action = Action::Pass;
@@ -1994,13 +2287,122 @@ namespace
 		NTSTATUS status = pOriginalNtQueryValueKey(KeyHandle, ValueName, KeyValueInformationClass,
 			KeyValueInformation, Length, ResultLength);
 
-		if (action == Action::Record) {
+		// ★ v71：替换 —— 真调已把真实值写进调用者的缓冲区，现在把**数据区**清零。
+		//
+		// ⚠️ **长度字段一个都不改**：`DataLength` / `DataOffset` / `*ResultLength` /
+		//    `Type` / `NameLength` 全部保持原值。理由见 registry_spoof_codec.h
+		//    —— 改长度要同步改三处，改错一处就是调用方读越界。
+		// ⚠️ 真调**失败**（值不存在 / 缓冲区太小 STATUS_BUFFER_TOO_SMALL）
+		//    ⇒ 根本没有内容被写进缓冲区，没有东西可泄露 ⇒ 如实返回失败。
+		if (action == Action::Spoof && status >= 0) {
+			const ULONG resultLength = ResultLength ? *ResultLength : 0;
+			R3ShieldCoreRegistrySpoof::DataRegion region = {};
+
+			if (R3ShieldCoreRegistrySpoof::LocateDataRegion(KeyValueInformationClass,
+					KeyValueInformation, Length, resultLength, region)
+				&& R3ShieldCoreRegistrySpoof::ZeroDataRegion(KeyValueInformation, Length, region)) {
+				event.Flags2 |= R3ShieldCore::FlagEvent2Spoofed;
+			}
+			else {
+				// 替换没做成：class 没有数据区 / 数据长度为 0 / 长度字段自相矛盾
+				// / 目标页只读。**如实记录，不置 FlagEvent2Spoofed** ——
+				// 否则日志里"替换成功"与"替换失败"长得一模一样（铁律 97）。
+				//
+				// ⚠️ 这条日志里的 ASCII 子串 `spoof_reg` 不是装饰：它是
+				//    `check_dist_sync.sh` 的 v71 代次标记（`strings -el` 只输出
+				//    ASCII 可打印字符，纯中文标记永远查不到）。别删。
+				LOG(L"RegistryGuard: 注册表值替换未生效（spoof_reg，class=%u len=%u result=%u），本次返回真实值",
+					KeyValueInformationClass, Length, resultLength);
+			}
+		}
+
+		// ★ v71：Spoof 也要上报（否则"替换发生了"这件事在日志里完全看不到）。
+		if (action == Action::Record || action == Action::Spoof) {
 			event.Status = static_cast<ULONG>(status);
 			Publish(event);
 		}
 
 		InterlockedDecrement(&g_activeHooks);
 		return status;
+	}
+
+	// ==================================================================
+	// v72：枚举隐藏 —— **索引重映射**
+	// ==================================================================
+	//
+	// 语义：调用方要"第 `callerIndex` 个**可见**项"。我们**从 0 开始扫**，
+	//   把命中 `protect_reg=` 的项跳过，数到第 `callerIndex` 个可见项时，
+	//   记下它的**原始索引** `original`；随后用**调用方给的 class / 缓冲区**
+	//   真调一次原函数取第 `original` 项。
+	//
+	//   ⇒ 返回给调用方的每一项都是**真实、合法、结构完整**的项，
+	//     `ResultLength` 也由原函数按真实项回填 —— **一个字段都不用我们自己改**
+	//     （铁律 194：能造出合法替代物才替换；这里的"替代物"就是列表里的下一项）。
+	//
+	// ⚠️ **为什么必须从 0 扫，不能"命中就往后挪一格"**：
+	//   考虑 [A(可见) B(隐藏) C(可见)]。若"命中就 +1"，则调用方索引 0 → A、
+	//   索引 1 → 原 1=B 隐藏 ⇒ 挪到 C、索引 2 → 原 2=C **可见** ⇒ 又返回 C
+	//   ⇒ 调用方看到 [A, C, C] —— **重复项**。从 0 数可见项才不会重复。
+	//
+	// ⚠️ 用**独立缓冲区 + class 0** 探测，不碰调用方的缓冲区、不用调用方的 class：
+	//   `KeyValuePartialInformation`(class 2) **没有名字**，而它正是
+	//   `RegEnumValue` 用的那个 ⇒ 用调用方的 class 探测会让最常见的那条路
+	//   永远取不到名字（而且完全不报错）。见 registry_enum_codec.h。
+	//
+	// ★★ **算法本身在 codec 里**（`RemapEnumerationIndexImpl`）——
+	//   生产与探针用**同一份控制流**，不只是同一份解析函数（铁律 195）。
+	//   这里只负责把"真调原函数"和"这个子路径算不算受保护"包成两个可调用体。
+	using Remap = R3ShieldCoreRegistryEnum::RemapResult;
+
+	// 编译期闸门：codec 里的路径上限必须与共享头一致（铁律 127 —— 常量抄了两份，
+	// 就得有东西盯着它别漂）。
+	static_assert(R3ShieldCoreRegistryEnum::kMaxKeyPathChars == R3ShieldCore::MaxKeyPathChars,
+		"registry_enum_codec.h 的 kMaxKeyPathChars 必须等于 R3ShieldCore::MaxKeyPathChars");
+
+	struct EnumProbeCall
+	{
+		bool valueEnum;
+		HANDLE keyHandle;
+
+		LONG operator()(ULONG index, ULONG infoClass, PVOID info,
+			ULONG length, PULONG resultLength) const noexcept
+		{
+			return valueEnum
+				? pOriginalNtEnumerateValueKey(keyHandle, index, infoClass, info, length, resultLength)
+				: pOriginalNtEnumerateKey(keyHandle, index, infoClass, info, length, resultLength);
+		}
+	};
+
+	struct ProtectedChildPredicate
+	{
+		bool operator()(const WCHAR* childPath) const noexcept
+		{
+			return R3ShieldCoreRules::IsProtectedRegistryPathForSpoof(childPath);
+		}
+	};
+
+	Remap RemapEnumerationIndex(bool valueEnum, HANDLE keyHandle, ULONG callerIndex,
+		const WCHAR* keyPath, ULONG keyPathChars,
+		ULONG& outOriginalIndex, ULONG& outHiddenCount) noexcept
+	{
+		EnumProbeCall call{ valueEnum, keyHandle };
+		ProtectedChildPredicate isHidden;
+
+		LONG probeStatus = 0;
+		const bool ok = R3ShieldCoreRegistryEnum::RemapEnumerationIndexImpl(
+			valueEnum, call, isHidden, callerIndex, keyPath, keyPathChars,
+			outOriginalIndex, outHiddenCount, probeStatus);
+
+		// 探测失败 ⇒ **如实留痕**（否则"藏不住"和"没写这个功能"长得一样，
+		// 铁律 97）。扫到底（NO_MORE_ENTRIES）是**正常**结果，不打日志。
+		if (!ok && !R3ShieldCoreRegistryEnum::IsNoMoreEntries(probeStatus)) {
+			LOG(L"RegistryGuard: 枚举隐藏未生效（spoof_reg_enum，探测返回 0x%08lX），本次返回真实列表",
+				static_cast<unsigned long>(probeStatus));
+		}
+
+		const bool exhausted = ok && R3ShieldCoreRegistryEnum::IsNoMoreEntries(probeStatus);
+		return R3ShieldCoreRegistryEnum::ClassifyRemap(
+			ok, outHiddenCount, outOriginalIndex, callerIndex, exhausted);
 	}
 
 	NTSTATUS NTAPI NtEnumerateKey_Hook(HANDLE KeyHandle, ULONG Index,
@@ -2018,10 +2420,61 @@ namespace
 			action = Action::Pass;
 		}
 
-		NTSTATUS status = pOriginalNtEnumerateKey(KeyHandle, Index, KeyInformationClass,
-			KeyInformation, Length, ResultLength);
+		NTSTATUS status = 0;
+		bool spoofed = false;
+		ULONG hiddenCount = 0;
 
-		if (action == Action::Record) {
+		if (action == Action::Spoof) {
+			ULONG originalIndex = 0;
+			Remap remap = Remap::Passthrough;
+
+			__try {
+				remap = RemapEnumerationIndex(false, KeyHandle, Index,
+					event.KeyPath, event.KeyPathLength, originalIndex, hiddenCount);
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER) {
+				remap = Remap::Passthrough;
+				hiddenCount = 0;
+			}
+
+			if (remap == Remap::Mapped && hiddenCount > 0) {
+				status = pOriginalNtEnumerateKey(KeyHandle, originalIndex,
+					KeyInformationClass, KeyInformation, Length, ResultLength);
+				spoofed = status >= 0;
+			}
+			else if (remap == Remap::Exhausted && hiddenCount > 0) {
+				// 可见项不够 ⇒ 调用方索引越界。语义与真实调用的
+				// "越界"完全一致（NO_MORE_ENTRIES + ResultLength=0）。
+				if (ResultLength) {
+					*ResultLength = 0;
+				}
+				status = R3ShieldCoreRegistryEnum::kStatusNoMoreEntries;
+				spoofed = true;
+			}
+			else {
+				// 判不出 / 一项都没藏 ⇒ **原样调用**（与开关之前完全一致）。
+				status = pOriginalNtEnumerateKey(KeyHandle, Index,
+					KeyInformationClass, KeyInformation, Length, ResultLength);
+			}
+		}
+		else {
+			status = pOriginalNtEnumerateKey(KeyHandle, Index, KeyInformationClass,
+				KeyInformation, Length, ResultLength);
+		}
+
+		// ★ 只有**真的藏掉了东西**才上报（见 Evaluate 里 v72 那段的口径说明）。
+		if (spoofed) {
+			event.Flags2 |= R3ShieldCore::FlagEvent2Spoofed;
+			event.Status = static_cast<ULONG>(status);
+			Publish(event);
+
+			// ⚠️ 这条日志里的 ASCII 子串 `spoof_reg_enum` 不是装饰：它是
+			//    `check_dist_sync.sh` 的 v72 代次标记（`strings -el` 只输出
+			//    ASCII 可打印字符，纯中文标记永远查不到）。别删。
+			LOG(L"RegistryGuard: 枚举隐藏（spoof_reg_enum）子键 %u 个，调用方索引 %u -> 原始索引 %u",
+				hiddenCount, Index, Index + hiddenCount);
+		}
+		else if (action == Action::Record) {
 			event.Status = static_cast<ULONG>(status);
 			Publish(event);
 		}
@@ -2045,10 +2498,54 @@ namespace
 			action = Action::Pass;
 		}
 
-		NTSTATUS status = pOriginalNtEnumerateValueKey(KeyHandle, Index, KeyValueInformationClass,
-			KeyValueInformation, Length, ResultLength);
+		NTSTATUS status = 0;
+		bool spoofed = false;
+		ULONG hiddenCount = 0;
 
-		if (action == Action::Record) {
+		if (action == Action::Spoof) {
+			ULONG originalIndex = 0;
+			Remap remap = Remap::Passthrough;
+
+			__try {
+				remap = RemapEnumerationIndex(true, KeyHandle, Index,
+					event.KeyPath, event.KeyPathLength, originalIndex, hiddenCount);
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER) {
+				remap = Remap::Passthrough;
+				hiddenCount = 0;
+			}
+
+			if (remap == Remap::Mapped && hiddenCount > 0) {
+				status = pOriginalNtEnumerateValueKey(KeyHandle, originalIndex,
+					KeyValueInformationClass, KeyValueInformation, Length, ResultLength);
+				spoofed = status >= 0;
+			}
+			else if (remap == Remap::Exhausted && hiddenCount > 0) {
+				if (ResultLength) {
+					*ResultLength = 0;
+				}
+				status = R3ShieldCoreRegistryEnum::kStatusNoMoreEntries;
+				spoofed = true;
+			}
+			else {
+				status = pOriginalNtEnumerateValueKey(KeyHandle, Index,
+					KeyValueInformationClass, KeyValueInformation, Length, ResultLength);
+			}
+		}
+		else {
+			status = pOriginalNtEnumerateValueKey(KeyHandle, Index, KeyValueInformationClass,
+				KeyValueInformation, Length, ResultLength);
+		}
+
+		if (spoofed) {
+			event.Flags2 |= R3ShieldCore::FlagEvent2Spoofed;
+			event.Status = static_cast<ULONG>(status);
+			Publish(event);
+
+			LOG(L"RegistryGuard: 枚举隐藏（spoof_reg_enum）值 %u 个，调用方索引 %u -> 原始索引 %u",
+				hiddenCount, Index, Index + hiddenCount);
+		}
+		else if (action == Action::Record) {
 			event.Status = static_cast<ULONG>(status);
 			Publish(event);
 		}
@@ -2116,6 +2613,38 @@ namespace
 			reinterpret_cast<LPVOID*>(&pOriginalNtOpenKey), true);
 		QueueHook("NtOpenKeyEx", reinterpret_cast<LPVOID>(NtOpenKeyEx_Hook),
 			reinterpret_cast<LPVOID*>(&pOriginalNtOpenKeyEx), false);
+
+		// ★ v75：事务注册表（KTM）三个"打开 / 创建"变体。
+		//
+		//   判据与上面三个**完全同源**（同一个 `Op::CreateKey` / `Op::OpenKey`），
+		//   补的是"**用事务打开受保护键**"这条绕过路 —— 原来 `NtOpenKey` 的判据
+		//   不经过事务变体 ⇒ 准入这一道门形同虚设。
+		//
+		//   ★ 一律 `required=false`：这些导出在很老的系统上可能没有，
+		//   缺了只少一层覆盖，**不能**让整个模块失败
+		//   （与 `NtOpenKeyEx` / `NtSetInformationKey` 同一个处理）。
+		//
+		//   ★ 为什么不给一个开关：事务打开与普通打开是**同一个决策**
+		//   （都是"要不要放行这次准入"）⇒ 单独关掉它等于**人为开一个洞**
+		//   （关掉就能绕过 v71/v72 的读不到/看不见）。所以跟随主判据，无条件挂。
+		//
+		//   ★★ v75 代次标记（**不要删这条 LOG**）：里面的 ASCII 子串
+		//   `spoof_reg_ktm` 是 `check_dist_sync.sh` 的 v75 判据
+		//   （`strings -el` 只输出 ASCII 可打印字符，纯中文标记永远查不到）。
+		//   为什么必须有它：事务变体与普通变体**没有新 ini 键、没有新 ABI 位**
+		//   —— 光看 v70~v73 那些标记，区分不出"这一版到底补没补这三个导出"。
+		const bool ktmCreate = QueueHook("NtCreateKeyTransacted",
+			reinterpret_cast<LPVOID>(NtCreateKeyTransacted_Hook),
+			reinterpret_cast<LPVOID*>(&pOriginalNtCreateKeyTransacted), false);
+		const bool ktmOpen = QueueHook("NtOpenKeyTransacted",
+			reinterpret_cast<LPVOID>(NtOpenKeyTransacted_Hook),
+			reinterpret_cast<LPVOID*>(&pOriginalNtOpenKeyTransacted), false);
+		const bool ktmOpenEx = QueueHook("NtOpenKeyTransactedEx",
+			reinterpret_cast<LPVOID>(NtOpenKeyTransactedEx_Hook),
+			reinterpret_cast<LPVOID*>(&pOriginalNtOpenKeyTransactedEx), false);
+		LOG(L"RegistryGuard: 事务注册表（KTM）准入判据已挂载（spoof_reg_ktm）"
+			L" create=%d open=%d openEx=%d",
+			ktmCreate ? 1 : 0, ktmOpen ? 1 : 0, ktmOpenEx ? 1 : 0);
 		QueueHook("NtSetValueKey", reinterpret_cast<LPVOID>(NtSetValueKey_Hook),
 			reinterpret_cast<LPVOID*>(&pOriginalNtSetValueKey), true);
 		QueueHook("NtDeleteKey", reinterpret_cast<LPVOID>(NtDeleteKey_Hook),
@@ -2164,14 +2693,51 @@ namespace
 				reinterpret_cast<LPVOID*>(&pOriginalNtReplaceKey), false);
 		}
 
-		// 读类：默认关闭，噪音太大
-		if (policy && (policy->Flags & R3ShieldCore::FlagHookReads)) {
+		// 读类：默认关闭（噪音太大 —— 任何读值的操作都走这里）。
+		//
+		// ★ v71：挂载条件放宽成 `hook_reads || spoof_reg`。
+		//   为什么必须放宽：`spoof_reg=1` 的替换**就发生在 `NtQueryValueKey`
+		//   的 detour 里**，而这个 hook 原来只在 `hook_reads=1` 时挂
+		//   ⇒ 不放开的话，用户打开 `spoof_reg` 什么也不会发生，
+		//   而引擎横幅还会印「注册表替换: 开」（铁律 93：配置说了 ≠ 代码会读）。
+		//
+		//   ⚠️ 但**不能**顺带把"读操作如实上报"也打开 —— 那是 `hook_reads`
+		//   的语义。`hook_reads=0` 时读操作返回 `Action::Pass`（完全静默），
+		//   见 `HookReadsEnabled`。
+		//
+		//   ⚠️ 枚举类（`NtEnumerateKey` / `NtEnumerateValueKey`）**不在
+		//   `spoof_reg` 这条放宽里**：v71 的替换面只有"值读取"。
+		//   ★ v72 起**枚举隐藏**是独立的一步（有游标语义），它有自己的位
+		//   `FlagSpoofRegistryEnum` ⇒ 由下面 `spoofRegEnum` 那一支单独挂。
+		//   仍然遵守"范围跟着代码走，不多不少"：只挂真正会用到的 hook。
+		const bool hookReads = policy && (policy->Flags & R3ShieldCore::FlagHookReads) != 0;
+		const bool spoofReg = policy && (policy->Flags2 & R3ShieldCore::FlagSpoofRegistry) != 0;
+		const bool spoofRegEnum = policy && (policy->Flags2 & R3ShieldCore::FlagSpoofRegistryEnum) != 0;
+
+		if (hookReads) {
 			QueueHook("NtQueryValueKey", reinterpret_cast<LPVOID>(NtQueryValueKey_Hook),
 				reinterpret_cast<LPVOID*>(&pOriginalNtQueryValueKey), false);
 			QueueHook("NtEnumerateKey", reinterpret_cast<LPVOID>(NtEnumerateKey_Hook),
 				reinterpret_cast<LPVOID*>(&pOriginalNtEnumerateKey), false);
 			QueueHook("NtEnumerateValueKey", reinterpret_cast<LPVOID>(NtEnumerateValueKey_Hook),
 				reinterpret_cast<LPVOID*>(&pOriginalNtEnumerateValueKey), false);
+		}
+		else {
+			if (spoofReg) {
+				QueueHook("NtQueryValueKey", reinterpret_cast<LPVOID>(NtQueryValueKey_Hook),
+					reinterpret_cast<LPVOID*>(&pOriginalNtQueryValueKey), false);
+				LOG(L"RegistryGuard: spoof_reg 打开 ⇒ 额外挂上 NtQueryValueKey"
+					L"（hook_reads 仍为关，普通读操作不上报）");
+			}
+			// ★ v72：枚举隐藏自己的挂载条件 —— 同样**不**打开读记录。
+			if (spoofRegEnum) {
+				QueueHook("NtEnumerateKey", reinterpret_cast<LPVOID>(NtEnumerateKey_Hook),
+					reinterpret_cast<LPVOID*>(&pOriginalNtEnumerateKey), false);
+				QueueHook("NtEnumerateValueKey", reinterpret_cast<LPVOID>(NtEnumerateValueKey_Hook),
+					reinterpret_cast<LPVOID*>(&pOriginalNtEnumerateValueKey), false);
+				LOG(L"RegistryGuard: spoof_reg_enum 打开 ⇒ 额外挂上 NtEnumerateKey /"
+					L" NtEnumerateValueKey（hook_reads 仍为关，普通枚举不上报）");
+			}
 		}
 	}
 }

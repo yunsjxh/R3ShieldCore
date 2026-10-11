@@ -169,6 +169,9 @@ namespace
 		if (name == "WOULD-BLOCK") {
 			return static_cast<ULONG>(R3ShieldCore::Decision::WouldBlock);
 		}
+		if (name == "SPOOF") {
+			return static_cast<ULONG>(R3ShieldCore::Decision::Spoofed);
+		}
 		if (name == "ALLOW") {
 			return static_cast<ULONG>(R3ShieldCore::Decision::Allowed);
 		}

@@ -20,7 +20,51 @@ namespace R3ShieldCore
 {
 	constexpr ULONG PolicyMagic = 0x31504752;  // 'RGP1'
 	constexpr ULONG ChannelMagic = 0x31454752; // 'RGE1'
-	constexpr ULONG AbiVersion = 20;           // 20: ★ 绝不注入名单（v49）—— `Policy` **尾部追加**
+	constexpr ULONG AbiVersion = 26;           // 26: ★ 摄像头**帧替换**（v73）—— `Policy::Flags2` 新增一个
+	                                           //     **位** `FlagSpoofCamera`（0x800）。**布局不变**，
+	                                           //     与 25/24/23/19 同一个理由（**语义**升版）：
+	                                           //     旧 DLL 不认识本位 ⇒ 它会在 `MFCreateSourceReaderFromMediaSource`
+	                                           //     上**直接拒绝**（= v73 之前的行为），而新引擎的启动横幅
+	                                           //     却会印「摄像头帧替换: 开」——**横幅撒谎**（铁律 93）。
+	                                           //     升版本 ⇒ 新旧混用落到「共享通道不可用 ⇒ 本进程
+	                                           //     跳过全部 Hook」，而不是"配置说了、代码没读"。
+	                                           // 25: ★ 注册表**枚举隐藏**（v72）—— `Policy::Flags2` 新增一个
+	                                           //     **位** `FlagSpoofRegistryEnum`（0x400）。**布局不变**，
+	                                           //     与 23/24/19 同一个理由（**语义**升版）：
+	                                           //     旧 DLL 不认识本位 ⇒ 它会让 `NtEnumerateKey` /
+	                                           //     `NtEnumerateValueKey` 照原样返回**完整列表**
+	                                           //     （受保护项照样看得见），而新引擎的启动横幅却会
+	                                           //     印「注册表枚举隐藏: 开」——**横幅撒谎**（铁律 93）。
+	                                           //     升版本 ⇒ 新旧混用落到「共享通道不可用 ⇒ 本进程
+	                                           //     跳过全部 Hook」，而不是"配置说了、代码没读"。
+	                                           // 24: ★ 注册表值替换（v71）—— `Policy::Flags2` 新增一个
+	                                           //     **位** `FlagSpoofRegistry`（0x200）。**布局不变**，
+	                                           //     与 23/19 同一个理由（**语义**升版）：
+	                                           //     旧 DLL 不认识本位 ⇒ 它会把 `spoof_reg=1`
+	                                           //     静默忽略（读操作照原样返回真值），而新引擎的
+	                                           //     启动横幅却会印「注册表替换: 开」——**横幅撒谎**
+	                                           //     （铁律 93）。升版本 ⇒ 新旧混用落到「共享通道
+	                                           //     不可用 ⇒ 本进程跳过全部 Hook」。
+	                                           // 23: ★ 剪贴板替换（v70）—— `Policy::Flags2` 新增一个
+	                                           //     **位** `FlagSpoofClipboard`（0x100）。**布局不变**，
+	                                           //     但和 19 一样是**语义**升版：
+	                                           //     旧 DLL 不认识本位 ⇒ 它会把 `spoof_clipboard=1`
+	                                           //     静默忽略、退回"拒绝"，而新引擎的启动横幅却会
+	                                           //     印「剪贴板替换: 开」——**横幅撒谎**。
+	                                           //     升版本 ⇒ 新旧混用落到「共享通道不可用 ⇒ 本进程
+	                                           //     跳过全部 Hook」，而不是"配置说了、代码没读"。
+	                                           //     （铁律 93：文档里写了 ≠ 代码会读。）
+	                                           // 22: ★ 测试模式（v68）—— `Policy` **尾部追加**
+	                                           //     `TestInjectCount` + `TestInjectPaths[16][260]`，
+	                                           //     并新增 `Flags2` 位 `FlagTestMode`。
+	                                           //     ★ 布局改动（`sizeof(Policy)` 变大）⇒ 必须升版本，
+	                                           //     理由与 20 完全一样（见下面 20 那段）。
+	                                           // 21: ★ 回传数据替换（v67）—— `Decision` 新增 `Spoofed`，
+	                                           //     `Policy::Flags2` / `Event::Flags2` 各新增一个**位**。
+	                                           //     ★ 布局不变，但**语义变了**：旧引擎不认识
+	                                           //     `Spoofed`（会显示成 "?"），旧 DLL 也不支持替换。
+	                                           //     两侧同版本才能保证"替换"语义被正确理解。
+	                                           // 20: ★ 绝不注入名单（v49）—— `Policy` **尾部追加**
 	                                           //     `NeverInjectCount` + `NeverInjectPaths[16][260]`。
 	                                           //     ★ 这是**布局改动**（`sizeof(Policy)` 变大）⇒ 必须
 	                                           //     升版本，而且**两个方向都要挡**：
@@ -908,11 +952,68 @@ enum class ObjectType : ULONG
 		Subscribe = 5,      // IWbemServices::ExecNotificationQuery —— 订阅事件（不落盘，但要报）
 	};
 
+	//
+	// guard 的**决策档位**（v74 收敛为共享枚举）。
+	//
+	// ⚠️ 历史：v67 之前，这 4 个值分散在 **17 个 guard 各自的 .cpp** 里
+	//    各写一份 `enum class Action { Pass, Record, Block };`（例如
+	//    `file_guard.cpp:130-135`）。多写几份的代价不是重复几行，而是
+	//    **同一个概念在 17 处独立演化**：
+	//      · v67 给 screen_guard 加了 `Spoof`，其余 16 个没有；
+	//      · v70/v71/v73 又各自补一次 ⇒ "哪个面支持替换"只能靠翻源码数。
+	//    收敛后：**一处定义、一处注释**（下面这段），各 guard 只 `using`
+	//    或直接引用 `R3ShieldCore::Action`。
+	//
+	// ⚠️ 命名冲突：库内另有两处**不相干**的 `Action`，**不要**混：
+	//      · `R3ShieldCoreToast::Action`（UI 卡片按钮：Allow/Deny/...）
+	//      · `ArkActions::Action`（ark 工具：Suspend/ForceKill/...）
+	//    它们与这里的"是否放行"无关，各在自己的命名空间里，保持独立。
+	//
+	// 与 `Decision` 的映射（每个 guard 的 Publish 处都要做这个转换）：
+	//      Pass   -> Decision::Allowed      （放行，无需关注）
+	//      Record -> Decision::Allowed      （放行 + 上报，Decision 不区分"记录了"）
+	//      Block  -> Decision::Blocked      （拒绝；Log 模式下先转 WouldBlock）
+	//      Spoof  -> Decision::Spoofed      （调用成功但回传数据是伪造的）
+	//
+	// ⚠️ `Spoof` **不是**"Block 加个变体"：Block 让调用**失败**（程序走它自己的
+	//    错误分支，安全）；Spoof 让调用**成功但内容为假**（程序按假数据继续跑）。
+	//    见 docs/回传数据替换Hook-技术预研.md §1.3 / §6.1。所以它值得单独一个值，
+	//    而不是塞进 Block 里靠另一个 bool 表达。
+	//
+	enum class Action
+	{
+		Pass,   // 无需关注，直接放行
+		Record, // 放行并上报
+		Block,  // 拒绝
+		//
+		// 回传数据替换 —— 调用**成功**返回，但回传数据被换成伪造内容。
+		// v67 屏幕（黑帧）/ v70 剪贴板 / v71 注册表值 / v72 注册表枚举 / v73 摄像头帧。
+		// ⚠️ 只在"本应拒绝"（RejectOrSpoof）时生效；各面**各自有开关**，
+		//    默认全关 ⇒ 不开开关时不会有任何 Spoof。
+		//
+		Spoof,
+	};
+
 	enum class Decision : ULONG
 	{
 		Allowed = 0,    // 允许且无需关注
 		Blocked = 1,    // 已拒绝
 		WouldBlock = 2, // Log 模式下本应拒绝
+		//
+		// v67：**回传数据替换**（主动欺骗）。
+		//
+		// 语义：调用**成功**，但返回给调用方的数据是伪造的（如截屏拿到黑帧）。
+		// 与 Blocked 的分水岭：Blocked 让调用**失败**（程序走错误分支，安全）；
+		// Spoofed 让调用**成功但内容为假**（程序按假数据继续跑 —— 见
+		// docs/回传数据替换Hook-技术预研.md §6.1，这是它最大的风险来源）。
+		//
+		// ⚠️ v73 起四个面都会产生这个值：ScreenGuard（截屏）、
+		//    ClipboardGuard（剪贴板）、RegistryGuard（注册表读/枚举）、
+		//    CameraGuard（摄像头帧）。**但各面都有各自的开关**，
+		//    默认全关 ⇒ 不开开关时永远只会看到 Blocked。
+		// ⚠️ 与 FlagEvent2Spoofed 配套：日志/UI 靠它们区分"真放行"与"替换"。
+		//
+		Spoofed = 3,    // 调用成功但回传数据是伪造的（替换）
 	};
 
 	//
@@ -1045,6 +1146,241 @@ enum class ObjectType : ULONG
 	//
 	constexpr ULONG FlagInjectShellThin = 0x00000020; // shell/服务宿主瘦注入，默认**开**（v42）
 
+	//
+	// v67：**截屏替换**（ini: `spoof_screen`，默认**关**）。
+	//
+	// 语义：当 ScreenGuard 判定"本应拒绝"时，**改为替换** —— 调用成功返回，
+	//   但目标 DC / 像素缓冲区被涂黑（`Decision::Spoofed`）。
+	//
+	// 覆盖范围（**只有"本应拒绝"的地方**）：
+	//   · `mode=block` 下的高危截屏（本来直接拒）
+	//   · `mode=ask` 下用户点了"拒绝"（本来返回失败）
+	// **不覆盖**：
+	//   · `mode=log` —— 它本来就不拒，替换会破坏"只记录、全部放行"的承诺；
+	//   · `mode=block_all` —— 铁律 165：全拦下**一律拒绝**，不做替换。
+	//
+	// ★ 默认**关**：这是"主动欺骗"能力，与产品既有「可见性 + 拒绝」定位不同族
+	//   （见 docs/回传数据替换Hook-技术预研.md §0）。默认关 ⇒ 默认配置行为不变。
+	//   默认 `mode=log` 时即使打开本开关也不会触发（log 不拒）。
+	//
+	// ⚠️ 已知盲区（诚实标注，非本开关引入）：
+	//   `GetPixel` 逐像素读屏幕、Desktop Duplication、WinRT Capture 都没挂
+	//   ⇒ 攻击者换这些路径仍能拿到真画面。定位是"提高成本"，不是硬边界。
+	//   （实测：`tools/spoof_retdata_probe.cpp` + docs/回传数据替换-多路径盘点.md）
+	//
+	constexpr ULONG FlagSpoofScreen = 0x00000040; // 截屏"替换"而非拒绝（返回黑帧），默认**关**（v67）
+
+	//
+	// v70：**剪贴板替换**（ini: `spoof_clipboard`，默认**关**）。
+	//
+	// 语义：当 ClipboardGuard 判定"本应拒绝"时，**改为替换** ——
+	//   `GetClipboardData` 调用成功返回，但返回的句柄指向**我们自己造的**
+	//   中性化内容（文本 = 空串；位图/DIB = 同尺寸全黑），`Decision::Spoofed`。
+	//
+	// 覆盖范围（**只有"本应拒绝"的地方**，与 `spoof_screen` 同构）：
+	//   · `mode=block` 下的高危剪贴板读取（本来直接拒）；
+	//   · `mode=ask` 下用户点了"拒绝"（本来返回失败）。
+	// **不覆盖**：`mode=log`（本来就不拒）、`mode=block_all`（铁律 165：一律拒绝）。
+	//
+	// ★★ 这个面**特有**的坑：**句柄所有权**（预研 §2.2 早就点出来了）——
+	//   `GetClipboardData` 返回的是**剪贴板拥有**的 `HANDLE`，调用方
+	//   **不得** `GlobalFree` / `DeleteObject`（契约上它只该 `GlobalLock` +
+	//   `GlobalUnlock`）。所以替换不是"改个指针"，而是：
+	//     ① 自己 `GlobalAlloc`（或 `CreateBitmap`）造一块；
+	//     ② 把它**藏起来**，等对方用完再释放 —— 释放时机只能挂在
+	//        `CloseClipboard`（剪贴板句柄的**契约有效期**就是"开着这段"）；
+	//     ③ 释放前**不能**被别人再释放（所以不能提前 free，也不能漏）。
+	//   见 `clipboard_guard.cpp` 的 `ReleaseAllFakes` / `TrackFake`。
+	//
+	// ⚠️ **不可伪造的格式 ⇒ 回落到 `Block`**（= v70 之前的行为）。
+	//   理由：我们造不出未知格式的合法布局，硬造一个长度不对的块会让
+	//   调用方**读越界 / 解析错**——那是"替换"引入的新崩溃面，不能接受。
+	//   能造的五种：`CF_TEXT` / `CF_BITMAP` / `CF_DIB` / `CF_UNICODETEXT` /
+	//   `CF_DIBV5`（见 `clipboard_spoof_codec.h`）。
+	//
+	// ⚠️ 已知盲区（非本开关引入，见 docs/回传数据替换-多路径盘点.md §2.2）：
+	//   OLE 拖放 `IDataObject::GetData`、`win32u!NtUserGetClipboardData`、
+	//   延迟渲染的 `WM_RENDERFORMAT` 都没挂 ⇒ 换这些路径仍能拿到真内容。
+	//   定位是"提高成本"，不是硬边界。
+	//
+	constexpr ULONG FlagSpoofClipboard = 0x00000100; // 剪贴板"替换"而非拒绝（返回中性内容），默认**关**（v70）
+
+	//
+	// v71：**注册表值替换**（ini: `spoof_reg`，默认**关**）。
+	//
+	// 语义：读**受保护位置**（`protect_reg=` 前缀命中）的注册表值时，
+	//   把回传的**数据区清零**，但**一个长度字段都不改**
+	//   （`DataLength` / `DataOffset` / `ResultLength` / `Type` / `NameLength`
+	//   全部保持原值），`Decision::Spoofed`。
+	//
+	// ★★ 为什么"同长度、清零"是这个面的正解（预研 §8 Phase 3 点名的
+	//   "值类型与 cbData 长度"陷阱）：
+	//     `NtQueryValueKey` 的 out 缓冲区是 `KEY_VALUE_*_INFORMATION` 的
+	//     变长结构 —— 数据区的位置由**调用方**给的 `KeyValueInformationClass`
+	//     决定（Partial 是紧跟头之后；Full 要靠 `DataOffset`）。
+	//     只要**改长度**，就有三种长度字段要同步改（`DataLength`、
+	//     `ResultLength`、以及 Full 的 `DataOffset`），改错一个 ⇒ 调用方
+	//     **读越界或读到错的偏移** ⇒ 宿主崩溃。
+	//     而"长度不动、只把数据字节清零"**一个字段都不用改** ——
+	//     长度字段与数据区天然自洽，不可能出现"声明长度 ≠ 实际长度"。
+	//     ★ 与 v70 剪贴板是**同一条规则**：同格式、同尺寸、内容清零。
+	//
+	// ★ 清零后的值**对每种类型都是合法的**：
+	//     REG_SZ / REG_EXPAND_SZ → 空串（首个 WCHAR 为 0）
+	//     REG_DWORD / REG_QWORD  → 0
+	//     REG_BINARY             → 全 0 字节
+	//     REG_MULTI_SZ           → 空列表（全 0 = 无字符串）
+	//
+	// ★ 触发面**只有** `protect_reg=`（用户显式声明的保护位置），
+	//   **不用**内置高危规则表 —— 后者包含 `...\Run` 这类**正常软件天天读**的
+	//   位置（任务管理器、启动项管理、安装程序都在枚举），拿来当替换触发面
+	//   会大面积误伤。语义上也更顺：**"保护" = 写不进 + 读不到**。
+	//
+	// ⚠️ 前置条件（两条，缺一不可）：
+	//   ① 必须配了 `protect_reg=`（否则没有任何键是"受保护位置"⇒ 本开关空转）；
+	//   ② 必须挂着 `NtQueryValueKey` —— v71 起挂载条件改成
+	//      `hook_reads=1 || spoof_reg=1`，**不再要求**打开噪音很大的 `hook_reads`。
+	//
+	// ⚠️ **不做**的部分（诚实标注）：
+	//   · **枚举隐藏**（`NtEnumerateValueKey` / `NtEnumerateKey`）—— 有**游标语义**
+	//     （Index 是"第几个"，藏掉一个会让后面的整体前移），是独立的一步，
+	//     见预研 §8 Phase 3 的第二半；
+	//   · `KeyValueBasicInformation`（class 0）**没有数据区** ⇒ 不替换（放行）；
+	//   · `NtQueryMultipleValueKey` **未挂** ⇒ 一次查多个值这条路径仍拿真值；
+	//   · hive 文件直读（`\System32\config\*` 当**文件**读）、事务注册表
+	//     （`NtCreateKeyTransacted` 系列）未挂。
+	//
+	constexpr ULONG FlagSpoofRegistry = 0x00000200; // 注册表值"替换"而非放行（数据区清零、长度不变），默认**关**（v71）
+
+	//
+	// v72：**注册表枚举隐藏**（ini: `spoof_reg_enum`，默认**关**）。
+	//
+	// 语义：枚举**受保护位置**（`protect_reg=` 前缀命中）的**子键 / 值**时，
+	//   把命中保护前缀的那些项**从列表里去掉**，`Decision::Spoofed`。
+	//   配合 v71 的"值读不到"与既有的"写不进"，合起来即
+	//   **「保护 = 写不进 + 读不到 + 看不见」**。
+	//
+	// ★★ 为什么这是一个**独立的位**，不并进 `FlagSpoofRegistry`：
+	//   两者的**风险画像不同**。值替换只改"某个值的内容"（列表长度不变），
+	//   而枚举隐藏改的是**列表的长度与顺序** —— 调用方按"第几个"索引时，
+	//   藏掉一个会让后面的整体前移。把后者悄悄塞进前者的开关里，
+	//   等于让"只想让值读不到"的用户**顺带**改变了枚举结果（铁律 199 同族：
+	//   放宽一个开关会顺带打开别的行为 ⇒ 必须能单独关掉）。
+	//
+	// ★ 实现方式 = **索引重映射**，不是"返回假项"：
+	//   调用方要第 N 个可见项，我们扫出原始第 M 个（跳过被隐藏的），
+	//   再用调用方给的 class / 缓冲区**真调一次原函数**取第 M 个。
+	//   ⇒ 返回的每一项都是**真实、合法、结构完整**的项（铁律 194：
+	//   能造出合法替代物才替换；这里"替代物"就是列表里的下一项）。
+	//   ⚠️ **不做**任何伪造名字 / 伪造类型 —— 那才会造出调用方解析不了的项。
+	//
+	// ⚠️ 前置条件（三条，缺一不可）：
+	//   ① 必须配了 `protect_reg=`（否则没有"受保护位置"⇒ 本开关空转）；
+	//   ② 必须挂着 `NtEnumerateKey` / `NtEnumerateValueKey` —— v72 起挂载条件
+	//      放宽成 `hook_reads=1 || spoof_reg=1 || spoof_reg_enum=1`；
+	//   ③ 被枚举的键必须与某个 `protect_reg=` 前缀**相关**
+	//      （在它下面，或它就在被枚举键的下一层）—— 见
+	//      `R3ShieldCoreRules::CouldHaveProtectedChildRegistry`。
+	//      不相关的键**一次都不扫**（避免给正常枚举加 O(n) 开销）。
+	//
+	// ⚠️ **不做**的部分（诚实标注）：
+	//   · 隐藏是**列表级**的，不是**访问级**的：被隐藏的键/值仍可被
+	//     `NtOpenKey` / `NtQueryValueKey` 直接按名字访问（值还会被 v71 清零）；
+	//   · `NtQueryKey` 返回的 `SubKeys` / `Values` **计数不变**（那是键元数据，
+	//     改它要同步改一堆字段，风险远大于收益）；
+	//   · 事务注册表 / hive 文件直读 / WOW64 重定向路径未覆盖。
+	//
+	constexpr ULONG FlagSpoofRegistryEnum = 0x00000400; // 注册表枚举"隐藏"而非放行（重映射索引、跳过受保护项），默认**关**（v72）
+
+	//
+	// v73：**摄像头帧替换**（ini: `spoof_camera`，默认**关**）。
+	//
+	// 语义：当 `CameraGuard` 判定"本应拒绝"**读取摄像头数据流**时，**改为替换** ——
+	//   `MFCreateSourceReaderFromMediaSource` 调用成功返回，但我们顺手
+	//   **patch 那个 `IMFSourceReader` 的 vtable**（`ReadSample`，槽号 9），
+	//   之后调用方每次 `ReadSample` 拿到的帧都被**原地改成中性帧**
+	//   （RGB → 全 0 = 黑；YUV → Y16/UV128 = 有限范围的黑），`Decision::Spoofed`。
+	//   ⇒ 攻击者拿到的是"合法的黑画面"，而不是"打开失败"。
+	//
+	// ★★ 与前三个面最大的不同：**这是流式的、有状态的**
+	//   （屏幕/剪贴板/注册表都是"单次调用、一进一出"）。所以：
+	//     · 判定在**建读取器**那一刻做一次；
+	//     · 替换在**每一帧**做（`ReadSample` detour）；
+	//     · 需要记住"哪些 reader 是要替换的"（进程级小表，见 `camera_guard.cpp`）。
+	//
+	// ★★ 中性值**与子类型有关**，不能照搬 v67/v70/v71 的"清零"：
+	//   全 0 在 **YUV** 里**不是黑**，而是一个饱和色 ⇒ 必须按子类型填
+	//   （决策表在 `camera_spoof_codec.h`，生产与探针共用一份）。
+	//   ⚠️ 对外口径**不能**说"黑帧"——RGB 是黑、YUV 是有限范围的黑；
+	//      两者视觉上都"黑"，但字节值不同（铁律 97：口径必须与实际一致）。
+	//
+	// ⚠️ **只有"能造出合法中性帧"的路径才替换，其余一律回落 `Block`**
+	//   （铁律 194：造不出合法替代物就回落拒绝）。具体：
+	//     · ✅ `MFCreateSourceReaderFromMediaSource`（唯一有帧路径的入口）；
+	//     · ❌ VFW `capCreateCaptureWindowW`（帧走 `WM_CAP_*` 消息 / 回调，
+	//          没有我们能改的缓冲区）⇒ 回落 `Block`；
+	//     · ❌ `MFCreateDeviceSource` / `MFCreateDeviceSourceActivate`
+	//          （设备源本身没有帧，帧由后续 reader 产出）⇒ 回落 `Block`；
+	//     · ❌ 音频三路（`waveInOpen` / `MCI` / `IAudioClient::Initialize`）
+	//          ⇒ 回落 `Block`（音频的"中性内容"是另一套语义，不在本开关范围）。
+	//   ⇒ **打开 `spoof_camera` 不会让麦克风/环回被放行**（铁律 199：放宽一个
+	//     开关不能顺带打开别的行为）。建读取器时若**没有视频流**，同样回落 `Block`。
+	//
+	// ⚠️ 子类型不支持（MJPG / H264 等压缩格式）⇒ **`ReadSample` 直接返回失败**
+	//   （= "拒绝"语义），并在日志里吵出来。理由：压缩帧里填 16/128 得到的是
+	//   **一帧解不出来的垃圾**（既不是黑帧，又可能让下游解码器报错）——
+	//   宁可拒绝，不可硬造（铁律 194/196）。
+	//
+	// ⚠️ **不覆盖** `block_all`：铁律 165 —— 全拦模式下一律拒绝，不做替换。
+	//
+	// ⚠️ 已知盲区（诚实标注）：
+	//   · 异步读取（`MF_SOURCE_READER_ASYNC_CALLBACK`）走回调交付帧 ——
+	//     已额外 patch 回调的 `OnReadSample` 覆盖；
+	//   · DirectShow / WinRT `MediaCapture` / 内核态驱动路径**未覆盖**；
+	//   · `GetPixel`-式的"逐像素重读"在这里不存在，但**别的进程**仍可
+	//     自己打开摄像头（我们只在被注入进程内生效）。
+	//   定位是"提高成本"，不是硬边界。见 docs/回传数据替换Hook-技术预研.md §8 Phase 2。
+	//
+	constexpr ULONG FlagSpoofCamera = 0x00000800; // 摄像头帧"替换"而非拒绝（返回中性帧），默认**关**（v73）
+
+	//
+	// v68：**测试模式**（ini: `mode=test`，默认**关**）。
+	//
+	// 动机：引擎的正常工作是**全局注入**所有非系统进程 —— 包括你正在用的
+	//   编辑器 / IDE，注入它们会崩（铁律 175）。所以在本机做端到端验证时，
+	//   需要一个"只碰我指定的那些进程"的跑法。
+	//
+	// ★ v69：**交付方式从命令行改成配置**。v68 是
+	//   `--test-inject-only=<镜像名>` + 一条导出；v69 改成 ini 的
+	//   `mode=test` + `test_inject_only=`（本**位** + `TestInjectPaths[]`），
+	//   那条导出已删除。理由：引擎自带 `requireAdministrator` manifest、
+	//   **自己会提权**，双击 `start.bat` 即可 —— 而命令行传参要求调用方先有
+	//   提权 shell，等于把测试模式锁死在"能提权的开发者"手里（铁律 127 同族：
+	//   一份权威配置，别开第二条旁路）。
+	//
+	// ★★ v69：**「注入范围」与「拦截行为」解耦**（关键）——
+	//   · 注入范围由 `TestInjectCount > 0` 决定，**与 `mode=` 无关**
+	//     （只要名单非空就只注入名单内的进程）；
+	//   · 拦截行为由 `mode=` 决定。
+	//   为什么必须解耦：spoof（截屏替换）**只在"本应拒绝"时才生效**，而
+	//   `mode=test` 的决策行为 = `log`（全部放行）⇒ 若白名单只认 `mode=test`，
+	//   那就永远验证不到替换路径（为验证而加的模式，恰好让被验证的功能不触发）。
+	//   解耦后 `mode=block` + `test_inject_only=<目标>` 既限定注入范围、又保留
+	//   拦截行为，端到端三格矩阵都能在开发机上安全地跑。
+	//
+	// ★ 本**位**（`FlagTestMode`）因此只承担一件事：**"用户写的是 `mode=test`"**。
+	//   引擎据此 ① 要求名单非空（fail-closed：写了 test 却不给名单 ⇒ 一个都不
+	//   注入 ⇒ 看着在跑实际全盲）；② 在启动横幅里吵出来。它**不参与**任何
+	//   guard 的决策。
+	//
+	// ★ 为什么 `mode=test` 直接落到 `Mode::Log` 而不是新增一个 `Mode` 枚举值：
+	//   `Mode` 在 22 个文件里有 ~130 处 `mode == Mode::Xxx` 分支。加一个新值
+	//   会让**每一处**都落进"不是 log、不是 block、不是 ask"的 else 分支 ——
+	//   那是"往共享枚举里加值然后指望 130 处都想到它"，正是本项目踩过的那类
+	//   静默错行为。复用 `Log` ⇒ 所有 guard 的行为**一字不改**，零风险。
+	//
+	constexpr ULONG FlagTestMode = 0x00000080; // "ini 里写的是 mode=test"（决策行为=log）；注入范围另由 TestInjectCount 决定（v68；v69 起配置驱动）
+
 	constexpr size_t MaxKeyPathChars = 320;
 	constexpr size_t MaxValueNameChars = 128;
 	constexpr size_t MaxImagePathChars = 260; // 应用 hive 的目标镜像路径
@@ -1061,6 +1397,18 @@ enum class ObjectType : ULONG
 	// 语义 = **完整镜像路径前缀 + 路径边界**，不区分大小写。
 	constexpr size_t MaxNeverInjectPaths = 16;
 	constexpr size_t MaxNeverInjectPathChars = 260;
+
+	// ★ v68：测试模式的**注入白名单**（ini 的 `test_inject_only=`，可重复 / 可逗号分隔）。
+	//
+	// 语义（与 `never_inject` 的"完整路径前缀"不同，这里更宽松，故意的）：
+	//   · 条目里**含路径分隔符**（`\` 或 `/`）⇒ 按**完整镜像路径前缀**匹配；
+	//   · 不含分隔符 ⇒ 按**镜像基名**匹配（不区分大小写）。
+	//   为什么允许基名：测试模式是**开发/验证用**的开关，用户写
+	//   `test_inject_only=my_probe.exe` 是最自然的用法；而它本身已经
+	//   把注入范围缩到了一个进程，不存在"改个名就免注入"的提权风险
+	//   （与 `never_inject` 的威胁模型不同 —— 那个是**放宽**防护）。
+	constexpr size_t MaxTestInjectPaths = 16;
+	constexpr size_t MaxTestInjectPathChars = 260;
 
 	// 网络目标地址（IP、域名或 host:port）的最大字符数。
 	// 单独一个常量是因为网络地址长度和文件路径完全不同 ——
@@ -1148,6 +1496,25 @@ enum class ObjectType : ULONG
 		//   否则它会按旧布局去读 `NeverInjectPaths` 所在的字节（越界/错读）。
 		ULONG NeverInjectCount;
 		WCHAR NeverInjectPaths[MaxNeverInjectPaths][MaxNeverInjectPathChars];
+
+		//
+		// ★ v68：**注入范围白名单**（ini 的 `test_inject_only=`）。
+		//
+		// 读它的判据是 `TestInjectCount > 0` —— **与 `mode=` 无关**
+		// （理由见 `FlagTestMode` 上面那段"解耦"）。`mode=test` 只是便捷写法。
+		//
+		// 匹配规则（`functions.cpp` 的 `MatchesTestInjectList`）：
+		//   含 `\` / `/` ⇒ 完整路径前缀 + 路径边界；否则 ⇒ 镜像基名（忽略大小写）。
+		//
+		// ⚠️ 与 `NeverInjectCount` 一样是**尾部追加**：前面所有字段偏移不动。
+		// ★ 但"尾部追加"仍会让 `sizeof(Policy)` 变大 ⇒ **本版 AbiVersion 升到 22**。
+		//   两个方向都要挡（理由同 20）：
+		//     · 新 DLL + 旧引擎：旧 section 更小 ⇒ `MapViewOfFile(sizeof(新))` 失败；
+		//     · 旧 DLL + 新引擎：映射能成功但读到错误版本 ⇒ 靠版本校验挡住，
+		//       否则它会把 `TestInjectPaths` 当成别的东西读。
+		//
+		ULONG TestInjectCount;
+		WCHAR TestInjectPaths[MaxTestInjectPaths][MaxTestInjectPathChars];
 	};
 
 	// ---------------------------------------------------------------------
@@ -1303,6 +1670,20 @@ enum class ObjectType : ULONG
 	//   日志里打 `[PID-UNKNOWN]` 便于事后审计这条旁路。
 	//
 	constexpr ULONG FlagEvent2TerminatePidUnknown = 0x00080000; // 终止事件：目标句柄反查不到 pid，降级放行
+
+	//
+	// v67 新增位（回传数据替换）。
+	//
+	// ★ 为什么必须有它：`Decision::Spoofed` 已经能区分，但**只有它不够** ——
+	//   "替换生效"与"替换尝试了但失败（目标页只读/句柄无效/格式不支持）"在
+	//   Decision 上长得一样。本位表示**替换真的发生了**，便于事后区分
+	//   「调用成功且内容为假」与「调用成功但内容是真」（铁律 97：布尔判定
+	//   不可诊断 —— 要有原因，不能只有"没生效"）。
+	//
+	// ★ v70：本位**不限于截屏**了 —— 剪贴板替换也置它。语义是
+	//   「本次事件的回传数据已被替换成伪造内容」，与对象类型无关。
+	//
+	constexpr ULONG FlagEvent2Spoofed = 0x00100000; // 回传数据替换事件：回传内容已被替换（截屏=黑帧 / 剪贴板=中性化内容）
 
 	// Event::Flags 位。给日志和弹窗提供额外的语义提示。
 	constexpr ULONG FlagEventImageName = 0x00000001; // KeyPath 里是目标镜像路径而非注册表路径
@@ -1988,6 +2369,7 @@ enum class ObjectType : ULONG
 		case Decision::Allowed: return "ALLOW";
 		case Decision::Blocked: return "BLOCK";
 		case Decision::WouldBlock: return "WOULD-BLOCK";
+		case Decision::Spoofed: return "SPOOF";
 		default: return "?";
 		}
 	}

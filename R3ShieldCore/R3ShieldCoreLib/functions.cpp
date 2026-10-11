@@ -261,6 +261,132 @@ bool IsUserNeverInject(PCWSTR imagePath) noexcept
 	return false;
 }
 
+//
+// ★ v68/v69：**测试模式** —— 只注入名单内的进程（**配置驱动**）。
+//
+// 动机：本机做端到端验证时，全局注入会 hook 编辑器 ⇒ 崩（铁律 175）。
+//   测试模式把注入范围缩到一个**白名单**，让引擎能在开发机上安全地跑起来。
+//
+// ★ 为什么读 Policy、而不是"引擎启动时用命令行塞进来"：
+//   引擎自带 `requireAdministrator` manifest，**自己会提权** —— 用户双击
+//   `start.bat` 或引擎 exe 就行。而"命令行传参"要求调用方先有提权 shell
+//   （本机实测：沙箱里既不能提权、UAC 也起不来），等于把测试模式锁在
+//   "能提权的开发者"手里。放进 ini 之后，配置路径与 `mode=` / `log=` 完全
+//   一致（铁律 127 同族：**一份权威配置**，不要两条路各记一份）。
+//
+// ★★ 这里**只认名单非空**（`TestInjectCount > 0`），**不看 `mode=`**：
+//   把「注入范围」与「拦截行为」解耦是**必须**的 —— spoof（截屏替换）只在
+//   "本应拒绝"时才生效，而 `mode=test` 的决策行为 = `log`（全部放行）⇒
+//   若白名单只认 `mode=test`，那就**永远验证不到替换路径**（本末倒置：
+//   为验证而加的模式，恰好让被验证的功能不触发）。
+//   解耦后：`mode=block` + `test_inject_only=<目标>` 既能限定注入范围、
+//   又能保留拦截行为，于是端到端三格矩阵都能在开发机上安全地跑。
+//
+// ★ 为什么 `mode=test` **不新增 `Mode` 枚举值**，而是复用 `Mode::Log`
+//   再加一个独立标志位 `FlagTestMode`：
+//   `Mode` 在 22 个文件里有 ~130 处 `mode == Mode::Xxx` 分支。加一个新值会
+//   让**每一处**都落进"不是 log、不是 block、不是 ask"的 else 分支 —— 那是
+//   "往共享枚举里加值然后指望 130 处都想到它"，正是本项目踩过的那类静默错
+//   行为。复用 `Log` ⇒ 所有 guard 的行为**一字不改**，零风险。
+//   `FlagTestMode` 于是只承担一件事：**"用户写的是 mode=test"** ⇒ 引擎据此
+//   要求白名单非空（fail-closed）+ 在横幅里吵出来。
+//
+// ⚠️ 这里读的是 Policy（共享内存），被注入进程也读得到 —— 但它们**不调**
+//   `ShouldSkipProcessInjection`（那是引擎枚举进程时用的），所以对它们无影响；
+//   `FlagTestMode` / `TestInjectPaths` 也**不参与**任何 guard 的决策。
+//
+bool IsTestInjectOnlyMode() noexcept
+{
+	const R3ShieldCore::Policy* policy = R3ShieldCoreChannel::Policy();
+	return policy && policy->TestInjectCount > 0;
+}
+
+// 取路径的基名（没有分隔符时返回原串）。
+static PCWSTR TestInjectBaseNameOf(PCWSTR imagePath) noexcept
+{
+	if (!imagePath) {
+		return L"";
+	}
+
+	PCWSTR base = imagePath;
+	for (PCWSTR p = imagePath; *p; ++p) {
+		if (*p == L'\\' || *p == L'/') {
+			base = p + 1;
+		}
+	}
+	return base;
+}
+
+// 路径的基名是否等于给定基名（不区分大小写）。
+// 镜像名是 ASCII，手写比较即可，不引入 CRT 大小写函数的本地化坑。
+static bool ImageBaseNameEquals(PCWSTR imagePath, PCWSTR baseName) noexcept
+{
+	if (!imagePath || !baseName || baseName[0] == L'\0') {
+		return false;
+	}
+
+	PCWSTR base = TestInjectBaseNameOf(imagePath);
+
+	while (*base && *baseName) {
+		WCHAR a = *base++;
+		WCHAR b = *baseName++;
+		if (a >= L'A' && a <= L'Z') { a = static_cast<WCHAR>(a - L'A' + L'a'); }
+		if (b >= L'A' && b <= L'Z') { b = static_cast<WCHAR>(b - L'A' + L'a'); }
+		if (a != b) {
+			return false;
+		}
+	}
+
+	return *base == L'\0' && *baseName == L'\0';
+}
+
+//
+// 测试模式：镜像路径是否命中**白名单**（`Policy.TestInjectPaths`）。
+//
+// 单条名单的语义（与 `never_inject=` 保持同一套写法 —— 铁律 127：同一个
+// 「名字清单」概念不要两套语法）：
+//   · 含分隔符（`D:\tools\a.exe`）⇒ **完整路径前缀 + 路径边界**，直接复用
+//     `InjectPolicy::MatchesNeverInjectPath`（连 `/`↔`\` 归一化一并继承）；
+//   · 不含分隔符（`a.exe`）⇒ **基名**不区分大小写相等。
+//
+// ⚠️ 名单为空 ⇒ 返回 **false**（一条都不命中）。但注意：调用方**只在名单
+//   非空时才走这条路**（`IsTestInjectOnlyMode()` 的判据就是 `Count > 0`）
+//   —— 所以"空名单"到不了这里。而 `mode=test` 却把名单写空时，引擎在
+//   **启动时**就拒绝启动（`app.cpp` fail-closed，铁律 97）。
+//
+static bool MatchesTestInjectList(PCWSTR imagePath, const R3ShieldCore::Policy* policy) noexcept
+{
+	if (!imagePath || !policy) {
+		return false;
+	}
+
+	for (ULONG i = 0; i < policy->TestInjectCount; ++i) {
+		const PCWSTR entry = policy->TestInjectPaths[i];
+		if (!entry || entry[0] == L'\0') {
+			continue;
+		}
+
+		bool hasSeparator = false;
+		for (PCWSTR p = entry; *p; ++p) {
+			if (*p == L'\\' || *p == L'/') {
+				hasSeparator = true;
+				break;
+			}
+		}
+
+		if (hasSeparator) {
+			if (InjectPolicy::MatchesNeverInjectPath(imagePath, entry)) {
+				return true;
+			}
+		}
+		else if (ImageBaseNameEquals(imagePath, entry)) {
+			return true;
+		}
+	}
+
+	return false;
+}
+
 bool ShouldSkipProcessInjection(HANDLE process) noexcept
 {
 	if (!process || process == INVALID_HANDLE_VALUE) {
@@ -271,6 +397,27 @@ bool ShouldSkipProcessInjection(HANDLE process) noexcept
 	DWORD length = _countof(imagePath);
 	if (!QueryFullProcessImageNameW(process, 0, imagePath, &length) || length == 0) {
 		return false;
+	}
+
+	// ★ v68/v69：限定注入范围（ini: `test_inject_only=`；`mode=test` 是它的便捷写法）。
+	//
+	// 语义：**只要白名单非空**，就只有命中名单的进程会被注入，其余一律跳过
+	//   —— 连 `never_inject` / 三档分类都不再参与判定（唯一判据就是白名单）。
+	//   ⚠️ 与 `mode=` **无关**：见 `IsTestInjectOnlyMode` 上面那段"解耦"的理由。
+	//
+	// ⚠️ 放在 `IsUserNeverInject` **之前**：白名单是"只有这些"，
+	//   用户名单是"除了这些" —— 白名单生效时黑名单没有意义，否则会出现
+	//   "测试目标恰好也在用户名单里 ⇒ 永远注不进去"的困惑。
+	//
+	// ⚠️ 两条日志都要打（铁律 97 / 178：跳过必须可见）—— 量是"每轮新进程
+	//   一条"，不是"每轮全机进程一条"（`NtGetNextProcess` 是流式枚举）。
+	if (IsTestInjectOnlyMode()) {
+		if (MatchesTestInjectList(imagePath, R3ShieldCoreChannel::Policy())) {
+			LOG(L"测试模式(test_inject_only)：命中白名单，注入 image=%ls", imagePath);
+			return false;
+		}
+		LOG(L"测试模式(test_inject_only)：跳过非白名单进程 image=%ls", imagePath);
+		return true;
 	}
 
 	// ★ v49：先看**用户自定义**名单 —— 用户明确说了"别注入这个"就照办，

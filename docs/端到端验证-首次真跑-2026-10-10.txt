@@ -1,0 +1,82 @@
+[run_elevated] cmd = "D:\Program Files\HostApp\resources\vendor\PortableGit\usr\bin\bash.exe" "--login" "D:\用户态杀软\tools\spoof_e2e.sh" "--run-engine"
+/etc/msystem: line 26: /etc/msystem.d/MSYS: No such file or directory
+[env] MSVC=/d/Program Files/Microsoft Visual Studio/18/Community/VC/Tools/MSVC/14.51.36231
+[env] SDK =/d/Windows Kits/10 (10.0.28000.0)
+[env] PY  =/d/msys64/ucrt64/bin/python3   GCC=/d/msys64/ucrt64/bin/gcc.exe
+transcript  : /tmp/spoof_e2e-last.log
+工作区      : /tmp/spoof_e2e_work
+
+=== 前置检查 ===
+  [ OK ] cygpath 可用（ProgramData 重定向 / 路径转换的前提）
+  [ OK ] iconv 可用（引擎日志 GBK -> UTF-8 转码的前提）
+  [ OK ] 引擎与目标产物都在（R3 ShieldCore.exe / spoof_e2e_target.exe）
+  [ OK ] 64 位 DLL 带 v69 宽串标记 'test_inject_only'（白名单逻辑已编入）
+  [ OK ] 32 位 DLL 带 v69 宽串标记 'test_inject_only'（白名单逻辑已编入）
+
+=== 基线：目标单独跑（无引擎，无 hook）===
+  RESULT bitblt=1 err=0 lines=96 first=0xFFF2F2F2 nonblack=12288/12288 getpixel0=0x00F2F2F2 getpixelmid=0x00202020 getpixel_nonblack=192 getpixel_full_nonblack=510/510
+  [ OK ] 基线非黑（nonblack=12288）⇒ 后续「变黑」可归因
+
+=== 管理员检查 ===
+  [ OK ] 当前是管理员会话
+  [ OK ] 没有别的引擎实例在跑
+  [ OK ] 工作区就绪（引擎: /tmp/spoof_e2e_work/app/R3 ShieldCore.exe）
+
+=== 三格矩阵（同一份引擎、同一个目标，只改 mode / spoof_screen）===
+    每格都会重启一次引擎 —— 只有它退出后才跑下一格（避免两份引擎互相打架）。
+
+=== 冒烟闸门：先证「注入范围真的被限定了」，再跑矩阵 ===
+    （引擎只跑 9000ms；这一步失败就**不**跑矩阵）
+    引擎自报: 配置文件    : C:\Users\user\AppData\Local\Temp\spoof_e2e_work\pd-A\R3 Shield Core\r3shieldcore.ini
+  [ OK ] 冒烟①：引擎自报「注入范围已被限定」⇒ 白名单被读到了
+  [ OK ] 冒烟①b：引擎读的是本工作区的配置（pd-A）
+    引擎自报注入计数合计: N=1  （阈值: 1 ≤ N ≤ 5）
+  [ OK ] 冒烟②：引擎注入了 1 个进程 ⇒ 目标确实被注入了（注入路径通了）
+  [ OK ] 冒烟③：N=1 ≤ 5 ⇒ 注入范围**真的被限住**了
+  [ OK ] 冒烟闸门通过 —— 白名单**行为上**生效了，可以安全跑矩阵
+
+--- 跑格 A：mode=block, spoof_screen=0  -> 期望 BitBlt **被拒**（err=5） ---
+    完成（结果已落盘: /tmp/spoof_e2e_work/result-A.txt）
+
+--- 跑格 B：mode=block, spoof_screen=1  -> 期望 BitBlt 成功但**黑帧** ---
+    完成（结果已落盘: /tmp/spoof_e2e_work/result-B.txt）
+
+--- 跑格 C：mode=log,   spoof_screen=1  -> 期望 BitBlt 成功 + **真实画面** ---
+    完成（结果已落盘: /tmp/spoof_e2e_work/result-C.txt）
+
+--- 格 A：mode=block, spoof_screen=0  -> 期望 BitBlt **被拒**（err=5） ---
+  RESULT bitblt=0 err=5 lines=96 first=0x00123456 nonblack=12288/12288 getpixel0=0x00F2F2F2 getpixelmid=0x00202020 getpixel_nonblack=192 getpixel_full_nonblack=510/510
+    引擎自报: 配置文件    : C:\Users\user\AppData\Local\Temp\spoof_e2e_work\pd-A\R3 Shield Core\r3shieldcore.ini
+    引擎自报: 模式        : BLOCK（主动防御：仅拦截高置信度高危行为）
+  [ OK ] A: 引擎读的是**本格**的配置（pd-A；未误读你真实的 ProgramData）
+  [ OK ] A: 引擎自报「注入范围已被限定」⇒ 白名单真的被读到了
+  [ OK ] A: 引擎自报模式 = BLOCK
+  [ OK ] A: BitBlt 被拒（bitblt=0 err=5）—— 同时证明**目标确实被注入了**
+
+--- 格 B：mode=block, spoof_screen=1  -> 期望 BitBlt 成功但**黑帧** ---
+  RESULT bitblt=1 err=0 lines=96 first=0x00000000 nonblack=0/12288 getpixel0=0x00F2F2F2 getpixelmid=0x00202020 getpixel_nonblack=192 getpixel_full_nonblack=510/510
+    引擎自报: 配置文件    : C:\Users\user\AppData\Local\Temp\spoof_e2e_work\pd-B\R3 Shield Core\r3shieldcore.ini
+    引擎自报: 模式        : BLOCK（主动防御：仅拦截高置信度高危行为）
+  [ OK ] B: 引擎读的是**本格**的配置（pd-B；未误读你真实的 ProgramData）
+  [ OK ] B: 引擎自报「注入范围已被限定」⇒ 白名单真的被读到了
+  [ OK ] B: 引擎自报模式 = BLOCK
+  [ OK ] B: BitBlt 成功（bitblt=1）但像素**全黑**（first=0x00000000 nonblack=0）⇒ 替换生效
+  [ OK ] B: 多路径戳穿实证 —— GetPixel 路仍读真实画面（块内=192，全屏=510 个非黑点）
+
+--- 格 C：mode=log,   spoof_screen=1  -> 期望 BitBlt 成功 + **真实画面** ---
+  RESULT bitblt=1 err=0 lines=96 first=0xFFF2F2F2 nonblack=12288/12288 getpixel0=0x00F2F2F2 getpixelmid=0x00202020 getpixel_nonblack=192 getpixel_full_nonblack=510/510
+    引擎自报: 配置文件    : C:\Users\user\AppData\Local\Temp\spoof_e2e_work\pd-C\R3 Shield Core\r3shieldcore.ini
+    引擎自报: 模式        : LOG（只记录，全部放行）
+  [ OK ] C: 引擎读的是**本格**的配置（pd-C；未误读你真实的 ProgramData）
+  [ OK ] C: 引擎自报「注入范围已被限定」⇒ 白名单真的被读到了
+  [ OK ] C: 引擎自报模式 = LOG
+  [ OK ] C: mode=log 下 BitBlt 成功且像素**非黑**（nonblack=12288）⇒ 替换只在「本应拒绝」时生效
+
+=== 结果：通过 27 / 失败 0 / 跳过 0 ===
+结论：截屏「替换」端到端成立 —— 真引擎注入真进程后，
+      block+spoof 下 BitBlt **返回成功但拿到黑帧**，且 GetPixel 路仍是真实画面。
+
+工作区保留在 /tmp/spoof_e2e_work（复查：bash tools/spoof_e2e.sh --collect；
+清掉：bash tools/spoof_e2e.sh --clean）
+
+[run_elevated] child exit code = 0

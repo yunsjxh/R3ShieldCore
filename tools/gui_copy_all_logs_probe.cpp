@@ -41,8 +41,8 @@ constexpr int TabBarHeight = 38;
 constexpr int ModeButtonWidth = 112;
 constexpr int ActionButtonWidth = 92;
 constexpr int ActionButtonGap = 8;
-constexpr int TabWidth = 84;
-constexpr int TabCount = 5;   // v62: 多了 ARK 页
+constexpr int TabWidth = 70;   // v77：6 个页签，84 会让第 6 个被右侧动作簇压住
+constexpr int TabCount = 6;   // v62 加 ARK；v77 加「高级」
 
 struct Rect { int left, top, right, bottom; };
 

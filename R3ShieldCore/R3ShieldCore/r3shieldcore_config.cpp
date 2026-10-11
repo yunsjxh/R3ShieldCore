@@ -208,7 +208,31 @@ namespace R3ShieldCoreConfig
 
 			if (key == "mode") {
 				std::string lower = ToLower(value);
-				if (lower == "block") {
+
+				// ★ v68：`mode=` 是**权威**的 —— 先清掉 `FlagTestMode` 位，再按值设。
+				//   否则 ini 里同时出现 `mode=test` 和 `mode=block` 时会留下
+				//   `FlagTestMode`（"最后一行是 block，但引擎却按 mode=test 要求
+				//   白名单非空"这种半开状态），而且**不可见**（铁律 97）。
+				policy.Flags2 &= ~R3ShieldCore::FlagTestMode;
+
+				if (lower == "test" || lower == "test_mode" || lower == "testmode"
+					|| lower == "test-mode") {
+					// ★ v68：`mode=test` —— 便捷写法 = `log` 的行为 +
+					//   **强制要求** `test_inject_only=` 非空（引擎启动时 fail-closed）。
+					//
+					// ⚠️ 注意这里**只设 Mode 与标志位**，**不碰** `TestInjectPaths[]`：
+					//    「注入范围」与「拦截行为」是解耦的（只要名单非空就限定注入
+					//    范围，与 `mode=` 无关），见 shared 头 `FlagTestMode` 上面
+					//    那段"解耦"的理由 —— spoof 只在"本应拒绝"时生效，若白名单
+					//    只认 `mode=test` 就永远验证不到替换路径。
+					//
+					// ⚠️ 这里**故意**复用 `Mode::Log` 而不是新增一个 `Mode` 枚举值：
+					//    `Mode` 在 22 个文件里有 ~130 处 `mode == Mode::Xxx` 分支，
+					//    加新值会让每一处都落进 else 分支 —— 那是静默错行为。
+					policy.Mode = static_cast<ULONG>(R3ShieldCore::Mode::Log);
+					policy.Flags2 |= R3ShieldCore::FlagTestMode;
+				}
+				else if (lower == "block") {
 					// Daily-use active defense: block only high-confidence risky
 					// operations; ordinary writes and network traffic remain usable.
 					policy.Mode = static_cast<ULONG>(R3ShieldCore::Mode::Block);
@@ -405,6 +429,213 @@ namespace R3ShieldCoreConfig
 				}
 				else {
 					policy.Flags &= ~R3ShieldCore::FlagHookScreen;
+				}
+			}
+			else if (key == "spoof_screen") {
+				// ★ v67：截屏**替换**（默认**关**）。
+				//
+				// 语义：本应**拒绝**截屏时，改为"**调用成功 + 返回黑帧**"
+				//   （`Decision::Spoofed`）—— 攻击者以为截到了，其实拿到一张黑图。
+				//
+				// 覆盖范围（只有"本应拒绝"的地方）：
+				//   · `mode=block` 下的高危截屏（本来直接拒）；
+				//   · `mode=ask` 下用户点了"拒绝"（本来返回失败）。
+				// **不覆盖**：
+				//   · `mode=log` —— 它本来就不拒（替换会破坏"只记录、全放行"）；
+				//   · `mode=block_all` —— 铁律 165：全拦下**一律拒绝**，不做替换。
+				//
+				// ⚠️ 前置条件：必须同时开着 `hook_screen=1`（否则 ScreenGuard
+				//    根本不装 hook，本开关无处生效）。
+				// ⚠️ 默认**关**：这是"主动欺骗"能力，与产品既有的「可见性 + 拒绝」
+				//    定位不同族。默认配置下行为与旧版**完全一致**。
+				// ⚠️ 已知盲区（非本开关引入）：`GetPixel` 逐像素读屏、
+				//    Desktop Duplication、WinRT Capture 都没挂 ⇒ 换这些路径
+				//    仍能拿到真画面。定位是"提高成本"，不是硬边界。
+				//    见 docs/回传数据替换-多路径盘点.md。
+				if (IsTrue(value)) {
+					policy.Flags2 |= R3ShieldCore::FlagSpoofScreen;
+				}
+				else {
+					policy.Flags2 &= ~R3ShieldCore::FlagSpoofScreen;
+				}
+			}
+			else if (key == "spoof_clipboard") {
+				// ★ v70：剪贴板**替换**（默认**关**）。
+				//
+				// 语义：本应**拒绝**读取剪贴板时，改为"**调用成功 + 返回
+				//   中性化内容**"（`Decision::Spoofed`）—— 文本变空串，
+				//   位图/DIB 变同尺寸全 0（BGR 下即全黑）。
+				//
+				// 覆盖范围（只有"本应拒绝"的地方，与 `spoof_screen` 同构）：
+				//   · `mode=block` 下的高危剪贴板读取（本来直接拒）；
+				//   · `mode=ask` 下用户点了"拒绝"（本来返回失败）。
+				// **不覆盖**：
+				//   · `mode=log` —— 它本来就不拒；
+				//   · `mode=block_all` —— 铁律 165：全拦下**一律拒绝**。
+				//
+				// ⚠️ 前置条件：必须同时开着 `hook_clipboard=1`（否则
+				//    ClipboardGuard 根本不装 hook，本开关无处生效）。
+				// ⚠️ **只对能伪造的格式生效**：CF_TEXT(1) / CF_BITMAP(2) /
+				//    CF_OEMTEXT(7) / CF_DIB(8) / CF_UNICODETEXT(13) /
+				//    CF_DIBV5(17)。其余格式（如注册格式、CF_HDROP）
+				//    **回落到拒绝** —— 造不出未知格式的合法布局，
+				//    硬造一个长度不对的块会让调用方读越界。
+				//    见 `clipboard_spoof_codec.h`。
+				// ⚠️ 默认**关**：这是"主动欺骗"能力，与产品既有的
+				//    「可见性 + 拒绝」定位不同族。默认配置下行为与旧版
+				//    **完全一致**。
+				// ⚠️ 已知盲区（非本开关引入）：OLE 拖放
+				//    `IDataObject::GetData`、`win32u!NtUserGetClipboardData`、
+				//    延迟渲染都没挂 ⇒ 换这些路径仍能拿到真内容。
+				//    见 docs/回传数据替换-多路径盘点.md §2.2。
+				if (IsTrue(value)) {
+					policy.Flags2 |= R3ShieldCore::FlagSpoofClipboard;
+				}
+				else {
+					policy.Flags2 &= ~R3ShieldCore::FlagSpoofClipboard;
+				}
+			}
+			else if (key == "spoof_reg") {
+				// ★ v71：注册表值**替换**（默认**关**）。
+				//
+				// 语义：读取**受保护位置**（`protect_reg=` 命中的键）的值时，
+				//   返回"**调用成功 + 数据区清零**"（`Decision::Spoofed`）——
+				//   值类型、长度字段**全部不变**，只有数据字节变 0：
+				//     · `REG_SZ`/`REG_EXPAND_SZ` ⇒ 空串；
+				//     · `REG_DWORD`/`REG_QWORD`   ⇒ 0；
+				//     · `REG_BINARY`              ⇒ 全 0 字节；
+				//     · `REG_MULTI_SZ`            ⇒ 空列表。
+				//   配合既有的"写不进"（`protect_reg` 拒写），合起来即
+				//   **「保护 = 写不进 + 读不到」**。
+				//
+				// ⚠️ 与 `spoof_screen`/`spoof_clipboard` 的**触发面不同**：
+				//   那两个只在"**本应拒绝**"时替换；注册表读**本来不拒**
+				//   （`!blockable`），所以这里是"**命中 `protect_reg` 就替换**"。
+				//   换句话说：**必须配 `protect_reg=` 才有效**，空名单下本开关
+				//   一个字节都不会动（判据见 `IsProtectedRegistryPathForSpoof`）。
+				//
+				// ⚠️ **不能拿 `IsHighRiskRegistry` 当触发面**：那张表里有
+				//   `...\CurrentVersion\Run`，任务管理器 / 启动项管理 / 各类
+				//   安装程序**天天在读**它 —— 一旦替换，正常软件会看到空值，
+				//   属于"把正常功能打坏"。所以触发面**只认用户显式声明的**
+				//   `protect_reg=`。
+				//
+				// ⚠️ 前置条件：`NtQueryValueKey` 必须被挂上。挂载条件已放宽成
+				//   `hook_reads || spoof_reg`（见 `registry_guard.cpp` 的 Install）——
+				//   否则用户打开 `spoof_reg` 什么也不会发生。**注意**：只挂
+				//   `NtQueryValueKey` 一个，不偷偷打开 `NtEnumerateKey`/
+				//   `NtEnumerateValueKey` 的读记录（那条路由 `hook_reads` 单独管）。
+				//
+				// ⚠️ 默认**关**：这是"主动欺骗"能力，与产品既有的
+				//   「可见性 + 拒绝」定位不同族。默认配置下行为与旧版
+				//   **完全一致**。
+				// ⚠️ 已知盲区（非本开关引入）：
+				//   · **枚举不隐藏** —— 枚举仍能看见值的**名字与类型**
+				//     （只是拿到 0 值）。要连名字一起藏，开 `spoof_reg_enum=`
+				//     （v72，**另一个位** —— 两者风险画像不同，见那里）；
+				//   · `KeyValueBasicInformation`(class 0) **没有数据区** ⇒ 不动；
+				//   · `NtQueryMultipleValueKey` **没挂**；
+				//   · 直接读 hive 文件、事务注册表（KTM）**没覆盖**。
+				//   见 docs/回传数据替换-多路径盘点.md §2.4 / §8。
+				if (IsTrue(value)) {
+					policy.Flags2 |= R3ShieldCore::FlagSpoofRegistry;
+				}
+				else {
+					policy.Flags2 &= ~R3ShieldCore::FlagSpoofRegistry;
+				}
+			}
+			else if (key == "spoof_reg_enum") {
+				// ★ v72：注册表**枚举隐藏**（默认**关**）。
+				//
+				// 语义：枚举**受保护位置**（`protect_reg=` 命中的键）的子键 / 值时，
+				//   把命中保护前缀的项**从列表里去掉**（`Decision::Spoofed`）——
+				//   攻击者"看不见"受保护的值与子键，配合 `spoof_reg=` 的
+				//   "读不到"和既有的"写不进"，合起来即
+				//   **「保护 = 写不进 + 读不到 + 看不见」**。
+				//
+				// ★ 实现 = **索引重映射**（不是伪造项）：调用方要第 N 个可见项，
+				//   我们跳过被隐藏的、真调原函数取到对应的那一个 ⇒ 返回的每一项
+				//   都是**真实、合法、结构完整**的项（铁律 194）。
+				//   ⚠️ 代价：列表**长度变了**。按"枚举到 NO_MORE_ENTRIES 为止"
+				//   写代码的程序看到的是短列表（这正是我们要的）；但**缓存过
+				//   列表长度**的程序可能行为改变 —— 所以本开关默认关。
+				//
+				// ⚠️ **与 `spoof_reg=` 是两个独立的位**，理由（铁律 199 同族）：
+				//   值替换只改"某个值的内容"（长度不变），枚举隐藏改的是
+				//   **列表长度与顺序**。并进同一个开关 ⇒ "只想让值读不到"的用户
+				//   会**顺带**发现枚举结果也变了，而且没法单独关掉。
+				//
+				// ⚠️ 必须配 `protect_reg=` 才有效（同 `spoof_reg`）：名单为空时
+				//   没有任何键是"受保护位置"，本开关空转（横幅会明说）。
+				//
+				// ⚠️ 前置条件：`NtEnumerateKey` / `NtEnumerateValueKey` 必须被挂上。
+				//   挂载条件已放宽成 `hook_reads || spoof_reg || spoof_reg_enum`
+				//   （见 `registry_guard.cpp` 的 Install）—— 否则用户打开本开关
+				//   什么也不会发生，而横幅还会印"开"（铁律 93）。
+				//   **注意**：只额外挂这两个枚举 hook，不偷偷打开读记录
+				//   （那是 `hook_reads` 的语义，见 `HookReadsEnabled`）。
+				//
+				// ⚠️ 默认**关**：这是"主动欺骗"能力，与产品既有的
+				//   「可见性 + 拒绝」定位不同族。默认配置下行为与旧版
+				//   **完全一致**。
+				// ⚠️ 已知盲区（非本开关引入）：
+				//   · 隐藏是**列表级**的，不是**访问级**的 —— 被隐藏的键/值
+				//     仍可被 `NtOpenKey` / `NtQueryValueKey` **直接按名字**访问
+				//     （值还会被 `spoof_reg` 清零）；
+				//   · `NtQueryKey` 的 `SubKeys` / `Values` **计数不变**
+				//     （键元数据，改它要同步改一堆字段，风险大于收益）；
+				//   · 事务注册表 / hive 文件直读 / WOW64 重定向路径未覆盖。
+				//   见 docs/回传数据替换-多路径盘点.md §2.4 / §8。
+				if (IsTrue(value)) {
+					policy.Flags2 |= R3ShieldCore::FlagSpoofRegistryEnum;
+				}
+				else {
+					policy.Flags2 &= ~R3ShieldCore::FlagSpoofRegistryEnum;
+				}
+			}
+			else if (key == "spoof_camera") {
+				// ★ v73：摄像头**帧替换**（默认**关**）。
+				//
+				// 语义：判定"本应拒绝**读取摄像头数据流**"时，**改为替换** ——
+				//   建读取器（`MFCreateSourceReaderFromMediaSource`）照常成功，
+				//   但我们顺手 patch 那个 `IMFSourceReader` 的 `ReadSample` 槽，
+				//   之后每一帧都被**原地改成中性帧**（`Decision::Spoofed`）。
+				//   ⇒ 攻击者拿到"合法的黑画面"，而不是"打开失败"。
+				//
+				// ★★ 与前三个面（屏幕 / 剪贴板 / 注册表值）的**根本不同**：
+				//   那三个是**单次调用**（一进一出、无状态）；摄像头是**流式**
+				//   （一帧一帧来）。所以判定在"建读取器"时做一次，替换在
+				//   "每一帧"做，并且要记住"哪些 reader 要替换"。
+				//
+				// ★★ 中性值**与子类型有关**：全 0 在 **YUV** 里**不是黑**
+				//   （是饱和色）⇒ 必须按子类型填（RGB → 全 0；YUV → Y16/UV128）。
+				//   决策表在 `camera_spoof_codec.h`，**生产与探针共用一份**。
+				//   ⚠️ 对外口径**不能**说"黑帧"（铁律 97）。
+				//
+				// ⚠️ **只有"能造出合法中性帧"的路径才替换，其余一律回落 `Block`**
+				//   （铁律 194）。能替换的**只有** `MFCreateSourceReaderFromMediaSource`
+				//   一个入口 —— VFW（`WM_CAP_*` 回调）、设备源创建、以及音频三路
+				//   （`waveInOpen` / MCI / `IAudioClient::Initialize`）都**回落拒绝**。
+				//   ⇒ 打开本开关**不会**让麦克风/环回被放行（铁律 199）。
+				//   建读取器时若**没有视频流**，同样回落 `Block`。
+				//
+				// ⚠️ 子类型不支持（MJPG / H264 等压缩格式）⇒ `ReadSample`
+				//   **直接返回失败**（= 拒绝语义）并记日志。压缩帧里填 16/128
+				//   得到的是"一帧解不出来的垃圾"，宁可拒绝不可硬造（铁律 194/196）。
+				//
+				// ⚠️ **不覆盖** `block_all`（铁律 165：全拦模式一律拒绝，不替换）；
+				//   默认 `mode=log` 下也不触发（log 本来就不拒）。
+				//
+				// ⚠️ 默认**关**：这是"主动欺骗"能力，与产品既有的
+				//   「可见性 + 拒绝」定位不同族。默认配置下行为与旧版**完全一致**。
+				// ⚠️ 已知盲区（非本开关引入）：DirectShow / WinRT `MediaCapture` /
+				//   内核态驱动路径未覆盖；异步回调路径已单独 patch。
+				//   见 docs/回传数据替换Hook-技术预研.md §8 Phase 2。
+				if (IsTrue(value)) {
+					policy.Flags2 |= R3ShieldCore::FlagSpoofCamera;
+				}
+				else {
+					policy.Flags2 &= ~R3ShieldCore::FlagSpoofCamera;
 				}
 			}
 			else if (key == "hook_dll_load") {
@@ -749,6 +980,65 @@ namespace R3ShieldCoreConfig
 
 				wcsncpy_s(policy.NeverInjectPaths[policy.NeverInjectCount], wide.c_str(), _TRUNCATE);
 				policy.NeverInjectCount++;
+			}
+
+			// ★ v68：**限定注入范围**的白名单（ini: `test_inject_only=`）。
+			//
+			// 与 `never_inject=` 的区别：
+			//   · `never_inject=` 是**黑名单**（列在这里的**不**注入）；
+			//   · `test_inject_only=` 是**白名单**（**只有**列在这里的才注入）。
+			//
+			// ★ 生效判据 = **名单非空**（`TestInjectCount > 0`），**与 `mode=` 无关**。
+			//   为什么不绑 `mode=test`：spoof（截屏替换）只在"本应拒绝"时才生效，
+			//   而 `mode=test` 的行为 = `log`（全部放行）⇒ 绑在一起就永远验证不到
+			//   替换路径。解耦后 `mode=block` + 本名单既能限定注入范围、又保留拦截
+			//   行为（见 shared 头 `FlagTestMode` 上面那段"解耦"）。
+			//   ⚠️ 代价：本键**一旦写了就生效**，所以启动横幅必须把"生效条数 + 内容"
+			//   打出来（app.cpp），否则"随手加了一行，防护范围就悄悄变了"不可见
+			//   （铁律 97）。
+			//
+			// 匹配规则（见 shared 头里 `MaxTestInjectPaths` 的说明）：
+			//   含路径分隔符 ⇒ 完整镜像路径前缀匹配；否则 ⇒ 镜像基名匹配。
+			//
+			// ⚠️ 支持**一行逗号分隔**（`a.exe,b.exe`）。这不是花哨 —— 不切分的
+			//    话 `a.exe,b.exe` 会被当成**一个字面路径**，永远匹配不上，而且
+			//    **完全静默**（铁律 97：失败必须可见）。
+			else if (key == "test_inject_only") {
+				std::wstring wide = Utf8ToWide(value);
+
+				size_t start = 0;
+				for (;;) {
+					const size_t comma = wide.find(L',', start);
+					std::wstring item = (comma == std::wstring::npos)
+						? wide.substr(start)
+						: wide.substr(start, comma - start);
+
+					// 去首尾空白（用户写成 `a.exe, b.exe` 也要能匹配）。
+					const size_t first = item.find_first_not_of(L" \t\r\n");
+					if (first == std::wstring::npos) {
+						item.clear();
+					}
+					else {
+						const size_t last = item.find_last_not_of(L" \t\r\n");
+						item = item.substr(first, last - first + 1);
+					}
+
+					if (!item.empty()) {
+						if (policy.TestInjectCount < R3ShieldCore::MaxTestInjectPaths) {
+							wcsncpy_s(policy.TestInjectPaths[policy.TestInjectCount],
+								item.c_str(), _TRUNCATE);
+							policy.TestInjectCount++;
+						}
+						// 超过上限：**静默丢弃**是错的 —— 用户会以为配上了。
+						// 但这里没有日志设施（纯解析函数），所以由引擎启动时
+						// 把"实际生效条数"打进横幅（见 app.cpp）。
+					}
+
+					if (comma == std::wstring::npos) {
+						break;
+					}
+					start = comma + 1;
+				}
 			}
 		}
 	}

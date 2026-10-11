@@ -38,12 +38,11 @@ namespace
 	int g_hookCount = 0;
 	volatile LONG g_activeHooks = 0;
 
-	enum class Action
-	{
-		Pass,
-		Record,
-		Block,
-	};
+	// v74：决策档位收敛到共享 ABI（`R3ShieldCore::Action`，见
+	//   shared/r3shieldcore/r3shieldcore_shared.h）。本文件**不再**自己定义。
+	//   ★ 本面是 `Spoof` 的**第一个**落地形态（v67）：截屏调用**成功**返回，
+	//     但目标位图被涂成黑帧。
+	using Action = R3ShieldCore::Action;
 
 	LONG64 NowFileTime() noexcept
 	{
@@ -115,6 +114,106 @@ namespace
 		return R3ShieldCore::Verdict::Deny;
 	}
 
+	// ------------------------------------------------------------------
+	// v67：替换（Spoof）相关
+	// ------------------------------------------------------------------
+	//
+	// 判据只有一条：ini `spoof_screen=1`（Policy::Flags2 的 FlagSpoofScreen，默认关）。
+	// 触发点只有"本应拒绝"的地方 —— 见 RejectOrSpoof。
+	//
+	bool SpoofScreenEnabled() noexcept
+	{
+		R3ShieldCore::Policy* policy = R3ShieldCoreChannel::Policy();
+		return policy && (policy->Flags2 & R3ShieldCore::FlagSpoofScreen) != 0;
+	}
+
+	// 把一块 DC 区域涂黑。返回 true 表示**替换真的发生了**。
+	//
+	// ⚠️ PatBlt 不在本 guard 的挂载表里 ⇒ 无递归（不会回头进 BitBlt_Hook）。
+	// ⚠️ 用 __try 护住：目标 DC 可能是野句柄 / 已被销毁
+	//    （铁律 97：失败必须可见，不能只有"没生效"）。
+	bool BlackenRect(HDC dc, int x, int y, int width, int height) noexcept
+	{
+		if (!dc || width <= 0 || height <= 0) {
+			return false;
+		}
+
+		__try {
+			return PatBlt(dc, x, y, width, height, BLACKNESS) != FALSE;
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER) {
+			return false;
+		}
+	}
+
+	// 把 GetDIBits 的像素缓冲区涂黑（BI_RGB 下"全 0"即黑色）。
+	//
+	// ⚠️ 必须按**位深算行距**（24/16/8bpp 的行是 4 字节对齐的），
+	//    不能想当然按 32bpp 算 —— 那会少涂一半或越界。
+	//    （探针实测：DIB 32bpp 像素 DWORD 是 BGRA 内存序，全 0 = 黑。）
+	// ⚠️ 只涂**本次真正写入的行数**（rowsWritten）—— 调用者可能只请求了
+	//    中间几行、缓冲区也只有那么大。
+	bool BlackenDibBits(LPVOID bits, const BITMAPINFO* info, int rowsWritten) noexcept
+	{
+		if (!bits || !info || rowsWritten <= 0) {
+			return false;
+		}
+
+		const BITMAPINFOHEADER& header = info->bmiHeader;
+		if (header.biWidth <= 0) {
+			return false;
+		}
+		// 压缩格式（RLE / JPEG / PNG）的字节布局不是"每像素固定位数"，不猜。
+		if (header.biCompression != BI_RGB && header.biCompression != BI_BITFIELDS) {
+			return false;
+		}
+
+		const LONG totalRows = header.biHeight < 0 ? -header.biHeight : header.biHeight;
+		LONG rows = rowsWritten;
+		if (rows > totalRows) {
+			rows = totalRows;
+		}
+
+		size_t stride = 0;
+		switch (header.biBitCount) {
+		case 32: stride = static_cast<size_t>(header.biWidth) * 4; break;
+		case 24: stride = (static_cast<size_t>(header.biWidth) * 3 + 3) & ~static_cast<size_t>(3); break;
+		case 16: stride = (static_cast<size_t>(header.biWidth) * 2 + 3) & ~static_cast<size_t>(3); break;
+		case 8:  stride = (static_cast<size_t>(header.biWidth) + 3) & ~static_cast<size_t>(3); break;
+		default: return false;   // 1/4bpp 调色板格式少见，不猜
+		}
+
+		const size_t bytes = stride * static_cast<size_t>(rows);
+		__try {
+			memset(bits, 0, bytes);
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER) {
+			return false;   // 目标页只读 / 缓冲区不够 —— 替换失败，别崩宿主
+		}
+		return true;
+	}
+
+	// 「本应拒绝」时的统一出口。
+	//
+	// ★ v67：开关打开 ⇒ **替换**（调用成功 + 黑帧）；否则 ⇒ 拒绝（原行为，一字不改）。
+	// ⚠️ 返回 Spoof 时，detour 层**不得**返回失败码 —— 要真调原函数后返回它的结果。
+	// ⚠️ 本函数**不**负责置 FlagEvent2Spoofed：那是 detour 层按"涂黑是否真成功"置的。
+	Action RejectOrSpoof(R3ShieldCore::Event& event) noexcept
+	{
+		if (SpoofScreenEnabled()) {
+			// 替换不是"被拦"：不置 FlagEventBlocked，不计 HighRiskBlocked。
+			event.Decision = static_cast<ULONG>(R3ShieldCore::Decision::Spoofed);
+			return Action::Spoof;
+		}
+
+		event.Decision = static_cast<ULONG>(R3ShieldCore::Decision::Blocked);
+		event.Flags |= R3ShieldCore::FlagEventBlocked;
+		if (R3ShieldCore::ChannelHeader* channel = R3ShieldCoreChannel::Channel()) {
+			InterlockedIncrement(&channel->HighRiskBlocked);
+		}
+		return Action::Block;
+	}
+
 	Action Evaluate(R3ShieldCore::ScreenOp op, R3ShieldCore::Event& event, bool allowAsk) noexcept
 	{
 		event.ObjectType = static_cast<ULONG>(R3ShieldCore::ObjectType::Screen);
@@ -175,12 +274,8 @@ namespace
 		const bool canAsk = allowAsk && (mode == static_cast<ULONG>(R3ShieldCore::Mode::Ask));
 		if (!canAsk) {
 			if (mode == static_cast<ULONG>(R3ShieldCore::Mode::Block)) {
-				event.Decision = static_cast<ULONG>(R3ShieldCore::Decision::Blocked);
-				event.Flags |= R3ShieldCore::FlagEventBlocked;
-				if (R3ShieldCore::ChannelHeader* channel = R3ShieldCoreChannel::Channel()) {
-					InterlockedIncrement(&channel->HighRiskBlocked);
-				}
-				return Action::Block;
+				// ★ v67：这里本应直接拒 —— 开关打开时改为"成功 + 黑帧"。
+				return RejectOrSpoof(event);
 			}
 
 			event.Decision = static_cast<ULONG>(R3ShieldCore::Decision::WouldBlock);
@@ -209,12 +304,8 @@ namespace
 			return Action::Record;
 		}
 
-		event.Decision = static_cast<ULONG>(R3ShieldCore::Decision::Blocked);
-		event.Flags |= R3ShieldCore::FlagEventBlocked;
-		if (R3ShieldCore::ChannelHeader* channel = R3ShieldCoreChannel::Channel()) {
-			InterlockedIncrement(&channel->HighRiskBlocked);
-		}
-		return Action::Block;
+		// 用户点了"拒绝"（或超时按兜底结论）：★ v67 —— 同样走 RejectOrSpoof。
+		return RejectOrSpoof(event);
 	}
 
 	// 第二字段放"拷贝区域"，用于区分"1x1 取色"和"整屏抓走"。
@@ -255,6 +346,18 @@ namespace
 
 		const BOOL result = pOriginalBitBlt(hdcDest, xDest, yDest, width, height, hdcSrc, xSrc, ySrc, rop);
 		event.Status = result ? 0u : static_cast<ULONG>(GetLastError());
+
+		// ★ v67：替换 —— 真调已发生（目标 DC 的句柄/尺寸都真实），
+		//    再把目标区域涂黑。**返回 result（= 成功）**，调用者看不出区别。
+		if (action == Action::Spoof && result) {
+			if (BlackenRect(hdcDest, xDest, yDest, width, height)) {
+				event.Flags2 |= R3ShieldCore::FlagEvent2Spoofed;
+			}
+			else {
+				LOG(L"ScreenGuard: BitBlt 替换失败（目标 DC 不可写），本次返回真实内容");
+			}
+		}
+
 		Publish(event);
 
 		InterlockedDecrement(&g_activeHooks);
@@ -289,6 +392,17 @@ namespace
 		const BOOL result = pOriginalStretchBlt(hdcDest, xDest, yDest, widthDest, heightDest,
 			hdcSrc, xSrc, ySrc, widthSrc, heightSrc, rop);
 		event.Status = result ? 0u : static_cast<ULONG>(GetLastError());
+
+		// ★ v67：替换 —— 同 BitBlt，涂的是**目标**矩形（缩放后的尺寸）。
+		if (action == Action::Spoof && result) {
+			if (BlackenRect(hdcDest, xDest, yDest, widthDest, heightDest)) {
+				event.Flags2 |= R3ShieldCore::FlagEvent2Spoofed;
+			}
+			else {
+				LOG(L"ScreenGuard: StretchBlt 替换失败（目标 DC 不可写），本次返回真实内容");
+			}
+		}
+
 		Publish(event);
 
 		InterlockedDecrement(&g_activeHooks);
@@ -330,6 +444,21 @@ namespace
 
 		const BOOL result = pOriginalPrintWindow(hwnd, hdcBlt, flags);
 		event.Status = result ? 0u : static_cast<ULONG>(GetLastError());
+
+		// ★ v67：替换 —— 把窗口画到 hdcBlt 之后再涂黑整块目标 DC。
+		//    hdcBlt 的尺寸用 GetClipBox 取（内存 DC 上即"位图范围"）。
+		if (action == Action::Spoof && result) {
+			RECT rect = {};
+			if (GetClipBox(hdcBlt, &rect) != ERROR &&
+				rect.right > rect.left && rect.bottom > rect.top &&
+				BlackenRect(hdcBlt, rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top)) {
+				event.Flags2 |= R3ShieldCore::FlagEvent2Spoofed;
+			}
+			else {
+				LOG(L"ScreenGuard: PrintWindow 替换失败（取不到目标 DC 尺寸或不可写），本次返回真实内容");
+			}
+		}
+
 		Publish(event);
 
 		InterlockedDecrement(&g_activeHooks);
@@ -394,6 +523,18 @@ namespace
 
 		const int result = pOriginalGetDIBits(hdc, hbm, start, lines, bits, info, usage);
 		event.Status = result ? 0u : static_cast<ULONG>(GetLastError());
+
+		// ★ v67：替换 —— 真调已把真实像素写进调用者的缓冲区，现在把它涂黑。
+		//    只涂**本次真正写入的行数**（result），按位深算行距。
+		if (action == Action::Spoof && result > 0) {
+			if (BlackenDibBits(bits, info, result)) {
+				event.Flags2 |= R3ShieldCore::FlagEvent2Spoofed;
+			}
+			else {
+				LOG(L"ScreenGuard: GetDIBits 替换失败（缓冲区不可写或格式不支持），本次返回真实像素");
+			}
+		}
+
 		Publish(event);
 
 		InterlockedDecrement(&g_activeHooks);

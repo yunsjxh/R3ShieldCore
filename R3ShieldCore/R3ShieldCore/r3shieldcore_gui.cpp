@@ -12,6 +12,24 @@
 #include <string>
 #include <vector>
 
+// ---------------------------------------------------------------------
+// ★ v77：主程序「高级」页签 —— 与「替换 API 结果」控制台**同一份**逻辑。
+//
+//   铁律 195（同一份逻辑不抄第二遍）：这一页显示的「改前 / 改后」字节，
+//   必须是引擎真跑时会写进去的那些字节，所以四件东西全部**直接复用**：
+//     · rules_codec.h        —— 中文规则引擎（含正则）
+//     · spoof_apply_codec.h  —— 判定 -> 字节怎么落地
+//     · registry_spoof_codec.h   —— **生产同源**的数据区定位
+//     · clipboard_spoof_codec.h  —— **生产同源**的替代物构造
+//
+//   ⚠️ 后两个住在 `R3ShieldCoreLib/`，所以构建脚本要把那个目录放进搜索路径
+//      （见 build.sh 的 build_demo：`-I R3ShieldCoreLib`）。漏了会 C1083。
+// ---------------------------------------------------------------------
+#include <r3shieldcore/rules_codec.h>
+#include <r3shieldcore/spoof_apply_codec.h>
+#include "registry_spoof_codec.h"
+#include "clipboard_spoof_codec.h"
+
 //
 // 界面布局
 // ========
@@ -78,19 +96,24 @@ namespace
 	//    底部栏盖住内容（尤其是事件日志页和进程页列表的底部）。
 	constexpr int PromptSummaryRowHeight = 26;
 
-	// 页签栏（标题区下方）。概览 / 事件日志 / 进程 / 配置 / ARK 五个页签。
+	// 页签栏（标题区下方）。概览 / 事件日志 / 进程 / 配置 / ARK / 高级 六个页签。
 	//
 	// ★ v62：4 → 5 个页签，TabWidth 92 → 84。
-	//   宽度是按"页签条不压到右侧动作簇"倒推的：
-	//     页签条右缘 = 20 + 5×(84+8) - 8 = 472
+	// ★ v77：5 → 6 个页签（多了「高级」），TabWidth 84 → 70。
+	//   ⚠️ 这一步**不是**为了好看 —— 84 宽时第 6 个页签（左缘 480）会被右侧
+	//      动作簇的「退出引擎」按钮（左缘 492）**压住**，页签直接点不到。
+	//      这个重叠在 `--gui-preview` 的截图上才第一次看得出来（自绘界面
+	//      没有控件句柄，靠读代码很容易漏）。
+	//   宽度仍是按"页签条不压到右侧动作簇"倒推的：
+	//     页签条右缘 = 20 + 6×(70+8) - 8 = 480
 	//     动作簇最左（「退出引擎」）左缘 = 客户区宽 - 532
-	//   ⇒ 客户区宽 ≥ 1004 才不重叠。所以窗口默认宽 920 → 1024、
+	//   ⇒ 客户区宽 ≥ 1020 才留得出 8px 间隔。所以窗口默认宽 920 → 1024、
 	//     最小跟踪宽 980 → 1040（见 WM_GETMINMAXINFO）。
 	//   ⚠️ `tools/gui_exit_button_probe.cpp` 与 `gui_copy_all_logs_probe.cpp`
 	//      各自**镜像**了这几个常量（它们要靠坐标去点按钮）—— 改这里必须同步改那边。
 	constexpr int TabBarHeight = 38;
 	constexpr int TabBarTop = 62;  // 紧跟标题区分隔线
-	constexpr int TabWidth = 84;
+	constexpr int TabWidth = 70;
 
 	// 日志页的行高与列宽。窗口宽 560、左右各 20 内边距 → 可用 520。
 	//
@@ -119,6 +142,9 @@ namespace
 	constexpr COLORREF ColorAccent = RGB(0, 120, 215);
 	constexpr COLORREF ColorBlocked = RGB(209, 52, 56);
 	constexpr COLORREF ColorWouldBlock = RGB(230, 126, 34);
+	// v67：替换（Spoof）—— 紫色。既不是"拒绝"（红）也不是"本应拒绝"（橙），
+	// 而是"调用成功了但内容是假的"，必须一眼能区分开。
+	constexpr COLORREF ColorSpoofed = RGB(123, 31, 162);
 	// 完全拦截模式的徽章色：比 BLOCK 更深更沉，一眼能跟普通拦截区分开。
 	constexpr COLORREF ColorBlockAll = RGB(139, 0, 0);
 	constexpr COLORREF ColorTrack = RGB(232, 232, 232);
@@ -271,6 +297,11 @@ namespace
 	std::vector<R3ShieldCoreArk::ActionRecord> g_arkActions;
 	ULONG g_arkActionsSerial = 0;
 
+	// ★ v77：「高级」页签的两个按钮（自绘，与 ARK 那套一样单独一份状态）。
+	//   同样**不**并进 HeaderAction —— 它们的位置随客户区大小变、且只在这一页存在。
+	int g_advHoverAction = -1;
+	int g_advPressedAction = -1;
+
 	// 当前显示用的模式。**不能直接读 g_options.Mode** ——
 	// 运行期切模式时引擎线程会改它，而 g_options 是普通结构体
 	// （非原子读写 + 撕裂风险）。用一个 LONG 走原子访问。
@@ -415,6 +446,7 @@ namespace
 		case R3ShieldCore::Decision::Allowed: return ColorAccent;
 		case R3ShieldCore::Decision::Blocked: return ColorBlocked;
 		case R3ShieldCore::Decision::WouldBlock: return ColorWouldBlock;
+		case R3ShieldCore::Decision::Spoofed: return ColorSpoofed;
 		default: return ColorTextSecondary;
 		}
 	}
@@ -1360,7 +1392,9 @@ namespace
 			}
 		}
 
-		for (int i = 0; i < 3; i++) {
+		// ★ 4 档：Allowed / Blocked / WouldBlock / Spoofed（v67 新增 Spoofed）。
+		//   `DecisionCounts` 本来就是 4 个元素（按 Decision 值索引），别写死 3。
+		for (int i = 0; i < 4; i++) {
 			auto decision = static_cast<R3ShieldCore::Decision>(i);
 			PCWSTR label = L"?";
 			switch (decision) {
@@ -1372,6 +1406,9 @@ namespace
 				break;
 			case R3ShieldCore::Decision::WouldBlock:
 				label = L"WOULD-BLOCK";
+				break;
+			case R3ShieldCore::Decision::Spoofed:
+				label = L"SPOOF";
 				break;
 			default:
 				break;
@@ -2833,10 +2870,558 @@ namespace
 			g_labelFont, ColorTextSecondary, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS);
 	}
 
+	// =================================================================
+	// ★ v77：「高级」页签 —— 替换 API 结果的**规则引擎预览台**
+	// =================================================================
+	//
+	// 这一页只回答一个问题：**我写的规则，会把 API 的返回值改成什么？**
+	//
+	// ★ 为什么它必须存在（而不是"控制台里有就够了"）
+	//   控制台（tools/spoof_console.cpp）是"你自己当攻击者、逐条敲命令试"；
+	//   这一页是"一眼看清规则到底改了哪几个字节" —— 调规则时后者快得多。
+	//   它**不能**写规则、**不能**注入：只把同一套引擎对合成样例跑一遍。
+	//
+	// ★ 它**不注入、不跑引擎、不碰真实 API**（铁律 175 因此不适用）：
+	//   注册表样例是**本进程栈上的合成缓冲区**，剪贴板样例是**本进程自己
+	//   GlobalAlloc 出来的** HGLOBAL。所以开发机上可以放心跑，配合
+	//   `--gui-preview` 就能建窗截图核对。
+	//
+	// ★ 「改后」是怎么算出来的（每一步都走**生产路径**，不是"照着生产写的"）
+	//   注册表值  ：`RSpoof::LocateDataRegion` 定位 -> `RApply::ApplyRegValue` 落值
+	//   剪贴板    ：`RClip::FormatLabel` 出格式名 -> 命中规则走
+	//               `RApply::BuildClipText`；没命中回落**生产** `RClip::BuildFake`
+	//   注册表枚举：`RRule::Eval` 逐个子键问规则，命中「隐藏」的从列表去掉
+	//               ⚠️ 未命中**一律保留** —— 这一页**不**模拟 `protect_reg` 判据
+	//                  （那是引擎侧配置，界面拿不到；硬编一个假判据才是骗人）。
+	//
+	// ★ 只读预览，不是操作台：真正的开关在 `r3shieldcore.ini`
+	//   （`spoof_reg=` / `spoof_clipboard=` / `spoof_reg_enum=` …）。
+	//   这一页把"改了会变成什么样"提前给你看，免得配错了要等真机才发现。
+
+	namespace RRule = R3ShieldCoreRules;
+	namespace RApply = R3ShieldCoreSpoofApply;
+	namespace RClip = R3ShieldCoreClipboardSpoof;
+	namespace RSpoof = R3ShieldCoreRegistrySpoof;
+
+	// ---------------- 布局（绘制与命中共用一份，避免"画在这儿点在那儿"） ----------------
+	enum AdvButton
+	{
+		AdvButtonNone = -1,
+		AdvButtonSeed = 0,      // 重置为示例规则
+		AdvButtonClear = 1,     // 清空规则
+		AdvButtonCount = 2,
+	};
+
+	constexpr int AdvButtonHeight = 28;
+	constexpr int AdvButtonWidth = 148;
+	constexpr int AdvLineHeight = 21;
+	constexpr int AdvMaxHexBytes = 16;   // 每行最多显示多少字节（超了打 "..."）
+
+	struct AdvLayout
+	{
+		int Left = 0, Right = 0;
+		int SummaryTop = 0;
+		int PanelTop = 0, PanelBottom = 0;
+		int RulesLeft = 0, RulesRight = 0;
+		int DiffLeft = 0, DiffRight = 0;
+		int ButtonTop = 0;
+		RECT Buttons[AdvButtonCount] = {};
+	};
+
+	AdvLayout AdvLayoutFor(const RECT& client)
+	{
+		AdvLayout layout = {};
+		layout.Left = Padding;
+		layout.Right = client.right - Padding;
+		layout.SummaryTop = TabBarTop + TabBarHeight + 12;
+		layout.PanelTop = layout.SummaryTop + 26;
+
+		// 底部按钮条固定贴底（在询问统计栏之上）—— 与其它页同一套算法，
+		// 窗口被拉矮时按钮不会跑到可视区外。
+		layout.ButtonTop = client.bottom - PromptSummaryHeight() - 12 - AdvButtonHeight;
+		layout.PanelBottom = layout.ButtonTop - 12;
+
+		const int gap = 14;
+		const int contentWidth = layout.Right - layout.Left - gap;
+		const int rulesWidth = contentWidth * 52 / 100;
+		layout.RulesLeft = layout.Left;
+		layout.RulesRight = layout.Left + rulesWidth;
+		layout.DiffLeft = layout.RulesRight + gap;
+		layout.DiffRight = layout.Right;
+
+		int x = layout.Left;
+		for (int i = 0; i < AdvButtonCount; i++) {
+			layout.Buttons[i] = { x, layout.ButtonTop, x + AdvButtonWidth, layout.ButtonTop + AdvButtonHeight };
+			x += AdvButtonWidth + 8;
+		}
+		return layout;
+	}
+
+	int HitTestAdvButton(POINT point, const RECT& client)
+	{
+		if (g_activeTab != 5) {
+			return AdvButtonNone;
+		}
+		const AdvLayout layout = AdvLayoutFor(client);
+		for (int i = 0; i < AdvButtonCount; i++) {
+			if (PtInRect(&layout.Buttons[i], point)) {
+				return i;
+			}
+		}
+		return AdvButtonNone;
+	}
+
+	PCWSTR AdvButtonLabel(int index)
+	{
+		switch (index) {
+		case AdvButtonSeed:  return L"重置为示例规则";
+		case AdvButtonClear: return L"清空规则";
+		default: return L"";
+		}
+	}
+
+	// ---------------- 示例规则 ----------------
+	//
+	// ★ 刻意用**中文 DSL 原文**（而不是直接拼 Rule 结构体）——
+	//   示例必须走用户手敲时那条**同一条解析路径**（铁律 22），
+	//   否则会出现"示例能用、用户照着写的不能用"这种最难查的偏差。
+	// ★ 三条覆盖三个面 × 三种动作：
+	//   #0 注册表值  ：正则匹配 -> 替换为文本（真会写进数据区）
+	//   #1 剪贴板    ：等于    -> 替换为文本
+	//   #2 注册表枚举：含      -> 隐藏（从列表里去掉）
+	PCWSTR kAdvDemoRules[] = {
+		L"当 注册表值 的 值名 匹配 /Pass.*/ 时 替换为 \"***\"",
+		L"当 剪贴板 的 格式 等于 文本 时 替换为 \"[已替换]\"",
+		L"当 注册表枚举 的 子键名 含 \"Secret\" 时 隐藏",
+	};
+
+	void AdvLoadDemoRules()
+	{
+		RRule::Clear();
+		for (PCWSTR line : kAdvDemoRules) {
+			std::wstring err;
+			RRule::Add(line, err, nullptr);
+		}
+	}
+
+	void PerformAdvAction(int index)
+	{
+		if (index == AdvButtonSeed) {
+			AdvLoadDemoRules();
+			printf("[adv] 已重置为示例规则（%d 条）\n", RRule::Count());
+			fflush(stdout);
+		}
+		else if (index == AdvButtonClear) {
+			RRule::Clear();
+			printf("[adv] 规则已清空\n");
+			fflush(stdout);
+		}
+	}
+
+	// ---------------- 显示辅助 ----------------
+	std::wstring AdvHex(const BYTE* data, size_t length)
+	{
+		if (!data || length == 0) {
+			return L"(空)";
+		}
+		std::wstring out;
+		WCHAR cell[8] = {};
+		const size_t n = (length < AdvMaxHexBytes) ? length : AdvMaxHexBytes;
+		for (size_t i = 0; i < n; i++) {
+			swprintf_s(cell, L"%02X ", data[i]);
+			out += cell;
+		}
+		if (n < length) {
+			out += L"...";
+		}
+		return out;
+	}
+
+	// 判定 -> 一句话。复用规则引擎自己的 Describe，别在这里再拼一遍语法
+	// （拼两遍必然与解析器漂移 —— 那正是 v74 收敛 Action 枚举要防的事）。
+	std::wstring AdvVerdictText(const RRule::Verdict& v)
+	{
+		if (!v.hit) {
+			return L"未命中规则 · 回落内置默认行为";
+		}
+		std::wstring desc;
+		if (!RRule::DescribeAt(v.index, desc)) {
+			return L"命中规则";
+		}
+		WCHAR head[32] = {};
+		swprintf_s(head, L"命中 #%d · ", v.index);
+		return std::wstring(head) + desc;
+	}
+
+	// 造一个"真实剪贴板文本"（UTF-16 带结尾 NUL）—— 只为喂给**生产**
+	// `RClip::BuildFake`，让"回落"那一格走的是真生产路径而不是模仿。
+	HGLOBAL AdvBuildRealUnicodeText(const WCHAR* text)
+	{
+		const size_t chars = text ? wcslen(text) : 0;
+		HGLOBAL h = GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT,
+			(chars + 1) * sizeof(WCHAR));
+		if (!h) {
+			return nullptr;
+		}
+		void* p = GlobalLock(h);
+		if (!p) {
+			GlobalFree(h);
+			return nullptr;
+		}
+		if (chars) {
+			memcpy(p, text, chars * sizeof(WCHAR));
+		}
+		GlobalUnlock(h);
+		return h;
+	}
+
+	void AdvDrawButton(HDC dc, const RECT& rect, PCWSTR label, bool hovered, bool pressed)
+	{
+		COLORREF fill = ColorHeaderBackground;
+		COLORREF border = ColorBorder;
+		COLORREF text = ColorTextPrimary;
+		if (pressed) {
+			fill = RGB(200, 222, 244);
+			border = ColorAccent;
+			text = ColorAccent;
+		}
+		else if (hovered) {
+			fill = ColorTabHoverBg;
+			border = ColorTabHoverBorder;
+			text = ColorAccent;
+		}
+
+		HBRUSH brush = CreateSolidBrush(fill);
+		HPEN pen = CreatePen(PS_SOLID, 1, border);
+		HGDIOBJ oldBrush = SelectObject(dc, brush);
+		HGDIOBJ oldPen = SelectObject(dc, pen);
+		RoundRect(dc, rect.left, rect.top, rect.right, rect.bottom, 6, 6);
+		SelectObject(dc, oldBrush);
+		SelectObject(dc, oldPen);
+		DeleteObject(brush);
+		DeleteObject(pen);
+
+		DrawTextSimple(dc, label, rect, g_labelFont, text,
+			DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+	}
+
+	// 一行「标签 : 值」
+	void AdvRow(HDC dc, int left, int right, int y, PCWSTR label,
+		const std::wstring& value, COLORREF color)
+	{
+		DrawTextSimple(dc, label, { left, y, left + 48, y + 18 },
+			g_labelFont, ColorTextSecondary, DT_LEFT | DT_SINGLELINE);
+		DrawTextSimple(dc, value.c_str(), { left + 48, y, right, y + 18 },
+			g_monoFont, color, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS);
+	}
+
+	void DrawAdvancedPage(HDC dc, const RECT& client)
+	{
+		// ★ 首次进这一页自动铺一遍示例规则 —— 否则用户看到的是
+		//   "0 条规则 + 全是真值"，与"这一页根本没做"长得一模一样（铁律 97）。
+		{
+			static bool seeded = false;
+			if (!seeded) {
+				seeded = true;
+				if (RRule::Count() == 0) {
+					AdvLoadDemoRules();
+				}
+			}
+		}
+
+		const AdvLayout layout = AdvLayoutFor(client);
+		const int ruleCount = RRule::Count();
+
+		// ★ 证明"这一页真的被画到了"（与 ARK 页同一套路，铁律 97）。
+		//   为什么值得单开一行日志：`--gui-preview` 的核对完全建立在
+		//   "窗口画出来了"这件事上，而"页面没被画到"与"画了但内容不对"
+		//   在一张截图上长得一模一样 —— 截到空窗口时分不清是哪种。
+		//   有这一行就能把两者分开（"截不到图"和"页面没画"是两回事）。
+		{
+			static bool paintedOnce = false;
+			if (!paintedOnce) {
+				paintedOnce = true;
+				printf("[adv] 页面已绘制 规则=%d 页签=%d 客户区=%dx%d\n",
+					ruleCount, g_activeTab,
+					static_cast<int>(client.right), static_cast<int>(client.bottom));
+				fflush(stdout);
+			}
+		}
+
+		// ---------------- 摘要行 ----------------
+		{
+			WCHAR buffer[256] = {};
+			swprintf_s(buffer, _countof(buffer),
+				L"替换 API 结果 · 规则引擎预览台（只读） —— 规则 %d 条 · "
+				L"按加入顺序 first-match wins，未命中回落内置默认行为",
+				ruleCount);
+			DrawTextSimple(dc, buffer,
+				{ layout.Left, layout.SummaryTop, layout.Right, layout.SummaryTop + 22 },
+				g_labelFont, ColorTextSecondary, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS);
+		}
+
+		// ---------------- 左：规则引擎 ----------------
+		RECT rulesPanel = { layout.RulesLeft, layout.PanelTop, layout.RulesRight, layout.PanelBottom };
+		DrawPanel(dc, rulesPanel, L"规则引擎（中文规则 + 正则）");
+
+		const int syntaxTop = layout.PanelBottom - 76;   // 底部留给语法提示
+		int y = layout.PanelTop + 46;
+		std::vector<std::wstring> all;
+		RRule::ListAll(all);
+		if (all.empty()) {
+			DrawTextSimple(dc, L"（还没有规则 —— 点下面的「重置为示例规则」）",
+				{ rulesPanel.left + 16, y, rulesPanel.right - 16, y + 20 },
+				g_labelFont, ColorTextSecondary, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS);
+		}
+		else {
+			for (size_t i = 0; i < all.size() && y + AdvLineHeight <= syntaxTop; i++) {
+				WCHAR index[16] = {};
+				swprintf_s(index, L"#%u", static_cast<unsigned>(i));
+				DrawTextSimple(dc, index, { rulesPanel.left + 16, y, rulesPanel.left + 46, y + 18 },
+					g_monoFont, ColorAccent, DT_LEFT | DT_SINGLELINE);
+				DrawTextSimple(dc, all[i].c_str(),
+					{ rulesPanel.left + 50, y, rulesPanel.right - 16, y + 18 },
+					g_monoFont, ColorTextPrimary, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS);
+				y += AdvLineHeight;
+			}
+		}
+
+		{
+			const int sy = syntaxTop;
+			DrawTextSimple(dc, L"语法：当 <面> [的 <字段>] <算子> <模式> 时 <动作>",
+				{ rulesPanel.left + 16, sy, rulesPanel.right - 16, sy + 18 },
+				g_labelFont, ColorTextSecondary, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS);
+			DrawTextSimple(dc, L"面 = 注册表值 / 注册表枚举 / 剪贴板",
+				{ rulesPanel.left + 16, sy + 19, rulesPanel.right - 16, sy + 37 },
+				g_labelFont, ColorTextSecondary, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS);
+			DrawTextSimple(dc, L"算子 = 等于 / 含 / 匹配(/正则/) / 开头 / 结尾",
+				{ rulesPanel.left + 16, sy + 38, rulesPanel.right - 16, sy + 56 },
+				g_labelFont, ColorTextSecondary, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS);
+			DrawTextSimple(dc, L"动作 = 替换为 \"文本\"|全零|全FF|空 · 隐藏 · 拒绝 · 放行",
+				{ rulesPanel.left + 16, sy + 57, rulesPanel.right - 16, sy + 75 },
+				g_labelFont, ColorTextSecondary, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS);
+		}
+
+		// ---------------- 右：改前 / 改后 字节对照 ----------------
+		RECT diffPanel = { layout.DiffLeft, layout.PanelTop, layout.DiffRight, layout.PanelBottom };
+		DrawPanel(dc, diffPanel, L"改前 / 改后 字节对照（生产同源 codec）");
+
+		int dy = layout.PanelTop + 46;
+		const int dleft = diffPanel.left + 16;
+		const int dright = diffPanel.right - 16;
+
+		// ---- 样例 1：注册表值（REG_SZ）----
+		{
+			const WCHAR* keyPath = L"HKEY_CURRENT_USER\\Software\\R3ShieldCoreDemo\\Vault";
+			const WCHAR* valueName = L"Password";
+			const WCHAR* secret = L"hunter2";
+
+			// 合成一个 class 2 的 KEY_VALUE_PARTIAL_INFORMATION：
+			//   +0 TitleIndex   +4 Type   +8 DataLength   +12 Data[]
+			const size_t secretBytes = (wcslen(secret) + 1) * sizeof(WCHAR);
+			BYTE buffer[12 + 64] = {};
+			ULONG type = 1 /*REG_SZ*/;
+			ULONG dataLength = static_cast<ULONG>(secretBytes);
+			memcpy(buffer + 4, &type, sizeof(type));
+			memcpy(buffer + 8, &dataLength, sizeof(dataLength));
+			memcpy(buffer + 12, secret, secretBytes);
+			const ULONG total = static_cast<ULONG>(12 + secretBytes);
+
+			RSpoof::DataRegion region = {};
+			const bool located = RSpoof::LocateDataRegion(2, buffer, sizeof(buffer), total, region);
+			const size_t regionOffset = located ? region.offset : 12;
+			const size_t regionLength = located ? region.length : secretBytes;
+
+			BYTE before[64] = {};
+			memcpy(before, buffer + regionOffset, regionLength);
+
+			const RRule::Verdict v = RRule::Eval(RRule::Face::RegValue, keyPath, valueName, nullptr);
+			const RApply::Effect effect = RApply::ApplyRegValue(v, v.hit, buffer,
+				sizeof(buffer), regionOffset, regionLength, 0);
+
+			DrawTextSimple(dc, L"① 注册表值 · Password（REG_SZ）",
+				{ dleft, dy, dright, dy + 18 }, g_labelFont, ColorTextPrimary,
+				DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS);
+			dy += AdvLineHeight;
+			AdvRow(dc, dleft, dright, dy, L"判定", AdvVerdictText(v),
+				v.hit ? ColorSpoofed : ColorTextSecondary);
+			dy += AdvLineHeight;
+			AdvRow(dc, dleft, dright, dy, L"改前", AdvHex(before, regionLength), ColorTextPrimary);
+			dy += AdvLineHeight;
+
+			std::wstring afterText;
+			COLORREF afterColor = ColorSpoofed;
+			if (effect == RApply::Effect::Rejected) {
+				afterText = L"（拒绝 —— 调用方拿到 STATUS_ACCESS_DENIED）";
+				afterColor = ColorBlocked;
+			}
+			else if (effect == RApply::Effect::PassThrough) {
+				afterText = AdvHex(before, regionLength) + L"   （规则要求放行，原样返回）";
+				afterColor = ColorTextSecondary;
+			}
+			else {
+				afterText = AdvHex(buffer + regionOffset, regionLength);
+				afterText += L"   （";
+				afterText += RApply::EffectName(effect);
+				afterText += L"）";
+			}
+			AdvRow(dc, dleft, dright, dy, L"改后", afterText, afterColor);
+			dy += AdvLineHeight + 10;
+		}
+
+		// ---- 样例 2：剪贴板（CF_UNICODETEXT）----
+		{
+			const UINT format = 13 /*CF_UNICODETEXT*/;
+			const WCHAR* realText = L"账号=admin 口令=hunter2";
+			const size_t realLength = (wcslen(realText) + 1) * sizeof(WCHAR);
+
+			HGLOBAL real = AdvBuildRealUnicodeText(realText);
+			const BYTE* realBytes = real
+				? static_cast<const BYTE*>(GlobalLock(real)) : nullptr;
+
+			// ★ 必须**先**把「改前」的字节抓成字符串，再解锁 / 释放。
+			//   否则后面显示用的是已经还回去的内存（use-after-free）。
+			//   实测症状很隐蔽：程序**不崩**，只是"改前"那一行变成两个指针值
+			//   （`70 2D 61 E5 5B 02 00 00 ...`），而不是真实的 UTF-16 文本 ——
+			//   自绘界面里没有任何东西会报错，只有截图能看出来。
+			const std::wstring beforeHex = AdvHex(realBytes, realLength);
+
+			WCHAR fmtBuffer[32] = {};
+			const WCHAR* fmtLabel = RClip::FormatLabel(format, fmtBuffer, _countof(fmtBuffer));
+			const RRule::Verdict v = RRule::Eval(RRule::Face::Clip, nullptr, nullptr, fmtLabel);
+
+			HGLOBAL fake = nullptr;
+			std::wstring afterText;
+			COLORREF afterColor = ColorSpoofed;
+			const WCHAR* afterWhat = L"";
+
+			if (v.hit && v.act == RRule::Act::Block) {
+				afterText = L"（拒绝 —— 调用方拿到 NULL + err=5）";
+				afterColor = ColorBlocked;
+			}
+			else if (v.hit && v.act == RRule::Act::Pass) {
+				afterText = beforeHex + L"   （规则要求放行，原样返回）";
+				afterColor = ColorTextSecondary;
+			}
+			else if (v.hit) {
+				const WCHAR* text = (v.act == RRule::Act::ReplaceText) ? v.text.c_str() : L"";
+				fake = RApply::BuildClipText(format, text);
+				afterWhat = (v.act == RRule::Act::ReplaceText)
+					? L"写入了规则指定的文本" : L"内容变空串";
+			}
+			else {
+				// ★ 回落 = **生产**路径：文本类 -> 空串（BuildEmptyText）
+				fake = RClip::BuildFake(format, real);
+				afterWhat = L"生产回落：文本内容变空串";
+				afterColor = ColorTextSecondary;
+			}
+
+			if (fake) {
+				const BYTE* fakeBytes = static_cast<const BYTE*>(GlobalLock(fake));
+				const size_t fakeLength = static_cast<size_t>(GlobalSize(fake));
+				afterText = AdvHex(fakeBytes, fakeLength);
+				afterText += L"   （";
+				afterText += afterWhat;
+				afterText += L"）";
+				GlobalUnlock(fake);
+				RClip::FreeFake(format, fake);
+			}
+
+			if (realBytes) {
+				GlobalUnlock(real);
+			}
+			if (real) {
+				GlobalFree(real);
+			}
+
+			DrawTextSimple(dc, L"② 剪贴板 · CF_UNICODETEXT（文本）",
+				{ dleft, dy, dright, dy + 18 }, g_labelFont, ColorTextPrimary,
+				DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS);
+			dy += AdvLineHeight;
+			AdvRow(dc, dleft, dright, dy, L"判定", AdvVerdictText(v),
+				v.hit ? ColorSpoofed : ColorTextSecondary);
+			dy += AdvLineHeight;
+			AdvRow(dc, dleft, dright, dy, L"改前", beforeHex, ColorTextPrimary);
+			dy += AdvLineHeight;
+			AdvRow(dc, dleft, dright, dy, L"改后", afterText, afterColor);
+			dy += AdvLineHeight + 10;
+		}
+
+		// ---- 样例 3：注册表枚举（隐藏）----
+		{
+			const WCHAR* keyPath = L"HKEY_CURRENT_USER\\Software\\R3ShieldCoreDemo\\Vault";
+			PCWSTR children[] = { L"SecretKey", L"PublicKey", L"SecretToken", L"Password" };
+			const int childCount = static_cast<int>(_countof(children));
+
+			std::wstring beforeList;
+			std::wstring afterList;
+			std::wstring hitText;
+			int hidden = 0;
+			for (int i = 0; i < childCount; i++) {
+				if (!beforeList.empty()) {
+					beforeList += L" · ";
+				}
+				beforeList += children[i];
+
+				const RRule::Verdict v = RRule::Eval(RRule::Face::RegEnum, keyPath, children[i], nullptr);
+				if (v.hit && v.act == RRule::Act::Hide) {
+					hidden++;
+					if (hitText.empty()) {
+						hitText = AdvVerdictText(v);
+					}
+					continue;
+				}
+				if (!afterList.empty()) {
+					afterList += L" · ";
+				}
+				afterList += children[i];
+			}
+			if (afterList.empty()) {
+				afterList = L"（全被隐藏）";
+			}
+
+			DrawTextSimple(dc, L"③ 注册表枚举 · 子键列表（隐藏）",
+				{ dleft, dy, dright, dy + 18 }, g_labelFont, ColorTextPrimary,
+				DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS);
+			dy += AdvLineHeight;
+			AdvRow(dc, dleft, dright, dy, L"判定",
+				hidden ? hitText : std::wstring(L"未命中规则 · 一项都不隐藏"),
+				hidden ? ColorSpoofed : ColorTextSecondary);
+			dy += AdvLineHeight;
+			// ★ 不带"共 N 项"后缀：这一行本来就长（4 个名字），加了会被
+			//   DT_END_ELLIPSIS 截掉尾巴，反而看不出藏的是谁。条数由「改后」那行说。
+			AdvRow(dc, dleft, dright, dy, L"改前", beforeList, ColorTextPrimary);
+			dy += AdvLineHeight;
+			AdvRow(dc, dleft, dright, dy, L"改后",
+				afterList + L"   （隐藏 " + std::to_wstring(hidden) + L" 项）",
+				hidden ? ColorSpoofed : ColorTextSecondary);
+			dy += AdvLineHeight + 10;
+		}
+
+		// 一句诚实标注：这一页**不**模拟引擎侧的 protect_reg 判据。
+		DrawTextSimple(dc, L"注：枚举面未命中即「保留」（不模拟 protect_reg 判据）。",
+			{ dleft, layout.PanelBottom - 24, dright, layout.PanelBottom - 6 },
+			g_labelFont, ColorTextSecondary, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS);
+
+		// ---------------- 底部按钮 + 说明 ----------------
+		for (int i = 0; i < AdvButtonCount; i++) {
+			AdvDrawButton(dc, layout.Buttons[i], AdvButtonLabel(i),
+				g_advHoverAction == i, g_advPressedAction == i);
+		}
+		{
+			DrawTextSimple(dc,
+				L"开关在 r3shieldcore.ini（spoof_reg / spoof_clipboard / spoof_reg_enum）；这一页只读。",
+				{ layout.Buttons[AdvButtonCount - 1].right + 16, layout.ButtonTop,
+				  layout.Right, layout.ButtonTop + AdvButtonHeight },
+				g_labelFont, ColorTextSecondary,
+				DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+		}
+	}
+
 	// -----------------------------------------------------------------
 	// 页签栏
 	// -----------------------------------------------------------------
-	constexpr int TabCount = 5;
+	constexpr int TabCount = 6;
 	PCWSTR TabTitle(int index)
 	{
 		switch (index) {
@@ -2844,6 +3429,7 @@ namespace
 		case 2: return L"进程";
 		case 3: return L"配置";
 		case 4: return L"ARK";
+		case 5: return L"高级";
 		default: return L"概览";
 		}
 	}
@@ -2929,8 +3515,11 @@ namespace
 	bool LogRowPassesFilter(const R3ShieldCoreStats::LogEntry& row)
 	{
 		if (g_logOnlyBlocked) {
+			// "只看被拦" = 我们真的处置了它：拒绝（BLOCK / WOULD-BLOCK）**或**
+			// 替换（SPOOF）。替换也是处置 —— 调用者没拿到真实数据。
 			if (row.Decision != static_cast<ULONG>(R3ShieldCore::Decision::Blocked) &&
-				row.Decision != static_cast<ULONG>(R3ShieldCore::Decision::WouldBlock)) {
+				row.Decision != static_cast<ULONG>(R3ShieldCore::Decision::WouldBlock) &&
+				row.Decision != static_cast<ULONG>(R3ShieldCore::Decision::Spoofed)) {
 				return false;
 			}
 		}
@@ -3332,7 +3921,7 @@ namespace
 		FillRect(buffer, &headerLine, lineBrush);
 		DeleteObject(lineBrush);
 
-		// 页签栏在标题区下方，四个页面共用。
+		// 页签栏在标题区下方，六个页面共用。
 		DrawTabBar(buffer);
 
 		if (g_activeTab == 1) {
@@ -3346,6 +3935,10 @@ namespace
 		}
 		else if (g_activeTab == 4) {
 			DrawArkPage(buffer, client);
+		}
+		else if (g_activeTab == 5) {
+			// ★ v77：「高级」页 —— 替换 API 结果的规则引擎预览台。
+			DrawAdvancedPage(buffer, client);
 		}
 		else {
 			R3ShieldCoreStats::Snapshot snapshot = R3ShieldCoreStats::GetSnapshot();
@@ -3501,11 +4094,21 @@ namespace
 				hoveredArk = HitTestArkButton(point, client);
 			}
 
+			// ★ v77：「高级」页的两个按钮（同样不在 HeaderAction 那套里 ——
+			//   位置随客户区大小变，且只在这一页存在）。
+			int hoveredAdv = AdvButtonNone;
+			if (g_activeTab == 5) {
+				RECT client = {};
+				GetClientRect(hwnd, &client);
+				hoveredAdv = HitTestAdvButton(point, client);
+			}
+
 			if (hovered != g_hoverButton || hoveredTab != g_hoverTab
-				|| hoveredArk != g_arkHoverAction) {
+				|| hoveredArk != g_arkHoverAction || hoveredAdv != g_advHoverAction) {
 				g_hoverButton = hovered;
 				g_hoverTab = hoveredTab;
 				g_arkHoverAction = hoveredArk;
+				g_advHoverAction = hoveredAdv;
 				InvalidateRect(hwnd, nullptr, FALSE);
 			}
 			return 0;
@@ -3514,10 +4117,11 @@ namespace
 		case WM_MOUSELEAVE:
 			g_trackingMouseLeave = false;
 			if (g_hoverButton != HeaderAction::None || g_hoverTab >= 0
-				|| g_arkHoverAction != ArkButtonNone) {
+				|| g_arkHoverAction != ArkButtonNone || g_advHoverAction != AdvButtonNone) {
 				g_hoverButton = HeaderAction::None;
 				g_hoverTab = -1;
 				g_arkHoverAction = ArkButtonNone;
+				g_advHoverAction = AdvButtonNone;
 				InvalidateRect(hwnd, nullptr, FALSE);
 			}
 			return 0;
@@ -3525,9 +4129,11 @@ namespace
 		case WM_CAPTURECHANGED:
 			// 捕获被抢走（弹了 UAC、别的窗口抢了鼠标）⇒ 清掉按下态，
 			// 否则按钮会永远停在"按下"的样子。
-			if (g_pressedButton != HeaderAction::None || g_arkPressedAction != ArkButtonNone) {
+			if (g_pressedButton != HeaderAction::None || g_arkPressedAction != ArkButtonNone
+				|| g_advPressedAction != AdvButtonNone) {
 				g_pressedButton = HeaderAction::None;
 				g_arkPressedAction = ArkButtonNone;
+				g_advPressedAction = AdvButtonNone;
 				InvalidateRect(hwnd, nullptr, FALSE);
 			}
 			return 0;
@@ -3593,6 +4199,20 @@ namespace
 				return 0;
 			}
 
+			// ★ v77：「高级」页 —— 两个自绘按钮（载入示例规则 / 清空规则）。
+			//   这一页没有别的可点区域，所以命中与否都吃掉这次点击。
+			if (g_activeTab == 5) {
+				RECT client = {};
+				GetClientRect(hwnd, &client);
+				const int button = HitTestAdvButton(point, client);
+				if (button != AdvButtonNone) {
+					g_advPressedAction = button;
+					SetCapture(hwnd);
+				}
+				InvalidateRect(hwnd, nullptr, FALSE);
+				return 0;
+			}
+
 			// 日志页左下角：左边点「只看拦截」，右边点「来源切换」。
 			// 两个开关都在状态栏那一行，按 x 分开。
 			if (g_activeTab == 1) {
@@ -3621,6 +4241,23 @@ namespace
 
 		case WM_LBUTTONUP: {
 			const POINT point = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+
+			// ★ v77：「高级」页的按钮（与 ARK 那套同样单独处理）。
+			if (g_advPressedAction != AdvButtonNone) {
+				const int pressed = g_advPressedAction;
+				g_advPressedAction = AdvButtonNone;
+				if (GetCapture() == hwnd) {
+					ReleaseCapture();
+				}
+				RECT client = {};
+				GetClientRect(hwnd, &client);
+				// 只有松手时鼠标仍停在**同一个**按钮上才触发（标准按钮语义）。
+				if (HitTestAdvButton(point, client) == pressed) {
+					PerformAdvAction(pressed);
+				}
+				InvalidateRect(hwnd, nullptr, FALSE);
+				return 0;
+			}
 
 			// ★ v62：ARK 页的动作按钮（与页头按钮**分开**处理 ——
 			//   它们不在 HeaderAction 那套枚举里）。
@@ -3873,6 +4510,12 @@ namespace
 			}
 			else if (n > 0 && _wcsicmp(tabEnv, L"ark") == 0) {
 				g_activeTab = 4;
+			}
+			// ★ v77：`advanced` —— 「高级」页（规则引擎预览台）。
+			//   理由同 ark：这一页也是自绘、没有控件句柄，自动化点击既过不了
+			//   UIPI 也点不准；要核对它只能靠这个开关 + `--gui-preview`。
+			else if (n > 0 && _wcsicmp(tabEnv, L"advanced") == 0) {
+				g_activeTab = 5;
 			}
 		}
 
@@ -4155,5 +4798,67 @@ namespace R3ShieldCoreGui
 		Stop();
 
 		return normal && super && cleared ? 0 : 3;
+	}
+
+	// ★ v77：界面预览（`--gui-preview`）—— 建窗、跑着、**不启动引擎**。
+	//
+	// ★ 为什么需要它
+	//   主程序一启动就会开始全局注入，而铁律 175 明令**开发机禁止跑引擎**
+	//   （全局注入会 hook 编辑器 ⇒ 崩）。于是"界面画得对不对"长期只能靠
+	//   读代码 —— 而本项目已经吃过"靠人眼 = 假绿"的亏（铁律 24/28）。
+	//   本模式在**引擎初始化之前**分流（和 `--topmost-selftest` 同一位置，
+	//   见 app.cpp），所以可以安全地反复跑、截图核对。
+	//
+	// ★ 与 `--topmost-selftest` 的区别
+	//   那个是"建窗 → 自检置顶 → 立刻退"（跑完就没了，看不到界面）；
+	//   本函数是"建窗 → **等你关**"，中间的界面就是发布版的界面。
+	//
+	// ★ 怎么指定看哪一页
+	//   环境变量 `R3SHIELDCORE_START_TAB`（v62 就有，见 GuiThreadProc）：
+	//     overview(默认) | log | process | config | ark | advanced
+	//   提权窗口收不到非提权进程的自动化点击（UIPI 拦），所以这是
+	//   验证某个页签的唯一可靠手段。
+	int RunPreview() noexcept
+	{
+		Options options = {};
+		options.Mode = R3ShieldCore::Mode::Log;
+		if (!Start(options)) {
+			printf("[gui-preview] GUI start FAILED\n");
+			return 1;
+		}
+		g_allowUiAccessRestart = false;
+
+		for (int attempt = 0; attempt < 40 && !g_window; ++attempt) {
+			Sleep(50);
+		}
+		if (!g_window) {
+			printf("[gui-preview] window creation FAILED\n");
+			Stop();
+			return 2;
+		}
+
+		printf("[gui-preview] 窗口已建立 %dx%d，当前页签 = %d\n",
+			WindowWidth, WindowHeight, g_activeTab);
+		printf("[gui-preview] **预览模式**：不注入、不启动引擎、不读屏幕；关窗口即退出。\n");
+		printf("[gui-preview] 换页签：设 R3SHIELDCORE_START_TAB=log|process|config|ark|advanced\n");
+
+		// 喂一个"引擎没在跑"的状态，让概览页有确定内容（否则全是初值）。
+		Update(0);
+
+		// 等窗口消失。GUI 线程自己跑消息循环，这里只轮询三件事：
+		//   · 模式切换请求 —— 预览模式**不**切引擎，取走即丢（否则会积压）；
+		//   · 退出请求（界面上的「退出引擎」按钮）—— 当作"关窗口"；
+		//   · UIAccess 重启请求 —— 预览模式不重启，同样取走即丢。
+		while (IsWindow(g_window)) {
+			R3ShieldCore::Mode m = R3ShieldCore::Mode::Log;
+			(void)TakePendingMode(m);
+			if (TakeQuitRequest()) break;
+			(void)TakeUiAccessRestartRequest();
+			Sleep(100);
+		}
+
+		Stop();
+		printf("[gui-preview] 已退出。\n");
+		return 0;
 	}
 }

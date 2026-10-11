@@ -13,6 +13,25 @@
 #include <mmsystem.h>
 #include <mmdeviceapi.h>
 
+// ★★ v73：摄像头**帧替换**要摸到 `IMFSample` / `IMFMediaBuffer` /
+//    `IMFSourceReader` / `IMFMediaType` 的**真实 vtable 布局**。
+//    手数槽号 = "靠记忆"（本项目在别的面上吃过亏）—— 这里直接引入 SDK 的
+//    接口声明，**让编译器算槽号**，那才是权威。
+//    ⚠️ 已 grep 核实：这几个 MF 头**都不含** `#pragma comment(lib, ...)`
+//       ⇒ 不会给 DLL 引入新的**链接**依赖（`camera_guard.cpp` 里那句
+//       "不 include mfapi.h" 的老注释讲的是"怕拉链接依赖"，实测不成立；
+//       但那时也确实不需要，现在需要了）。
+//    ⚠️ 只在**本文件**引入，不放 stdafx.h —— 别的 guard 不需要，别扩大影响面。
+//    ⚠️ 顺序有讲究：`mfreadwrite.h` 用到 `IMFMediaSource` / `IMFSourceReader`，
+//       所以 `mfidl.h` 必须在它**前面**（否则 C2065/C2275 一片）。
+#include <mfapi.h>
+#include <mfidl.h>
+#include <mfreadwrite.h>
+
+// ★★ 生产与探针**共用同一份**中性帧决策表（铁律 195：同一份逻辑别抄两份）。
+//    `camera_spoof_codec.h` 全 `inline`、不碰 COM、不链库。
+#include "camera_spoof_codec.h"
+
 //
 // 摄像头 / 麦克风访问监控层。
 //
@@ -67,12 +86,19 @@ namespace
 	int g_hookCount = 0;
 	volatile LONG g_activeHooks = 0;
 
-	enum class Action
+	// v74：决策档位收敛到共享 ABI（`R3ShieldCore::Action`，见
+	//   shared/r3shieldcore/r3shieldcore_shared.h）。本文件**不再**自己定义。
+	//   ★ 本面的 `Spoof` 特殊之处：它是**流式**的 —— `Evaluate` 只在
+	//     "建读取器"那一刻返回它，真正的帧替换在 `ReadSample` detour 里
+	//     **逐帧**做（见下面的 v73 段）。档位本身语义与其他面一致。
+	using Action = R3ShieldCore::Action;
+
+	// ★ v73：摄像头帧替换的开关（ini `spoof_camera=1`，默认关）。
+	bool SpoofCameraEnabled() noexcept
 	{
-		Pass,
-		Record,
-		Block,
-	};
+		R3ShieldCore::Policy* policy = R3ShieldCoreChannel::Policy();
+		return policy && (policy->Flags2 & R3ShieldCore::FlagSpoofCamera) != 0;
+	}
 
 	// 我们主动拒绝时给调用方看的错误码。
 	constexpr HRESULT CG_E_ACCESSDENIED = static_cast<HRESULT>(0x80070005L); // E_ACCESSDENIED
@@ -174,9 +200,34 @@ namespace
 		return R3ShieldCore::Verdict::Deny;
 	}
 
+	// ★ v73：与 ScreenGuard / ClipboardGuard 同构的"拒绝 or 替换"分流。
+	//
+	// ⚠️ `canSpoof` 由**调用点**决定，不是全局 —— 只有"能造出合法中性帧"的
+	//    入口才允许升级成替换（铁律 194：造不出合法替代物就回落拒绝）。
+	//    摄像头这一面**只有 `MFCreateSourceReaderFromMediaSource` 一条**能替换：
+	//    它有帧路径（`ReadSample`）。VFW 的帧走 `WM_CAP_*` 消息、设备源本身
+	//    没有帧、音频三路的中性内容是另一套语义 ⇒ 那几条一律回落 `Block`。
+	Action RejectOrSpoof(R3ShieldCore::Event& event, bool canSpoof) noexcept
+	{
+		if (canSpoof && SpoofCameraEnabled()) {
+			event.Decision = static_cast<ULONG>(R3ShieldCore::Decision::Spoofed);
+			event.Flags2 |= R3ShieldCore::FlagEvent2Spoofed;
+			return Action::Spoof;
+		}
+
+		event.Decision = static_cast<ULONG>(R3ShieldCore::Decision::Blocked);
+		event.Flags |= R3ShieldCore::FlagEventBlocked;
+		if (R3ShieldCore::ChannelHeader* channel = R3ShieldCoreChannel::Channel()) {
+			InterlockedIncrement(&channel->HighRiskBlocked);
+		}
+		return Action::Block;
+	}
+
 	// 结果判定。allowAsk 决定高危时能不能真的弹窗 ——
 	// LOG/BLOCK 模式下 UI 线程根本没起，Ask 会白等满超时。
-	Action Evaluate(R3ShieldCore::CameraOp op, R3ShieldCore::Event& event, bool allowAsk) noexcept
+	// canSpoof：见 RejectOrSpoof 的说明（默认 false = 老行为）。
+	Action Evaluate(R3ShieldCore::CameraOp op, R3ShieldCore::Event& event, bool allowAsk,
+		bool canSpoof = false) noexcept
 	{
 		event.ObjectType = static_cast<ULONG>(R3ShieldCore::ObjectType::Camera);
 		event.Op = static_cast<ULONG>(op);
@@ -250,12 +301,8 @@ namespace
 		const bool canAsk = allowAsk && (mode == static_cast<ULONG>(R3ShieldCore::Mode::Ask));
 		if (!canAsk) {
 			if (mode == static_cast<ULONG>(R3ShieldCore::Mode::Block)) {
-				event.Decision = static_cast<ULONG>(R3ShieldCore::Decision::Blocked);
-				event.Flags |= R3ShieldCore::FlagEventBlocked;
-				if (R3ShieldCore::ChannelHeader* channel = R3ShieldCoreChannel::Channel()) {
-					InterlockedIncrement(&channel->HighRiskBlocked);
-				}
-				return Action::Block;
+				// ★ v73：block 模式下的高危拒绝 —— 能替换的入口在这里升级成 Spoof。
+				return RejectOrSpoof(event, canSpoof);
 			}
 
 			event.Decision = static_cast<ULONG>(R3ShieldCore::Decision::WouldBlock);
@@ -284,12 +331,8 @@ namespace
 			return Action::Record;
 		}
 
-		event.Decision = static_cast<ULONG>(R3ShieldCore::Decision::Blocked);
-		event.Flags |= R3ShieldCore::FlagEventBlocked;
-		if (R3ShieldCore::ChannelHeader* channel = R3ShieldCoreChannel::Channel()) {
-			InterlockedIncrement(&channel->HighRiskBlocked);
-		}
-		return Action::Block;
+		// ★ v73：用户点了"拒绝"（或超时按兜底结论）—— 能替换的入口在这里升级成 Spoof。
+		return RejectOrSpoof(event, canSpoof);
 	}
 
 	// KeyPath 里放"目标是哪个设备"，长度字段一并填好。
@@ -418,6 +461,27 @@ namespace
 		return hr;
 	}
 
+	// ★ v73：帧替换的三个动作定义在下面（v73 段）—— 这里先用，所以前置声明。
+	//   **只有 `MFCreateSourceReaderFromMediaSource` 这一条路**会用到它们。
+	bool HasVideoStream(IMFSourceReader* reader) noexcept;
+	bool PatchReaderVtable(IMFSourceReader* reader) noexcept;
+	void MarkSpoofReader(void* reader) noexcept;
+	void PatchAsyncCallbackIfAny(void* attributes) noexcept;
+
+	// ★ 替换**回落**成拒绝时，事件里记的结论必须跟着改 ——
+	//   否则上报里写着 "SPOOF" 而实际返回给调用方的是失败
+	//   （铁律 97：口径必须与实际一致，否则诊断时被自己的日志带错方向；
+	//    铁律 100：「没拦住」要能分开是没看见 / 没规则 / 判据错）。
+	void FallbackSpoofToBlock(R3ShieldCore::Event& event) noexcept
+	{
+		event.Decision = static_cast<ULONG>(R3ShieldCore::Decision::Blocked);
+		event.Flags |= R3ShieldCore::FlagEventBlocked;
+		event.Flags2 &= ~R3ShieldCore::FlagEvent2Spoofed;
+		if (R3ShieldCore::ChannelHeader* channel = R3ShieldCoreChannel::Channel()) {
+			InterlockedIncrement(&channel->HighRiskBlocked);
+		}
+	}
+
 	HRESULT WINAPI MFCreateSourceReaderFromMediaSource_Hook(void* mediaSource, void* attributes, void** reader)
 	{
 		InterlockedIncrement(&g_activeHooks);
@@ -426,7 +490,14 @@ namespace
 		SetTarget(event, L"媒体源读取器（开始取帧）");
 		event.Status = 0;
 
-		const Action action = Evaluate(R3ShieldCore::CameraOp::CreateSourceReader, event, true);
+		// ★ v73：**唯一**允许升级成"替换"的入口。
+		//
+		//   为什么只有它：帧路径（`IMFSourceReader::ReadSample`）**只挂在**
+		//   这个函数返回的对象上。其余四个 hook（VFW W/A、DeviceSource、
+		//   DeviceSourceActivate、EnumDevice）**一律 `canSpoof=false`**
+		//   ⇒ 照旧回落 `Block`（铁律 194：造不出合法替代物就拒绝）。
+		const Action action = Evaluate(R3ShieldCore::CameraOp::CreateSourceReader, event, true,
+			/*canSpoof=*/true);
 		if (action == Action::Block) {
 			event.Status = static_cast<ULONG>(CG_E_ACCESSDENIED);
 			Publish(event);
@@ -435,6 +506,60 @@ namespace
 		}
 
 		const HRESULT hr = pOriginalMFCreateSourceReader(mediaSource, attributes, reader);
+
+		// ★ v73：替换分支 —— 只在"判定为替换"且**真的建出了读取器**时才动。
+		if (action == Action::Spoof && SUCCEEDED(hr) && reader && *reader) {
+			IMFSourceReader* sr = reinterpret_cast<IMFSourceReader*>(*reader);
+
+			// ⚠️⚠️ 铁律 199：MF 里**摄像头与麦克风共用同一套 API** ——
+			//     `MFCreateSourceReaderFromMediaSource` 也是麦克风采集的
+			//     标准入口。我们造不出"中性音频"⇒ **没有视频流就回落拒绝**，
+			//     绝不能把纯音频读取器顺带放行。
+			if (!HasVideoStream(sr)) {
+				sr->Release();
+				*reader = nullptr;
+				FallbackSpoofToBlock(event);
+				event.Status = static_cast<ULONG>(CG_E_ACCESSDENIED);
+				Publish(event);
+				InterlockedDecrement(&g_activeHooks);
+				LOG(L"CameraGuard: 摄像头帧替换未生效（spoof_camera）—— "
+					L"该读取器**没有视频流**（纯音频），本次**回落拒绝**");
+				return CG_E_ACCESSDENIED;
+			}
+
+			// 顺序：先 patch（让**后续帧**走 detour）→ 再标记（决定"这个对象
+			// 的帧要不要换"）→ 最后处理异步回调。
+			//
+			// ⚠️ 两个动作**都要成功**才算"替换生效"：
+			//    只 patch 成功但没标记 ⇒ detour 里 `IsSpoofReader` 为假
+			//    ⇒ 帧**照原样**过去（静默泄露真画面）。
+			//    ⇒ 任一失败就**回落拒绝**（fail-closed，铁律 194）。
+			const bool patched = PatchReaderVtable(sr);
+			if (patched) {
+				MarkSpoofReader(sr);
+			}
+			PatchAsyncCallbackIfAny(attributes);
+
+			if (!patched) {
+				sr->Release();
+				*reader = nullptr;
+				FallbackSpoofToBlock(event);
+				event.Status = static_cast<ULONG>(CG_E_ACCESSDENIED);
+				Publish(event);
+				InterlockedDecrement(&g_activeHooks);
+				LOG(L"CameraGuard: 摄像头帧替换未生效（spoof_camera）—— "
+					L"ReadSample 的 vtable patch 失败，本次**回落拒绝**");
+				return CG_E_ACCESSDENIED;
+			}
+
+			// ★★ 闸门标记：这条日志里必须有 **ASCII 子串 `spoof_camera`**
+			//    （`strings -el` 只输出 ASCII，铁律 193）—— `check_dist_sync.sh`
+			//    靠它验收"生产 DLL 里真的有这段代码"。**别删**。
+			LOG(L"CameraGuard: 摄像头帧替换已挂载（spoof_camera）—— "
+				L"该 reader 的后续帧会被改成中性帧；压缩子类型（MJPG/H264 等）"
+				L"在取帧时**回落拒绝**");
+		}
+
 		event.Status = static_cast<ULONG>(hr);
 		Publish(event);
 
@@ -465,6 +590,600 @@ namespace
 
 		InterlockedDecrement(&g_activeHooks);
 		return hr;
+	}
+
+	// ==================================================================
+	// v73：摄像头「帧替换」
+	// ==================================================================
+	//
+	// ★ 为什么这一段比前三个面复杂：
+	//   屏幕 / 剪贴板 / 注册表都是**单次调用** —— 在 hook 里把回传数据换掉就完了。
+	//   摄像头是**流式**的：真正的帧由 `IMFSourceReader::ReadSample` 产出，
+	//   而它**不是导出函数**（`mfreadwrite.dll` 不导出它）⇒ 只能
+	//   **patch 对象的 vtable**。
+	//   ⇒ 判定在"建读取器"时做一次，替换在"每一帧"做。
+	//
+	// ⚠️ vtable 是**模块级共享**的（同一个 COM 类的所有实例指向同一份数组）
+	//    ⇒ patch 一次，进程内**所有** reader 都会经过我们的 detour。
+	//    所以"要不要替换"必须**按对象**记（`g_spoofReaders`），
+	//    不能靠"patch 过就算数"（那会把别的 reader 也一起换了）。
+	//
+	// ⚠️ 帧的**字节布局与子类型有关**（RGB 全 0 是黑、YUV 全 0 **不是**黑）
+	//    ⇒ 决策表在 `camera_spoof_codec.h`（生产与探针共用一份，铁律 195）。
+
+	typedef HRESULT(STDMETHODCALLTYPE* SourceReaderReadSamplePtr)(
+		IMFSourceReader*, DWORD, DWORD, DWORD*, DWORD*, LONGLONG*, IMFSample**);
+	typedef HRESULT(STDMETHODCALLTYPE* ReaderCallbackOnReadSamplePtr)(
+		void*, HRESULT, DWORD, DWORD, LONGLONG, IMFSample*);
+
+	constexpr int CG_MAX_SPOOF_OBJECTS = 32;
+	// ⚠️ 名字里必须带 `SPOOF`：本文件下面（v13 音频 WASAPI 段）另有一张
+	//    `CG_MAX_PATCHED_VTABLES` 的去重表 —— 同一个匿名命名空间里重名
+	//    直接 C2374「重定义」（**不是** shadow，是硬错）。
+	constexpr int CG_SPOOF_MAX_VTABLES = 16;
+
+	// 已 patch 的 vtable → 它**原来**的 ReadSample。
+	//
+	// ★ 为什么按 vtable 存原件（而不是存一份全局原件）：理论上不同来源的
+	//   reader（FromURL / FromMediaSource / FromByteStream…）可能是**不同的类**
+	//   ⇒ 不同 vtable ⇒ 不同的原函数。存一份全局原件，第二个 vtable 的调用
+	//   就会跳进**第一个**的实现里 —— 那是极隐蔽的错。
+	struct CG_PatchedReaderVtable
+	{
+		void** vtable;
+		void* originalReadSample;
+	};
+	CG_PatchedReaderVtable g_patchedReaderVtables[CG_SPOOF_MAX_VTABLES] = {};
+	int g_patchedReaderVtableCount = 0;
+
+	struct CG_PatchedCallbackVtable
+	{
+		void** vtable;
+		void* originalOnReadSample;
+	};
+	CG_PatchedCallbackVtable g_patchedCallbackVtables[CG_SPOOF_MAX_VTABLES] = {};
+	int g_patchedCallbackVtableCount = 0;
+
+	// 要替换的**对象**（不是 vtable）。满了就不再标记（fail-closed：
+	// 没标记 ⇒ 不替换 ⇒ 帧照原样过去），并打日志 —— 别静默。
+	void* g_spoofReaders[CG_MAX_SPOOF_OBJECTS] = {};
+	int g_spoofReaderCount = 0;
+	void* g_spoofCallbacks[CG_MAX_SPOOF_OBJECTS] = {};
+	int g_spoofCallbackCount = 0;
+
+	// 最近一次解析出来的中性化计划。
+	//
+	// ★ 为什么需要它：**异步读取**（`MF_SOURCE_READER_ASYNC_CALLBACK`）的帧
+	//   不从 `ReadSample` 的 out 参数回来，而是**稍后从回调**交付 —— 而回调
+	//   签名里**没有 reader**，查不到媒体类型。
+	//   ⇒ `ReadSample` detour 每次把解析结果存这里，回调 detour 取用。
+	//   ⚠️ 用 **seqlock**（写者两次自增、读者比对奇偶与序号）跨线程读写这个
+	//      POD —— 不用锁，也不会读到"写了一半"的值。
+	volatile LONG g_planSeq = 0;
+	R3ShieldCoreCameraSpoof::NeutralPlan g_lastPlan = {};
+	bool g_lastPlanValid = false;
+
+	volatile LONG g_spoofFrames = 0;        // 已中性化的帧数（同步路径）
+	volatile LONG g_spoofAsyncFrames = 0;   // 已中性化的帧数（异步回调路径）
+	volatile LONG g_spoofDeniedFrames = 0;  // 因"子类型不支持"而拒绝的帧数
+	volatile LONG g_spoofFailures = 0;      // 拿不到缓冲区（未能替换）
+
+	// ---- 槽号（**实测钉死 + 运行时前提检查**，不靠"应该没错"）----
+	//
+	// `IMFSourceReader`（IUnknown 占 0~2）：
+	//   3 GetStreamSelection 4 SetStreamSelection 5 GetNativeMediaType
+	//   6 GetCurrentMediaType 7 SetCurrentMediaType 8 SetCurrentPosition
+	//   9 **ReadSample** 10 Flush 11 GetServiceForStream 12 GetPresentationAttribute
+	//
+	// ★ 9 这个数字不是"按文档推的"：`tools/spoof_camera_probe.cpp` 里有一条
+	//   **实测判据**（A4）—— `vt[9]` 必须落在 `mfreadwrite.dll` 的模块范围内，
+	//   否则 FAIL。本文件在 patch 前也做**同样的检查**（`vt[9]` 不在
+	//   mfreadwrite.dll 里就**拒绝 patch** 并打日志）—— 宁可功能不生效，
+	//   也不能把错误的函数指针换掉（那会让调用方跳进别的函数，直接崩）。
+	//
+	// `IMFSourceReaderCallback`（IUnknown 占 0~2）：
+	//   3 **OnReadSample** 4 OnFlush 5 OnEvent
+	//   ⚠️ 回调的 vtable 属于**调用方自己的类**（不在 mfreadwrite.dll 里），
+	//      所以做不了"落在某模块内"的检查。它只在异步模式下被 patch，
+	//      且有独立探针覆盖（见 docs）。
+	constexpr int CG_SLOT_READSAMPLE = 9;
+	constexpr int CG_SLOT_ONREADSAMPLE = 3;
+
+	// 前向声明（定义在下面；detour 要用）。
+	void* OriginalReadSampleFor(void* self) noexcept;
+	void* OriginalOnReadSampleFor(void* self) noexcept;
+
+	bool IsPtrInModule(HMODULE module, const void* p) noexcept
+	{
+		if (!module || !p) {
+			return false;
+		}
+		MODULEINFO mi = {};
+		if (!GetModuleInformation(GetCurrentProcess(), module, &mi, sizeof(mi))) {
+			return false;
+		}
+		const BYTE* lo = static_cast<const BYTE*>(mi.lpBaseOfDll);
+		const BYTE* hi = lo + mi.SizeOfImage;
+		const BYTE* fn = static_cast<const BYTE*>(p);
+		return fn >= lo && fn < hi;
+	}
+
+	void StoreLastPlan(const R3ShieldCoreCameraSpoof::NeutralPlan& plan) noexcept
+	{
+		InterlockedIncrement(&g_planSeq);   // → 奇数：写入中
+		g_lastPlan = plan;
+		g_lastPlanValid = true;
+		InterlockedIncrement(&g_planSeq);   // → 偶数：稳定
+	}
+
+	void InvalidateLastPlan() noexcept
+	{
+		InterlockedIncrement(&g_planSeq);
+		g_lastPlanValid = false;
+		InterlockedIncrement(&g_planSeq);
+	}
+
+	bool LoadLastPlan(R3ShieldCoreCameraSpoof::NeutralPlan& out) noexcept
+	{
+		for (int attempt = 0; attempt < 8; ++attempt) {
+			const LONG s1 = InterlockedCompareExchange(&g_planSeq, 0, 0);
+			if (s1 & 1) {
+				continue;   // 正在写 ⇒ 重试
+			}
+			const R3ShieldCoreCameraSpoof::NeutralPlan snapshot = g_lastPlan;
+			const bool valid = g_lastPlanValid;
+			const LONG s2 = InterlockedCompareExchange(&g_planSeq, 0, 0);
+			if (s1 == s2) {
+				if (!valid) {
+					return false;
+				}
+				out = snapshot;
+				return true;
+			}
+		}
+		return false;
+	}
+
+	bool IsSpoofReader(void* reader) noexcept
+	{
+		for (int i = 0; i < g_spoofReaderCount; ++i) {
+			if (g_spoofReaders[i] == reader) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	void MarkSpoofReader(void* reader) noexcept
+	{
+		if (!reader || IsSpoofReader(reader)) {
+			return;
+		}
+		if (g_spoofReaderCount >= CG_MAX_SPOOF_OBJECTS) {
+			LOG(L"CameraGuard: 待替换 reader 表已满（%d），本次不再标记 —— 该 reader 的帧不会被替换",
+				CG_MAX_SPOOF_OBJECTS);
+			return;
+		}
+		g_spoofReaders[g_spoofReaderCount++] = reader;
+	}
+
+	bool IsSpoofCallback(void* cb) noexcept
+	{
+		for (int i = 0; i < g_spoofCallbackCount; ++i) {
+			if (g_spoofCallbacks[i] == cb) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	void MarkSpoofCallback(void* cb) noexcept
+	{
+		if (!cb || IsSpoofCallback(cb)) {
+			return;
+		}
+		if (g_spoofCallbackCount >= CG_MAX_SPOOF_OBJECTS) {
+			return;
+		}
+		g_spoofCallbacks[g_spoofCallbackCount++] = cb;
+	}
+
+	// ---- 前置检查：这个 reader 有没有**视频流** ----
+	//
+	// ★ 为什么必须有这一步：MF 里**摄像头与麦克风共用同一套 API** ——
+	//   `MFCreateSourceReaderFromMediaSource` 也是麦克风采集的标准入口。
+	//   若不加这一步，`spoof_camera=1` 会把**纯音频**读取器也放行
+	//   （我们造不出"中性音频"）—— 那就是"放宽一个开关顺带打开别的行为"
+	//   （铁律 199）。⇒ 没有视频流 ⇒ 回落 `Block`。
+	bool HasVideoStream(IMFSourceReader* reader) noexcept
+	{
+		if (!reader) {
+			return false;
+		}
+		__try {
+			IMFMediaType* mt = nullptr;
+			const HRESULT hr = reader->GetNativeMediaType(
+				static_cast<DWORD>(MF_SOURCE_READER_FIRST_VIDEO_STREAM), 0, &mt);
+			if (mt) {
+				mt->Release();
+			}
+			return SUCCEEDED(hr);
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER) {
+			return false;
+		}
+	}
+
+	// ---- 从 reader 的**实际**媒体类型解析中性化计划 ----
+	//
+	// 返回： 1 = 视频且子类型支持（可以替换）
+	//        0 = 非视频流 / 拿不到媒体类型（**放行**，不猜）
+	//       -1 = 视频但子类型**不支持**（调用方回落**拒绝**，铁律 194/196）
+	//
+	// ⚠️ **每帧都解析**，不做缓存：媒体类型可能在 `SetCurrentMediaType` 之后
+	//    变（实测：真实设备建读取器时给 YUY2，应用随后设成 RGB32）。
+	//    缓存 + 失效是一类经典 bug（忘了失效 ⇒ 用旧计划填新帧），
+	//    而这里每帧多一次 `GetCurrentMediaType` 的代价可以接受。
+	int ResolveFramePlan(IMFSourceReader* reader, DWORD streamIndex,
+		R3ShieldCoreCameraSpoof::NeutralPlan& out) noexcept
+	{
+		if (!reader) {
+			return 0;
+		}
+		__try {
+			IMFMediaType* mt = nullptr;
+			if (FAILED(reader->GetCurrentMediaType(streamIndex, &mt)) || !mt) {
+				return 0;
+			}
+
+			GUID major = {}, sub = {};
+			mt->GetGUID(MF_MT_MAJOR_TYPE, &major);
+			if (major != MFMediaType_Video) {
+				mt->Release();
+				return 0;   // 音频流：不归本开关管（音频在 IAudioClient::Initialize 处单独判）
+			}
+			mt->GetGUID(MF_MT_SUBTYPE, &sub);
+
+			UINT32 w = 0, h = 0;
+			MFGetAttributeSize(mt, MF_MT_FRAME_SIZE, &w, &h);
+
+			// ⚠️ `MF_MT_DEFAULT_STRIDE` 对**自下而上**的帧是**负数**
+			//    （那是"行序"的表示，不是"步长是负的"）—— codec 里取绝对值。
+			INT32 stride = 0;
+			(void)mt->GetUINT32(MF_MT_DEFAULT_STRIDE, reinterpret_cast<UINT32*>(&stride));
+
+			mt->Release();
+
+			R3ShieldCoreCameraSpoof::SpoofGuid g = {};
+			g.Data1 = sub.Data1;
+			g.Data2 = sub.Data2;
+			g.Data3 = sub.Data3;
+			memcpy(g.Data4, sub.Data4, sizeof(g.Data4));
+
+			const R3ShieldCoreCameraSpoof::VideoFormat fmt =
+				R3ShieldCoreCameraSpoof::ClassifyFormat(g);
+
+			if (R3ShieldCoreCameraSpoof::PlanForFormat(fmt, w, h, stride, out)) {
+				return 1;
+			}
+			return -1;
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER) {
+			return 0;
+		}
+	}
+
+	// ---- 把一帧原地改成中性帧（**长度一个都不改**）----
+	//
+	// ⚠️ 用 `GetBufferByIndex(0)` 优先，失败再 `ConvertToContiguousBuffer` ——
+	//    多缓冲的 sample 必须先转连续，否则我们只改了第一个缓冲。
+	bool NeutralizeSample(IMFSample* sample,
+		const R3ShieldCoreCameraSpoof::NeutralPlan& plan) noexcept
+	{
+		if (!sample) {
+			return false;
+		}
+		__try {
+			IMFMediaBuffer* buf = nullptr;
+			if (FAILED(sample->GetBufferByIndex(0, &buf)) || !buf) {
+				if (FAILED(sample->ConvertToContiguousBuffer(&buf)) || !buf) {
+					return false;
+				}
+			}
+
+			BYTE* p = nullptr;
+			DWORD maxLen = 0, curLen = 0;
+			if (FAILED(buf->Lock(&p, &maxLen, &curLen)) || !p || curLen == 0) {
+				buf->Release();
+				return false;
+			}
+
+			// ★ 只写 [0, curLen)：`SetCurrentLength` / `maxLen` 一个都不动。
+			R3ShieldCoreCameraSpoof::ApplyNeutral(p, curLen, plan);
+
+			buf->Unlock();
+			buf->Release();
+			return true;
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER) {
+			return false;
+		}
+	}
+
+	// ---- detour：IMFSourceReader::ReadSample（槽号 9）----
+	HRESULT STDMETHODCALLTYPE ReadSample_Detour(IMFSourceReader* self, DWORD index, DWORD flags,
+		DWORD* actualIndex, DWORD* streamFlags, LONGLONG* timestamp, IMFSample** sample)
+	{
+		SourceReaderReadSamplePtr real = reinterpret_cast<SourceReaderReadSamplePtr>(
+			OriginalReadSampleFor(self));
+		if (!real) {
+			return CG_E_ACCESSDENIED;
+		}
+
+		const HRESULT hr = real(self, index, flags, actualIndex, streamFlags, timestamp, sample);
+
+		// ★ vtable 是共享的 ⇒ 这个 detour 会服务进程内**所有** reader。
+		//   只有被显式标记过的才处理（其余原样返回）。
+		if (!IsSpoofReader(self)) {
+			return hr;
+		}
+
+		DWORD sidx = index;
+		if (index == static_cast<DWORD>(MF_SOURCE_READER_ANY_STREAM) && actualIndex) {
+			sidx = *actualIndex;
+		}
+
+		R3ShieldCoreCameraSpoof::NeutralPlan plan = {};
+		const int r = ResolveFramePlan(self, sidx, plan);
+		if (r == 1) {
+			StoreLastPlan(plan);   // 异步回调路径要用
+		}
+		else if (r < 0) {
+			InvalidateLastPlan();
+		}
+
+		if (FAILED(hr) || !sample || !*sample) {
+			// 异步模式：帧稍后从回调交付，计划已经存好了。
+			return hr;
+		}
+
+		if (r == 0) {
+			// 非视频流（或拿不到类型）：放行。音频不归本开关管。
+			return hr;
+		}
+
+		if (r < 0) {
+			// ★ 视频但子类型**不支持**（MJPG / H264 …）⇒ **回落拒绝**。
+			//   压缩帧里填 16/128 得到的是"一帧解不出来的垃圾"：
+			//   既不是黑帧，又可能让下游解码器报错 —— 宁可拒绝，不可硬造
+			//   （铁律 194/196）。调用方会看到"读取失败"。
+			(*sample)->Release();
+			*sample = nullptr;
+			if (streamFlags) {
+				*streamFlags = 0;
+			}
+			const LONG n = InterlockedIncrement(&g_spoofDeniedFrames);
+			if (n == 1) {
+				LOG(L"CameraGuard: 摄像头帧替换未生效 —— 子类型不在支持表里"
+					L"（spoof_camera，stream=%u），本次**回落拒绝**（返回失败）",
+					sidx);
+			}
+			return CG_E_ACCESSDENIED;
+		}
+
+		if (NeutralizeSample(*sample, plan)) {
+			const LONG n = InterlockedIncrement(&g_spoofFrames);
+			if (n == 1) {
+				LOG(L"CameraGuard: 摄像头帧替换已生效（spoof_camera）—— "
+					L"格式=%S stream=%u，调用方拿到的是**中性帧**（不是真画面）",
+					R3ShieldCoreCameraSpoof::FormatName(plan.format), sidx);
+			}
+		}
+		else {
+			InterlockedIncrement(&g_spoofFailures);
+		}
+		return hr;
+	}
+
+	// ---- detour：IMFSourceReaderCallback::OnReadSample（槽号 3）----
+	//
+	// ★ 异步读取（`MF_SOURCE_READER_ASYNC_CALLBACK`）的帧从这里交付 ——
+	//   不覆盖它，异步模式就会**静默泄露**真画面。
+	HRESULT STDMETHODCALLTYPE OnReadSample_Detour(void* self, HRESULT hrStatus, DWORD streamIndex,
+		DWORD streamFlags, LONGLONG timestamp, IMFSample* sample)
+	{
+		ReaderCallbackOnReadSamplePtr real = reinterpret_cast<ReaderCallbackOnReadSamplePtr>(
+			OriginalOnReadSampleFor(self));
+		if (!real) {
+			return hrStatus;
+		}
+
+		if (!IsSpoofCallback(self) || FAILED(hrStatus) || !sample) {
+			return real(self, hrStatus, streamIndex, streamFlags, timestamp, sample);
+		}
+
+		// ★ 顺序不能反：**先替换，再交给调用方**。反了调用方就先看到真帧了。
+		R3ShieldCoreCameraSpoof::NeutralPlan plan = {};
+		if (LoadLastPlan(plan) && NeutralizeSample(sample, plan)) {
+			InterlockedIncrement(&g_spoofAsyncFrames);
+		}
+		else {
+			// ★ 拿不到计划 / 改不动 ⇒ **回落拒绝**：把这次交付改成失败，
+			//   而不是把真帧递出去（fail-closed，铁律 194）。
+			InterlockedIncrement(&g_spoofFailures);
+			return real(self, CG_E_ACCESSDENIED, streamIndex, streamFlags, timestamp, nullptr);
+		}
+
+		return real(self, hrStatus, streamIndex, streamFlags, timestamp, sample);
+	}
+
+	// ---- vtable patch ----
+	void* OriginalReadSampleFor(void* self) noexcept
+	{
+		__try {
+			void** vt = *reinterpret_cast<void***>(self);
+			for (int i = 0; i < g_patchedReaderVtableCount; ++i) {
+				if (g_patchedReaderVtables[i].vtable == vt) {
+					return g_patchedReaderVtables[i].originalReadSample;
+				}
+			}
+			return nullptr;
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER) {
+			return nullptr;
+		}
+	}
+
+	void* OriginalOnReadSampleFor(void* self) noexcept
+	{
+		__try {
+			void** vt = *reinterpret_cast<void***>(self);
+			for (int i = 0; i < g_patchedCallbackVtableCount; ++i) {
+				if (g_patchedCallbackVtables[i].vtable == vt) {
+					return g_patchedCallbackVtables[i].originalOnReadSample;
+				}
+			}
+			return nullptr;
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER) {
+			return nullptr;
+		}
+	}
+
+	bool PatchReaderVtable(IMFSourceReader* reader) noexcept
+	{
+		if (!reader) {
+			return false;
+		}
+		__try {
+			void** vt = *reinterpret_cast<void***>(reader);
+			if (!vt) {
+				return false;
+			}
+			for (int i = 0; i < g_patchedReaderVtableCount; ++i) {
+				if (g_patchedReaderVtables[i].vtable == vt) {
+					return true;   // 同一个类 ⇒ 已 patch 过
+				}
+			}
+			if (g_patchedReaderVtableCount >= CG_SPOOF_MAX_VTABLES) {
+				return false;
+			}
+
+			// ⚠️ 槽号用**常量**（`CG_SLOT_READSAMPLE`），**不用**
+			//    `&IMFSourceReader::ReadSample` 去算 —— 成员函数指针在 MSVC 上
+			//    **不能** `reinterpret_cast` 成整数（C2440：虚函数的成员指针
+			//    不是"一个地址"，而是"槽号 + this 调整"的打包表示，大小也不是
+			//    指针大小）。这个常量由**探针实测钉死**（A4 判据），下面的模块
+			//    范围检查是第二道保险 —— **两道都过才敢换指针**。
+			const int slot = CG_SLOT_READSAMPLE;
+
+			// ★★ 运行时**前提检查**：`vt[slot]` 必须落在 `mfreadwrite.dll` 内。
+			//
+			//   为什么不能只靠"槽号 9 是对的"：`IMFSourceReader` 是**接口** ——
+			//   不同来源的 reader 可能是**不同的类**实现的。把错误的函数指针
+			//   换掉 = 让调用方跳进**别的函数**（直接崩）。
+			//   ⇒ 检查不过就**拒绝 patch**：宁可功能不生效（随后回落拒绝），
+			//     也绝不能换错指针（铁律 117：判据要有前提检查）。
+			//   ⚠️ 与探针 A4 判据**同一套口径**（`tools/spoof_camera_probe.cpp`）。
+			if (!IsPtrInModule(GetModuleHandleW(L"mfreadwrite.dll"), vt[slot])) {
+				LOG(L"CameraGuard: 拒绝 patch IMFSourceReader vtable —— "
+					L"槽 %d 的指针不在 mfreadwrite.dll 内（vtable=%p, fn=%p）",
+					slot, static_cast<void*>(vt), vt[slot]);
+				return false;
+			}
+
+			DWORD oldProtect = 0;
+			if (!VirtualProtect(&vt[slot], sizeof(void*), PAGE_READWRITE, &oldProtect)) {
+				LOG(L"CameraGuard: IMFSourceReader vtable 改保护失败 err=%u", GetLastError());
+				return false;
+			}
+			g_patchedReaderVtables[g_patchedReaderVtableCount].vtable = vt;
+			g_patchedReaderVtables[g_patchedReaderVtableCount].originalReadSample = vt[slot];
+			vt[slot] = reinterpret_cast<void*>(&ReadSample_Detour);
+
+			DWORD ignored = 0;
+			VirtualProtect(&vt[slot], sizeof(void*), oldProtect, &ignored);
+
+			g_patchedReaderVtableCount++;
+			LOG(L"CameraGuard: IMFSourceReader::ReadSample 已 patch（vtable=%p，槽=%d，累计 %d）",
+				vt, slot, g_patchedReaderVtableCount);
+			return true;
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER) {
+			LOG(L"CameraGuard: patch IMFSourceReader vtable 异常");
+			return false;
+		}
+	}
+
+	bool PatchCallbackVtable(void* callback) noexcept
+	{
+		if (!callback) {
+			return false;
+		}
+		__try {
+			void** vt = *reinterpret_cast<void***>(callback);
+			if (!vt) {
+				return false;
+			}
+			for (int i = 0; i < g_patchedCallbackVtableCount; ++i) {
+				if (g_patchedCallbackVtables[i].vtable == vt) {
+					return true;
+				}
+			}
+			if (g_patchedCallbackVtableCount >= CG_SPOOF_MAX_VTABLES) {
+				return false;
+			}
+
+			// ⚠️ 同 `PatchReaderVtable`：成员函数指针**不能**转成整数 ⇒
+			//    用实测钉死的常量。回调的 vtable 属于**调用方自己的类**，
+			//    做不了"落在某模块内"的检查 ⇒ 它是唯一没有第二道保险的一处，
+			//    靠探针（Part C/D）覆盖。
+			const int slot = CG_SLOT_ONREADSAMPLE;
+
+			DWORD oldProtect = 0;
+			if (!VirtualProtect(&vt[slot], sizeof(void*), PAGE_READWRITE, &oldProtect)) {
+				return false;
+			}
+			g_patchedCallbackVtables[g_patchedCallbackVtableCount].vtable = vt;
+			g_patchedCallbackVtables[g_patchedCallbackVtableCount].originalOnReadSample = vt[slot];
+			vt[slot] = reinterpret_cast<void*>(&OnReadSample_Detour);
+
+			DWORD ignored = 0;
+			VirtualProtect(&vt[slot], sizeof(void*), oldProtect, &ignored);
+
+			g_patchedCallbackVtableCount++;
+			LOG(L"CameraGuard: IMFSourceReaderCallback::OnReadSample 已 patch（vtable=%p，槽=%d）",
+				vt, slot);
+			return true;
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER) {
+			return false;
+		}
+	}
+
+	// 如果调用方用的是**异步回调**模式，把回调的 OnReadSample 也 patch 掉
+	// （否则异步交付的帧会绕过我们的 ReadSample detour —— 静默泄露）。
+	void PatchAsyncCallbackIfAny(void* attributes) noexcept
+	{
+		if (!attributes) {
+			return;
+		}
+		__try {
+			IMFAttributes* attr = reinterpret_cast<IMFAttributes*>(attributes);
+			IUnknown* cb = nullptr;
+			if (FAILED(attr->GetUnknown(MF_SOURCE_READER_ASYNC_CALLBACK,
+				__uuidof(IUnknown), reinterpret_cast<void**>(&cb))) || !cb) {
+				return;   // 同步模式：不需要
+			}
+			MarkSpoofCallback(cb);
+			PatchCallbackVtable(cb);
+			// ⚠️ 标记表里存的是**裸地址**，只用来比相等 —— 不 deref，
+			//    所以这里可以立刻释放我们这次拿到的引用（回调的生命周期由
+			//    reader 持有）。
+			cb->Release();
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER) {
+		}
 	}
 
 	// ------------------------------------------------------------------

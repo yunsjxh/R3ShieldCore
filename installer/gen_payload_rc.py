@@ -64,6 +64,7 @@ DIST_FILES = [
     "verify-v26.bat",
     "netcheck-diag.bat",
     "dskill.exe",
+    "r3shieldcore-cfg.exe",
     "配置详解.md",
     "模式选择说明.md",
     "部署指南.md",
