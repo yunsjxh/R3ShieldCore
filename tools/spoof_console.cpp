@@ -41,6 +41,7 @@
 #include "clipboard_spoof_codec.h"    // v70：剪贴板替换（生产同款，不抄）
 #include <r3shieldcore/rules_codec.h>   // v76：规则引擎（与主程序「高级」页签同源）
 #include <r3shieldcore/spoof_apply_codec.h>   // v77：判定 -> 字节怎么落地（两处同源）
+#include <r3shieldcore/advanced_quiz.h>       // v78：闸门三题（与「高级」页同源）
 
 #pragma comment(lib, "ktmw32.lib")
 
@@ -263,7 +264,7 @@ static ULONG QueryKeyPathImpl(HANDLE key, WCHAR* out, ULONG capacity)
 	//   `R3ShieldCore/shared/r3shieldcore/rules_codec.h`
 	//   （铁律 195：控制台 / 主程序「高级」页签 / 引擎侧 三处共用同一份，不许抄）。
 	//   这里只留一个别名，让下面所有 `RRule::xxx` 的调用一字不改。
-	namespace RRule = R3ShieldCoreRules;
+	namespace RRule = R3ShieldCoreRuleScript;
 
 // ================================================================== detour：准入
 static LONG NTAPI NtOpenKey_Detour(PHANDLE KeyHandle, ACCESS_MASK Access, const ProbeObjectAttributes* Oa)
@@ -866,61 +867,13 @@ static void Compare(const WCHAR* which)
 }
 
 // ================================================================== 闸门：三道 Win32 题
-struct QuizQ
-{
-	const WCHAR* text;
-	const WCHAR* opt[4];
-	WCHAR answer;        // 'A'..'D'
-	const WCHAR* why;
-};
-
-static const QuizQ kQuiz[3] = {
-	{
-		L"NtOpenKey / NtOpenKeyTransacted 把**预定义伪句柄**（HKEY_CURRENT_USER /\n"
-		L"    HKEY_LOCAL_MACHINE 这类固定常量）当作 RootDirectory 传进去，会返回什么？",
-		{
-			L"STATUS_OBJECT_NAME_NOT_FOUND   (0xC0000034)",
-			L"STATUS_ACCESS_DENIED           (0xC0000022)",
-			L"STATUS_INVALID_HANDLE          (0xC0000008)",
-			L"STATUS_INVALID_PARAMETER       (0xC000000D)",
-		},
-		L'C',
-		L"`Nt*` 层**不吃**伪句柄。advapi32 的 RegOpenKeyExW(HKEY_CURRENT_USER, ...) 能跑，\n"
-		L"    是因为它**自己**先把伪句柄换成了真句柄 —— 这个替换把坑盖住了。\n"
-		L"    Nt* 只有两条路：① RootDirectory=真键句柄 + 相对名；② RootDirectory=NULL +\n"
-		L"    绝对 NT 路径（\\REGISTRY\\USER\\<SID>\\...）。"
-	},
-	{
-		L"COM 接口的 vtable 在**同一个模块内是按类共享**的。现在只想对某个实例生效，\n"
-		L"    给 IMediaSample::GetPointer 做 inline patch：\"要不要替换\"按什么记？原件按什么存？",
-		{
-			L"标记按 vtable 记，原件按实例存",
-			L"标记按实例记，原件按 vtable 存",
-			L"每个实例各自 patch 一份自己的 vtable 就行，不用记",
-			L"vtable 每个实例独立，怎么记都一样",
-		},
-		L'B',
-		L"vtable 是**模块级共享**的：patch 一次，所有实例一起变。所以必须\n"
-		L"    「补丁全局、策略逐对象」—— 要不要替换按**实例**记；\n"
-		L"    而原件必须按 **vtable** 存，否则第二个实例再来 patch 时，\n"
-		L"    会把**已经被改过**的地址当成「原件」存下来，链就断了。"
-	},
-	{
-		L"32 位进程在 64 位 Windows 上执行\n"
-		L"        RegOpenKeyExW(HKEY_LOCAL_MACHINE, L\"SOFTWARE\\\\Foo\", 0, KEY_READ, &h)\n"
-		L"    不带任何 KEY_WOW64_* 标志时，实际读的是哪个键？想强制读 64 位那份要怎么办？",
-		{
-			L"默认读 WOW6432Node 那份；加 KEY_WOW64_64KEY 才能读 64 位那份",
-			L"默认读 64 位那份；加 KEY_WOW64_32KEY 才能读 WOW6432Node",
-			L"默认读 WOW6432Node 那份；只能把 Wow6432Node 写进路径才能读到 64 位那份",
-			L"由应用程序清单决定，与 KEY_WOW64_* 无关",
-		},
-		L'A',
-		L"WOW64 默认把 32 位进程的 HKLM\\SOFTWARE 重定向到 HKLM\\SOFTWARE\\WOW6432Node。\n"
-		L"    KEY_WOW64_64KEY 强制走 64 位视图，KEY_WOW64_32KEY 强制走 32 位视图。\n"
-		L"    （注意 HKCU 也重定向，但只对 HKCU\\Software\\Classes 那一段。）"
-	},
-};
+//
+// ★ v78：题目与解析**不再写在这里** —— 提到 `shared/r3shieldcore/advanced_quiz.h`，
+//   因为主程序「高级」页用的是**同一套题**（页内问答）。抄两份必然漂
+//   （铁律 127）：漂了之后"控制台过了、界面过不了"，而两边都不会报错。
+using QuizQ = R3ShieldCoreQuiz::Question;
+static const QuizQ* kQuiz = R3ShieldCoreQuiz::Questions();
+static constexpr int kQuizCount = 3;
 
 // 读一个 A/B/C/D。返回 0 表示这一轮不合法 / 用户要退出（*quit = true）。
 static WCHAR AskOne(const QuizQ& q, int index, bool* quit)
@@ -970,7 +923,7 @@ static bool RunQuiz()
 
 		WCHAR given[3] = {};
 		bool quit = false;
-		for (int i = 0; i < 3; ++i) {
+		for (int i = 0; i < kQuizCount; ++i) {
 			WCHAR c = 0;
 			while (c == 0) {
 				c = AskOne(kQuiz[i], i, &quit);

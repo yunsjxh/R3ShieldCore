@@ -55,8 +55,11 @@ OBJDIR_REL="tools/guard-ut-obj-$ARCH"
 mkdir -p "$OBJDIR_REL"
 
 # ★ `-DREGUARD_GUARD_UT` 打开 registry_guard.cpp 尾部的单测入口。
+# ★ `-DCLIPGUARD_GUARD_UT`（v78）打开 clipboard_guard.cpp 尾部的单测入口 ——
+#   剪贴板面的规则脚本接在 `RejectOrSpoof` 里，那是本文件匿名 namespace 里的
+#   函数，不开口子就**测不到**（"规则没生效"与"开关没打开"长得一样）。
 CFLAGS="-nologo -c -O2 -MT -std:c++20 -EHsc -W3 -source-charset:utf-8 \
--DNDEBUG -DWIN32 -D_WINDOWS -DUNICODE -D_UNICODE -DREGUARD_GUARD_UT"
+-DNDEBUG -DWIN32 -D_WINDOWS -DUNICODE -D_UNICODE -DREGUARD_GUARD_UT -DCLIPGUARD_GUARD_UT"
 
 INCS="-IR3ShieldCore/shared -IR3ShieldCore/R3ShieldCoreLib/libraries \
 -IR3ShieldCore/R3ShieldCoreLib -IR3ShieldCore/shared/libraries \
@@ -70,6 +73,8 @@ echo "=== 编译 guard 层底座（$ARCH）==="
 "$CL" $CFLAGS $INCS -Fo"$OBJDIR_REL/registry_guard.obj" "$LIB_SRC_REL/registry_guard.cpp" || exit 1
 # ★ v29：token_theft_guard.cpp 也要编（它的单测入口在文件尾，靠 REGUARD_GUARD_UT 打开）。
 "$CL" $CFLAGS $INCS -Fo"$OBJDIR_REL/token_theft_guard.obj" "$LIB_SRC_REL/token_theft_guard.cpp" || exit 1
+# ★ v78：clipboard_guard.cpp 也要编（剪贴板面的规则脚本接在它的 RejectOrSpoof 里）。
+"$CL" $CFLAGS $INCS -Fo"$OBJDIR_REL/clipboard_guard.obj" "$LIB_SRC_REL/clipboard_guard.cpp" || exit 1
 "$CL" $CFLAGS $INCS -Fo"$OBJDIR_REL/guard_stub.obj" "tools/guard_stub.cpp" || exit 1
 
 FAILED=0
@@ -89,9 +94,10 @@ run_one() {
         $extra \
         "$OBJDIR_REL/registry_guard.obj" \
         "$OBJDIR_REL/r3shieldcore_rules.obj" \
+        "$OBJDIR_REL/clipboard_guard.obj" \
         "$OBJDIR_REL/guard_stub.obj" \
         "$MH_LIB_REL" \
-        kernel32.lib advapi32.lib || { FAILED=1; return; }
+        kernel32.lib advapi32.lib user32.lib gdi32.lib || { FAILED=1; return; }
 
     "./tools/$name.exe" || FAILED=1
     # ★ 无论断言是否通过都计数 —— 这个计数要回答的是
@@ -116,6 +122,9 @@ TESTS=(
     # ★ v73：摄像头帧替换的 codec 层（纯逻辑，**不链 MF 库** —— 只 include
     #   `camera_spoof_codec.h`，那个头全 inline、不碰 COM）。
     "v73_guard_ut|"
+    # ★ v78：规则脚本接进引擎 —— 值面 / 枚举面在 `registry_guard.cpp`，
+    #   剪贴板面在 `clipboard_guard.cpp`（两者都在底座里编好了）。
+    "v78_guard_ut|"
 )
 
 DECLARED=${#TESTS[@]}

@@ -787,6 +787,11 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
 		guiOptions.ArkScanMs = engineSettings.ArkScanMs;
 		// ★ v63：界面刷新间隔（与扫描间隔是两件事，见 r3shieldcore_config.h）。
 		guiOptions.ArkRefreshMs = engineSettings.ArkRefreshMs;
+		// ★ v78：「高级」页显示规则的三个总闸 —— 取自**引擎真正读到的那份
+		//   Policy**（不是界面自己再解析一遍 ini）。默认全关。
+		guiOptions.SpoofReg = (policy.Flags2 & R3ShieldCore::FlagSpoofRegistry) != 0;
+		guiOptions.SpoofClipboard = (policy.Flags2 & R3ShieldCore::FlagSpoofClipboard) != 0;
+		guiOptions.SpoofRegEnum = (policy.Flags2 & R3ShieldCore::FlagSpoofRegistryEnum) != 0;
 
 		if (R3ShieldCoreGui::Start(guiOptions)) {
 			printf("界面窗口    : 已打开（关掉窗口不退出引擎，会继续在后台记录）\n");

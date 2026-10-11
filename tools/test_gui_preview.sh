@@ -14,8 +14,17 @@
 #   在这里都不需要。
 #
 # 用法:
-#   bash tools/test_gui_preview.sh                 # 只看 advanced（默认）
-#   bash tools/test_gui_preview.sh advanced ark    # 指定若干页签
+#   bash tools/test_gui_preview.sh                          # 默认跑「高级」页的**三屏**
+#   bash tools/test_gui_preview.sh advanced ark             # 指定若干页签
+#   bash tools/test_gui_preview.sh advanced:editor          # 指定「高级」页的状态
+#
+# ★ v78：「高级」页有**三个互斥的界面状态**（闸门未过 / 刚全对 / 已解锁编辑台），
+#   光截一张只能证明其中一屏。所以默认把三屏都截 + 各自断言：
+#     advanced         -> 闸门屏（三道题）
+#     advanced:why     -> 解析屏（刚全对）
+#     advanced:editor  -> 编辑台（规则表 + 模板芯片 + 原生 EDIT）
+#   页签与状态用 `:` 分隔；不带 `:` 就是该页签的默认状态。
+#   负对照仍然是 `ark`（非「高级」页时那一页不该被画到）。
 #
 set -u
 
@@ -33,9 +42,9 @@ EXE="$DEMO/BuildCheck/R3 ShieldCore.exe"
 PROBE="$ROOT/tools/gui_preview_probe.exe"
 SHOTS="$ROOT/docs/shots"
 
-TABS=("$@")
-if [ "${#TABS[@]}" -eq 0 ]; then
-    TABS=(advanced)
+SPECS=("$@")
+if [ "${#SPECS[@]}" -eq 0 ]; then
+    SPECS=(advanced advanced:why advanced:editor)
 fi
 
 cd "$ROOT" || exit 1
@@ -61,14 +70,22 @@ fi
 mkdir -p "$SHOTS"
 
 echo ""
-echo "=== [3/4] 逐页签：起预览 -> 截图 -> 断言 ==="
+echo "=== [3/4] 逐规格：起预览 -> 截图 -> 断言 ==="
 rc_all=0
-for tab in "${TABS[@]}"; do
+for spec in "${SPECS[@]}"; do
+    tab="${spec%%:*}"
+    mode=""
+    case "$spec" in
+        *:*) mode="${spec#*:}" ;;
+    esac
+    # 截图文件名带上状态，否则三屏会互相覆盖（只剩最后一张）。
+    label="$tab"
+    [ -n "$mode" ] && label="$tab-$mode"
     echo ""
-    echo "---- 页签: $tab ----"
-    bmp="$SHOTS/gui-preview-$tab.bmp"
-    png="$SHOTS/gui-preview-$tab.png"
-    "$PROBE" "$EXE" "$tab" "$bmp"
+    echo "---- 规格: $spec（页签=$tab 状态=${mode:-默认}）----"
+    bmp="$SHOTS/gui-preview-$label.bmp"
+    png="$SHOTS/gui-preview-$label.png"
+    "$PROBE" "$EXE" "$tab" "$bmp" "$mode"
     rc=$?
     [ "$rc" -eq 0 ] || rc_all=1
     if [ -f "$bmp" ]; then

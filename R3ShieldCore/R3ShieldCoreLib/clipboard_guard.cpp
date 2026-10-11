@@ -7,6 +7,12 @@
 #include "r3shieldcore_rules.h"
 #include "logger.h"
 
+// ★ v78：规则脚本（用户在主程序「高级」页写的**中文规则**）。
+//   命名空间 `R3ShieldCoreRuleScript` —— 与上面那个编译期高危规则表
+//   （`R3ShieldCoreRules`）**同名不同物**，理由见 rules_codec.h 头部。
+#include <r3shieldcore/spoof_apply_codec.h>
+#include "rules_script_runtime.h"
+
 //
 // 剪贴板读取监控层。
 //
@@ -35,6 +41,27 @@ namespace
 	OpenClipboardPtr pOriginalOpenClipboard = nullptr;
 	GetClipboardDataPtr pOriginalGetClipboardData = nullptr;
 	CloseClipboardPtr pOriginalCloseClipboard = nullptr;
+
+	// ★ v78：规则脚本的别名（与 registry_guard.cpp 里那两个**同名同物**，
+	//   只是各自 TU 里的简写）。
+	namespace RScript = R3ShieldCoreRuleScript;
+	namespace RApply = R3ShieldCoreSpoofApply;
+
+	// 首次用到规则时把规则文件读进来（每个被注入进程各一次；见
+	// `rules_script_runtime.h` 的状态机 —— 同一模块里 registry_guard.cpp
+	// 与这里**共用一份**状态，所以只有最先到的那个会真读、会打日志）。
+	bool EnsureClipRulesLoaded() noexcept
+	{
+		if (!R3ShieldCoreRuleScriptRuntime::EnsureLoadedSafe()) {
+			return false;
+		}
+		// ⚠️ ASCII 子串 `rules_script` 是 v78 代次标记的一部分，别删。
+		LOG(L"ClipboardGuard: 规则脚本加载完毕（rules_script，路径 %s，%d 条有效 / %d 条无效）",
+			R3ShieldCoreRuleScriptRuntime::Path(),
+			static_cast<int>(R3ShieldCoreRuleScriptRuntime::OkCount()),
+			static_cast<int>(R3ShieldCoreRuleScriptRuntime::BadCount()));
+		return true;
+	}
 
 	bool g_installed = false;
 	bool g_bypass = false;
@@ -172,11 +199,46 @@ namespace
 		}
 	}
 
+	// ★ v78：剪贴板面的规则求值。
+	//
+	// 规则按**格式名**匹配（`当 剪贴板 的 格式 等于 文本 时 …`）⇒ 这里用
+	// `FormatLabel` 把格式号转成名字。**必须用 codec 里那一份**：自己再
+	// switch 一遍必然与"哪些格式算文本"漂移（铁律 127/195）。
+	//
+	// ⚠️ 抽成函数是为了**决策层与 detour 层问的是同一件事**（铁律 22）。
+	RScript::Verdict EvalClipRule(UINT format) noexcept
+	{
+		WCHAR buf[32] = {};
+		// ⚠️ 必须用**返回值**，不能把 `buf` 直接传下去：文本 / 位图这两类
+		//    `FormatLabel` 返回的是**静态字符串**，压根不往 `buf` 里写
+		//    ⇒ 传 buf 的话匹配到的是空串，`当 剪贴板 的 格式 等于 文本 时 …`
+		//      **永远不命中**（只有"未知格式"那一路才填 buf 并返回它）。
+		//    这个坑在界面上完全看不出来 —— 规则显示得好好的，就是不生效。
+		const WCHAR* label = R3ShieldCoreClipboardSpoof::FormatLabel(format, buf, _countof(buf));
+		try {
+			return RScript::Eval(RScript::Face::Clip, nullptr, nullptr, label);
+		}
+		catch (...) {
+			return RScript::Verdict{};
+		}
+	}
+
 	// 「本应拒绝」时的统一出口。
 	//
 	// ★ v70：开关打开 **且该格式造得出合法替代物** ⇒ 替换；否则 ⇒ 拒绝
 	//   （原行为，一字不改）。
 	//
+	// ★ v78：**规则脚本优先**。命中即按规则处置：
+	//     · 替换为 "文本" / 空 ⇒ 替换（**仅文本类格式**，见下）；
+	//     · 拒绝             ⇒ 落到下面走拒绝；
+	//     · 放行             ⇒ 原样返回真实内容（`Action::Pass`）。
+	//   没命中 ⇒ 原样走 v70 的内置判据。
+	//
+	// ⚠️ 规则要求「替换为 文本」但格式是**位图 / 未知** ⇒ 回落**拒绝**
+	//    （铁律 194：造不出合法替代物就不硬造）。把一段文本塞进 CF_BITMAP
+	//    的槽里，调用方会把它当位图去解析 —— 那是"替换"新引入的崩溃面。
+	// ⚠️ 与注册表面同一条口径：规则的**总闸**仍是 ini 的 `spoof_clipboard=1`
+	//    （五个替换开关默认关是刻意的，铁律 199 同族）。
 	// ⚠️ 为什么"格式不支持"要**回落拒绝**而不是"照原样返回"：造不出未知格式
 	//    的合法布局，硬造一个长度不对的块会让调用方读越界/解析错 —— 那是
 	//    "替换"**新引入**的崩溃面。回落拒绝 = v70 之前的行为，安全。
@@ -186,10 +248,41 @@ namespace
 	//    真的造出来了"置的。
 	Action RejectOrSpoof(R3ShieldCore::Event& event, UINT format) noexcept
 	{
-		const bool formatOk = R3ShieldCoreClipboardSpoof::ClassifyFormat(format)
-			!= R3ShieldCoreClipboardSpoof::FakeKind::Unsupported;
+		EnsureClipRulesLoaded();
 
-		if (formatOk && SpoofClipboardEnabled()) {
+		const R3ShieldCoreClipboardSpoof::FakeKind kind =
+			R3ShieldCoreClipboardSpoof::ClassifyFormat(format);
+		const bool formatOk = kind != R3ShieldCoreClipboardSpoof::FakeKind::Unsupported;
+
+		// ★ 规则命中 ⇒ **由规则说了算**，不再落到下面的内置替换判据。
+		//   ⚠️ 这一条是必须的：规则要求「拒绝」或"要求替换但格式不支持"时，
+		//      若继续往下走，内置判据会看到 `formatOk && 开关开着` ⇒ 又把它
+		//      变成 Spoof ⇒ **用户写的「拒绝」被静默推翻**。
+		//      （v78 单测第一版就是这样：两条"回落拒绝"的断言都红了。）
+		bool ruleDecided = false;
+
+		if (SpoofClipboardEnabled()) {
+			const RScript::Verdict v = EvalClipRule(format);
+			if (v.hit) {
+				ruleDecided = true;
+				if (v.act == RScript::Act::Pass) {
+					event.Decision = static_cast<ULONG>(R3ShieldCore::Decision::Allowed);
+					return Action::Pass;
+				}
+				if (v.act != RScript::Act::Block) {
+					// 替换类动作（`ReplaceByte` 已被解析器挡掉）。
+					if (kind == R3ShieldCoreClipboardSpoof::FakeKind::Text) {
+						event.Decision = static_cast<ULONG>(R3ShieldCore::Decision::Spoofed);
+						return Action::Spoof;
+					}
+					// ⚠️ ASCII 子串 `rules_script` 是 v78 代次标记的一部分，别删。
+					LOG(L"ClipboardGuard: 规则要求替换为文本，但格式 %u 不是文本类（rules_script 规则 #%d）=> 回落拒绝",
+						format, v.index);
+				}
+			}
+		}
+
+		if (!ruleDecided && formatOk && SpoofClipboardEnabled()) {
 			// 替换不是"被拦"：不置 FlagEventBlocked，不计 HighRiskBlocked。
 			event.Decision = static_cast<ULONG>(R3ShieldCore::Decision::Spoofed);
 			return Action::Spoof;
@@ -369,7 +462,23 @@ namespace
 		//    FlagEvent2Spoofed 不置 —— 事后能区分这两种情况。
 		HANDLE returned = result;
 		if (action == Action::Spoof && result) {
-			HANDLE fake = R3ShieldCoreClipboardSpoof::BuildFake(format, result);
+			// ★ v78：规则命中「替换为 <文本>」⇒ 用**规则给的文本**；
+			//   没命中（或规则给的是"空"）⇒ 回落**生产** `BuildFake`
+			//   （文本 ⇒ 空串、位图 ⇒ 同尺寸全 0、DIB ⇒ 像素清零）。
+			//
+			// ⚠️ `BuildClipText` 返回 nullptr（分配失败）时**落到 `BuildFake`**：
+			//   那是"替换成空串"而不是"泄露真实内容" ⇒ 失败方向是安全的
+			//   （宁可少给，不可多给）。这种情况下面那条日志会留痕。
+			HANDLE fake = nullptr;
+			const RScript::Verdict v = EvalClipRule(format);
+			if (v.hit
+				&& (v.act == RScript::Act::ReplaceText || v.act == RScript::Act::ReplaceEmpty)) {
+				const WCHAR* text = (v.act == RScript::Act::ReplaceText) ? v.text.c_str() : L"";
+				fake = RApply::BuildClipText(format, text);
+			}
+			if (!fake) {
+				fake = R3ShieldCoreClipboardSpoof::BuildFake(format, result);
+			}
 			if (fake) {
 				TrackFake(format, fake);
 				returned = fake;
@@ -530,3 +639,62 @@ namespace ClipboardGuard
 		return true;
 	}
 }
+
+// ==================================================================
+// ★ v78：单测专用入口
+// ==================================================================
+//
+// 与 `registry_guard.cpp` 尾部那一段同构：`RejectOrSpoof` / `EvalClipRule`
+// 都在本文件的匿名 namespace 里，外部 TU 拿不到，而 v78 要断言的
+// **"规则把这次剪贴板读变成了什么处置"** 恰恰就在这里。
+//
+// 用编译宏隔离（`build_guard_ut.sh` 带、`build.sh` 不带）⇒ 导出表不变。
+#ifdef CLIPGUARD_GUARD_UT
+namespace ClipboardGuardTest
+{
+	// ★ 单测**必须**先调这个。
+	//   `SpoofClipboardEnabled()` 的判据里有一条"CloseClipboard 挂上了没"
+	//   （回收替换块的前提），单测不跑 `Install()` ⇒ 它恒为 false ⇒
+	//   **剪贴板面的任何替换路径都测不到**，而且失败原因看不出来
+	//   （"规则没生效"和"开关没打开"长得一模一样）。
+	void SetCloseHookReady(bool ready) noexcept
+	{
+		g_closeHookReady = ready;
+	}
+
+	// 驱动「本应拒绝」的统一出口。返回 `Action` 的值；
+	// `decisionOut` / `flagsOut` 收下判定与标志位（**可空**）。
+	int RejectOrSpoofForTest(UINT format, int* decisionOut, ULONG* flagsOut) noexcept
+	{
+		R3ShieldCore::Event event = {};
+		const Action action = RejectOrSpoof(event, format);
+		if (decisionOut) *decisionOut = static_cast<int>(event.Decision);
+		if (flagsOut)    *flagsOut = event.Flags;
+		return static_cast<int>(action);
+	}
+
+	// 规则求值本身（**-1 = 没命中**；否则是 `Act` 的值）。`indexOut` 收命中序号。
+	//
+	// ⚠️ 不能用 0 当"没命中"的哨兵：`Act::ReplaceText` **就是 0**。
+	//    这是本项目铁律 110 那一类坑（"哨兵值与合法值撞车 ⇒ 断言恒真"）——
+	//    v78 单测第一版就是这么写的，"文本格式命中规则"在**完全没命中**时
+	//    也显示 PASS。
+	int EvalClipRuleForTest(UINT format, int* indexOut) noexcept
+	{
+		const RScript::Verdict v = EvalClipRule(format);
+		if (indexOut) *indexOut = v.hit ? v.index : -1;
+		return v.hit ? static_cast<int>(v.act) : -1;
+	}
+
+	// 规则给出的文本（`Act::ReplaceText` 用）。没命中/不是文本动作 ⇒ 空串。
+	void RuleTextForTest(UINT format, WCHAR* out, size_t outChars) noexcept
+	{
+		if (!out || outChars == 0) return;
+		out[0] = L'\0';
+		const RScript::Verdict v = EvalClipRule(format);
+		if (v.hit && v.act == RScript::Act::ReplaceText) {
+			wcsncpy_s(out, outChars, v.text.c_str(), _TRUNCATE);
+		}
+	}
+}
+#endif // CLIPGUARD_GUARD_UT

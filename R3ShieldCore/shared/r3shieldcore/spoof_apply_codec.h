@@ -30,8 +30,8 @@
 
 namespace R3ShieldCoreSpoofApply
 {
-	using R3ShieldCoreRules::Act;
-	using R3ShieldCoreRules::Verdict;
+	using R3ShieldCoreRuleScript::Act;
+	using R3ShieldCoreRuleScript::Verdict;
 
 	// 这次落地**实际做了什么**。
 	//

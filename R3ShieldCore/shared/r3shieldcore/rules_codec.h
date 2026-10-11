@@ -4,8 +4,22 @@
 //   规则引擎有几处要用，行为必须**逐字一致**：
 //     · `tools/spoof_console.cpp`             —— 交互式控制台（高级模式）
 //     · `R3ShieldCore/r3shieldcore_gui.cpp`   —— 主程序「高级」页签
-//     · （计划）引擎侧 `r3shieldcore-lib.dll` 的三个替换点
+//     · `R3ShieldCoreLib/registry_guard.cpp`  —— 引擎侧注册表值 / 枚举两个替换点
+//     · `R3ShieldCoreLib/clipboard_guard.cpp` —— 引擎侧剪贴板替换点
 //   所以它必须是一个 header-only 的共享 codec，而不是各写一份。
+//
+// ★★ 命名空间为什么**不叫** `R3ShieldCoreRules`（v78 改名，别改回去）
+//   引擎侧另有一个 `R3ShieldCoreLib/r3shieldcore_rules.h`，它声明的也是
+//   `namespace R3ShieldCoreRules` —— 那是**编译期定长的高危规则表**
+//   （`IsHighRiskRegistry` / `IsHighRiskFile` …），与本文件的**中文 DSL
+//   规则脚本**是两回事。两边一旦出现在**同一个翻译单元**（引擎侧接入
+//   必然如此：`registry_guard.cpp` 两个头都要 include），命名空间就会**合并**：
+//   当前符号恰好不重名，所以能编过 —— 但那是巧合，不是设计。
+//   往后任一侧新增一个同名函数（`Count()` / `Add()` / `Parse()` …）就会
+//   静默变成重载/冲突，而**错误信息指向的是另一个文件**。
+//   ⇒ 本文件的命名空间定为 `R3ShieldCoreRuleScript`（"规则脚本"），
+//     与"高危规则表"在名字上就分得开。引用点只有 4 处（本文件 +
+//     `spoof_apply_codec.h` 的两个 using + GUI/控制台各一行别名）。
 //
 // ★ 语法（刻意做得像易语言）
 //       当 <面> [的 <字段>] <算子> <模式> 时 <动作>
@@ -47,7 +61,7 @@
 #include <mutex>
 #include <initializer_list>
 
-namespace R3ShieldCoreRules {
+namespace R3ShieldCoreRuleScript {
 
 	// 大小写不敏感的子串查找（ASCII 折叠）。
 	// 从控制台那版 `ContainsW(hay, hayChars, needle)` 收敛成两参数版 ——
@@ -100,12 +114,20 @@ struct Verdict {
 	BYTE fill = 0;
 };
 
-static std::vector<Rule> g_rules;
-static std::mutex        g_mtx;
+// ★★ 为什么状态是 `inline` 而不是 `static`（v78，别改回去）
+//   本头文件在**同一个模块里会被多个 TU 包含**（引擎侧：`registry_guard.cpp`
+//   与 `clipboard_guard.cpp` 各包含一次）。`static` 是**内部链接** ⇒ 每个 TU
+//   一份 ⇒ **两张互不相干的规则表**：注册表那边 `Add()` 的规则，剪贴板那边
+//   一条都看不到，而且**谁都不报错**。
+//   `inline`（C++17）给的是"整个模块**一份**"⇒ 两侧共用同一张表。
+//   ⚠️ 跨模块（exe / dll）仍然是各一份 —— 那是对的：规则文件在每个
+//      被注入进程里各加载一次（见 `rules_script_runtime.h`）。
+inline std::vector<Rule> g_rules;
+inline std::mutex        g_mtx;
 
 // 最近一次命中（供 attack 打印 —— detour 里不能直接 Say）
-static volatile LONG g_lastHit = -1;
-static WCHAR         g_lastHitText[512] = L"";
+inline volatile LONG g_lastHit = -1;
+inline WCHAR         g_lastHitText[512] = L"";
 
 static void NoteHit(int idx, const WCHAR* desc)
 {
@@ -331,6 +353,22 @@ static bool Add(const WCHAR* line, std::wstring& err, int* outIndex)
 static int  Count() { std::lock_guard<std::mutex> lk(g_mtx); return (int)g_rules.size(); }
 static void Clear() { std::lock_guard<std::mutex> lk(g_mtx); g_rules.clear(); }
 
+// 表里有没有针对某个面的规则。
+//
+// ★ 语义是**保守上界**（给引擎侧做预筛用，与 `CouldHaveProtectedChildRegistry`
+//   同一套路）：返回 false ⇒ 这个面**一条规则都没有** ⇒ 调用方可以**完全跳过**
+//   规则求值。枚举面尤其需要 —— 它一次调用要逐个子项问规则，
+//   不预筛的话每次枚举都要多扫一遍表。
+//   ★ 方向：宁可多问一次，不可漏问（假阳性只是慢，假阴性 = 规则静默不生效）。
+static bool HasFace(Face face)
+{
+	std::lock_guard<std::mutex> lk(g_mtx);
+	for (const Rule& r : g_rules) {
+		if (r.face == face) return true;
+	}
+	return false;
+}
+
 static bool RemoveAt(int idx)
 {
 	std::lock_guard<std::mutex> lk(g_mtx);
@@ -499,4 +537,4 @@ static bool LoadFile(const WCHAR* path, int* okCount, int* badCount, std::wstrin
 	return true;
 }
 
-} // namespace R3ShieldCoreRules
+} // namespace R3ShieldCoreRuleScript
