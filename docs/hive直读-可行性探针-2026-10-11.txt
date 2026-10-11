@@ -1,0 +1,106 @@
+R3ShieldCore —— 「hive 文件直读」可行性探针实测输出
+日期：2026-10-11   探针源码：tools/hive_read_probe.cpp   构建：build_hive_read_probe.sh
+机器：Windows x64；探针不挂 hook、不注入、不跑引擎（铁律 175 不适用）
+
+################################################################
+# 一、非提权（当前用户）
+################################################################
+R3ShieldCore —— hive 文件直读可行性探针
+本探针不挂 hook、不注入、不跑引擎；只读，只在自己 %TEMP% 下建普通文件。
+当前进程：普通用户
+SeBackupPrivilege：不可用（非管理员或未分配）
+
+=== 检查一：基线（负对照）—— 自建普通文件必须能读 ===
+  [ OK ] 基线：普通文件已建好（4096 B，头 4 字节 = 'regf'）
+  [ OK ] 基线：普通文件读打开成功
+  [ OK ] 基线：读到 'regf' 签名 -> 探针的「读 hive 签名」判据本身有效
+  [obs ] 推论：未加载的 hive 文件 = 普通文件 -> 可读（本检查已证）
+  [obs ] -> 决定性问题只剩「活 hive（已被系统加载）能不能被打开」
+  [ OK ] 负对照：同一个 NtCreateFile 能打开普通文件 -> 该调用方式本身有效
+
+=== 检查二：活 hive 直开（含备份意图）===
+  · HKLM\SYSTEM   (活)
+        连 GetFileAttributes 都失败，err=5（★ 权限不足，不是不存在）
+  [obs ] → 非提权下连元数据都读不到 => 更不可能打开
+  · HKLM\SOFTWARE (活)
+        连 GetFileAttributes 都失败，err=5（★ 权限不足，不是不存在）
+  [obs ] → 非提权下连元数据都读不到 => 更不可能打开
+  · HKLM\SAM      (活)
+        连 GetFileAttributes 都失败，err=5（★ 权限不足，不是不存在）
+  [obs ] → 非提权下连元数据都读不到 => 更不可能打开
+  · HKLM\SECURITY (活)
+        连 GetFileAttributes 都失败，err=5（★ 权限不足，不是不存在）
+  [obs ] → 非提权下连元数据都读不到 => 更不可能打开
+  · HKCU NTUSER.DAT(活)
+        共享全开 -> 失败，Win32 err=32
+        只读共享 -> 失败，Win32 err=32
+        备份语义(CreateFileW) -> 失败，Win32 err=32
+        备份意图(NtCreateFile) -> 失败，NTSTATUS=0xC0000043
+
+=== 检查三：内存映射（打开成功才可能）===
+  打不开 C:\Windows\System32\config\SOFTWARE（err=5）-> 无法进入映射检查
+  [obs ] ★ 打开这一步就挡住了 -> 映射路径**不可达**
+
+=== 检查四：RegSaveKey 导出（合法导出，另说）===
+  RegSaveKey 失败，err=1314（多半缺 SeBackupPrivilege）
+  [obs ] 合法导出这条路在当前权限下不可行
+
+=== 结果：通过 4 / 失败 0 / 观察 8 ===
+（本探针的产出主要是 [obs] 事实行，判据只用来证明探针自身可信）
+
+################################################################
+# 二、提权（管理员，SeBackupPrivilege 已开启）
+################################################################
+[run_elevated] cmd = "D:\鐢ㄦ埛鎬佹潃杞痋tools\hive_read_probe.exe"
+R3ShieldCore —— hive 文件直读可行性探针
+本探针不挂 hook、不注入、不跑引擎；只读，只在自己 %TEMP% 下建普通文件。
+当前进程：管理员
+SeBackupPrivilege：已开启
+
+=== 检查一：基线（负对照）—— 自建普通文件必须能读 ===
+  [ OK ] 基线：普通文件已建好（4096 B，头 4 字节 = 'regf'）
+  [ OK ] 基线：普通文件读打开成功
+  [ OK ] 基线：读到 'regf' 签名 -> 探针的「读 hive 签名」判据本身有效
+  [obs ] 推论：未加载的 hive 文件 = 普通文件 -> 可读（本检查已证）
+  [obs ] -> 决定性问题只剩「活 hive（已被系统加载）能不能被打开」
+  [ OK ] 负对照：同一个 NtCreateFile 能打开普通文件 -> 该调用方式本身有效
+
+=== 检查二：活 hive 直开（含备份意图）===
+  · HKLM\SYSTEM   (活)
+        共享全开 -> 失败，Win32 err=32
+        只读共享 -> 失败，Win32 err=32
+        备份语义(CreateFileW) -> 失败，Win32 err=32
+        备份意图(NtCreateFile) -> 失败，NTSTATUS=0xC0000043
+  · HKLM\SOFTWARE (活)
+        共享全开 -> 失败，Win32 err=32
+        只读共享 -> 失败，Win32 err=32
+        备份语义(CreateFileW) -> 失败，Win32 err=32
+        备份意图(NtCreateFile) -> 失败，NTSTATUS=0xC0000043
+  · HKLM\SAM      (活)
+        共享全开 -> 失败，Win32 err=32
+        只读共享 -> 失败，Win32 err=32
+        备份语义(CreateFileW) -> 失败，Win32 err=32
+        备份意图(NtCreateFile) -> 失败，NTSTATUS=0xC0000043
+  · HKLM\SECURITY (活)
+        共享全开 -> 失败，Win32 err=32
+        只读共享 -> 失败，Win32 err=32
+        备份语义(CreateFileW) -> 失败，Win32 err=32
+        备份意图(NtCreateFile) -> 失败，NTSTATUS=0xC0000043
+  · HKCU NTUSER.DAT(活)
+        共享全开 -> 失败，Win32 err=32
+        只读共享 -> 失败，Win32 err=32
+        备份语义(CreateFileW) -> 失败，Win32 err=32
+        备份意图(NtCreateFile) -> 失败，NTSTATUS=0xC0000043
+
+=== 检查三：内存映射（打开成功才可能）===
+  打不开 C:\Windows\System32\config\SOFTWARE（err=32）-> 无法进入映射检查
+  [obs ] ★ 打开这一步就挡住了 -> 映射路径**不可达**
+
+=== 检查四：RegSaveKey 导出（合法导出，另说）===
+  RegSaveKey 失败，err=1450（多半缺 SeBackupPrivilege）
+  [obs ] 合法导出这条路在当前权限下不可行
+
+=== 结果：通过 4 / 失败 0 / 观察 4 ===
+（本探针的产出主要是 [obs] 事实行，判据只用来证明探针自身可信）
+
+[run_elevated] child exit code = 0

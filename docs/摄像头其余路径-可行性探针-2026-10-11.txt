@@ -1,0 +1,85 @@
+R3ShieldCore —— 摄像头「其余取帧路径」可行性探针实测输出
+日期：2026-10-11   源码：tools/camera_paths_probe.cpp   构建：build_camera_paths_probe.sh
+探针自包含（自己挂自己的 vtable patch），不注入、不跑引擎。
+
+################################################################
+# 一、默认（不开硬件）：机制 + 设备枚举 + WinRT 挂点
+################################################################
+R3ShieldCore —— 摄像头其余取帧路径可行性探针
+自包含：自己挂自己的 vtable patch，不注入、不跑引擎。
+硬件开关：关（只跑不需要硬件的部分）
+
+=== Part A1：DirectShow 机制（CMemAllocator 造 IMediaSample，不需要摄像头）===
+  [ OK ] CMemAllocator 就绪（2 个 64KB 缓冲）
+  [ OK ] 拿到一个真 IMediaSample（DirectShow 的帧对象）
+  [ OK ] 已把缓冲区填成 0xAB 并设置实际长度（负对照的'真数据'）
+  [ OK ] 负对照：patch 之前读到的是真数据（0xAB）-> 后面的'变 0'可归因
+  [obs ] ★ 两个 IMediaSample 的 vtable **相同** -> vtable 是**按类共享**的
+  [obs ]   => 与 MF 的 IMFSourceReader 同一个坑：patch 一次影响所有实例，
+  [obs ]      必须**按对象**记'要不要替换'（铁律 210）
+  [ OK ] 已 patch IMediaSample vtable 槽 3（GetPointer）
+  [ OK ] ★ patch 后调用方读到全 0 -> **DirectShow 的帧可以在进程内中性化**
+  [ OK ] 我们的 detour 确实被调用到了（不是'patch 了但没人走'）
+  [obs ] 已还原 vtable 槽（探针不留副作用）
+
+=== Part A2：DirectShow 采集设备枚举 ===
+       · Logi C270 HD WebCam
+       · OnePlus Ace 5 Pro (Windows 虚拟摄像头)
+       · OBS Virtual Camera
+  [ OK ] DirectShow 枚举到 3 个采集设备 -> 该 API 面在进程内可达
+
+=== Part C：WinRT MediaCapture 路由 ===
+  [ OK ] MFCaptureEngine.dll 导出 MFCreateCaptureEngine @ 00007FF871850DC0 -> 挂点存在
+  [ OK ] ★ MFCreateCaptureEngine 可被 MH_CreateHook 挂上 -> 挂点可用
+  [skip] 未加 --use-camera：WinRT 激活（RoGetActivationFactory + InitializeAsync）未跑
+  [obs ] => 本部分给的是**静态证据链 + 挂点可挂性**，不是'真机替换成功'
+
+=== Part B：VFW 帧路径 ===
+  [skip] 未加 --use-camera：VFW 必须真开采集窗口才能判定
+
+=== 结果：通过 10 / 失败 0 / 跳过 2 ===
+（跳过必须可见并计数 —— 铁律 178）
+
+################################################################
+# 二、--use-camera（真开摄像头）
+################################################################
+R3ShieldCore —— 摄像头其余取帧路径可行性探针
+自包含：自己挂自己的 vtable patch，不注入、不跑引擎。
+硬件开关：--use-camera（会真开摄像头）
+
+=== Part A1：DirectShow 机制（CMemAllocator 造 IMediaSample，不需要摄像头）===
+  [ OK ] CMemAllocator 就绪（2 个 64KB 缓冲）
+  [ OK ] 拿到一个真 IMediaSample（DirectShow 的帧对象）
+  [ OK ] 已把缓冲区填成 0xAB 并设置实际长度（负对照的'真数据'）
+  [ OK ] 负对照：patch 之前读到的是真数据（0xAB）-> 后面的'变 0'可归因
+  [obs ] ★ 两个 IMediaSample 的 vtable **相同** -> vtable 是**按类共享**的
+  [obs ]   => 与 MF 的 IMFSourceReader 同一个坑：patch 一次影响所有实例，
+  [obs ]      必须**按对象**记'要不要替换'（铁律 210）
+  [ OK ] 已 patch IMediaSample vtable 槽 3（GetPointer）
+  [ OK ] ★ patch 后调用方读到全 0 -> **DirectShow 的帧可以在进程内中性化**
+  [ OK ] 我们的 detour 确实被调用到了（不是'patch 了但没人走'）
+  [obs ] 已还原 vtable 槽（探针不留副作用）
+
+=== Part A2：DirectShow 采集设备枚举 ===
+       · Logi C270 HD WebCam
+       · OnePlus Ace 5 Pro (Windows 虚拟摄像头)
+       · OBS Virtual Camera
+  [ OK ] DirectShow 枚举到 3 个采集设备 -> 该 API 面在进程内可达
+
+=== Part A3：DirectShow 真机建图（--use-camera）===
+  [skip] 真机建图未实现 —— Part A1 已在机制层证明'槽 3 可 patch 且调用方可见'；
+  [skip] 真机建图需要 SampleGrabber + NullRenderer 且对媒体类型挑剔，留待接生产时做
+
+=== Part C：WinRT MediaCapture 路由 ===
+  [ OK ] MFCaptureEngine.dll 导出 MFCreateCaptureEngine @ 00007FF871850DC0 -> 挂点存在
+  [ OK ] ★ MFCreateCaptureEngine 可被 MH_CreateHook 挂上 -> 挂点可用
+  [skip] WinRT 真机激活未实现 —— 需要在 WinRT 应用上下文里 InitializeAsync（异步 + 相机权限），
+  [skip] 留待接生产时做；本轮的结论是'路由明确 + 挂点存在且可挂'
+
+=== Part B：VFW 帧路径 ===
+       VFW 驱动[0]: Microsoft WDM Image Capture (Win32) (Version:  10.0.26100.1882)
+  [obs ] VFW 驱动枚举成功（枚举本身不阻塞）
+  [skip] VFW 25 秒未完成（卡在 stage=1）-> 本机无法判定，按'未覆盖'计
+
+=== 结果：通过 10 / 失败 0 / 跳过 5 ===
+（跳过必须可见并计数 —— 铁律 178）

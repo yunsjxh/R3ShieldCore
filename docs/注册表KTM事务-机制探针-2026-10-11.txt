@@ -1,0 +1,202 @@
+R3ShieldCore —— 「事务注册表（KTM）」机制探针实测输出
+日期：2026-10-11   探针源码：tools/spoof_reg_ktm_probe.cpp   构建：build_spoof_reg_ktm_probe.sh
+机器：Windows x64；探针自挂自测、不注入、不跑引擎（铁律 175 不适用）
+复现：bash build_spoof_reg_ktm_probe.sh --run
+
+################################################################
+# 0. 结论摘要（先看这个）
+################################################################
+[结论 1] 三个事务导出在本机 ntdll 里都存在、都能被 MinHook 挂上，
+         且与对应的非事务导出是**不同的函数**（syscall 号也不同）：
+             NtOpenKey               addr=...5A2000  ssn=18
+             NtOpenKeyEx             addr=...5A4310  ssn=299
+             NtOpenKeyTransacted     addr=...5A4330  ssn=300
+             NtOpenKeyTransactedEx   addr=...5A4350  ssn=301
+             NtCreateKey             addr=...5A2160  ssn=29
+             NtCreateKeyTransacted   addr=...5A3470  ssn=182
+         => "补挂这三个"不是重复劳动，是**真的补了一块**。
+
+[结论 2] ★★ 缺口成立：把事务 detour 关掉（＝修复前），
+         `NtOpenKeyTransacted(KEY_SET_VALUE)` 打开受保护键**能拿到句柄**；
+         而且**非事务那条 `NtOpenKey` detour 完全没有被顺带触发**
+         （hits 3 -> 3）—— 说明事务变体**不是**内部转发到 `NtOpenKey`。
+         => 原来"写不进 / 读不到 / 看不见"的**第一道门（准入）形同虚设**。
+
+[结论 3] ★★ 修复生效：打开事务 detour 后，三个导出对受保护键的写打开
+         一律 `0xC0000022 STATUS_ACCESS_DENIED`；
+         同时**负对照通过**（不受保护的键仍然放行）—— 是"准入判据"而不是"一律拒绝"。
+
+[结论 4] ★★ "缺的只是准入"这句话成立：
+         事务键句柄上真调 `NtQueryValueKey` / `NtEnumerateKey` / `NtSetValueKey`
+         **全部走到同一个 detour**（与调用方视角一致），并且
+             v71 值替换生效（数据区全 0、长度字段不动）
+             v72 枚举隐藏生效（HiddenChild 被跳过：0 -> Vis1、1 -> Vis2、
+                              索引 2 -> 0x8000001A NO_MORE_ENTRIES）
+         非事务句柄上结果**逐字节相同**。
+
+[结论 5] ★ 生产 v72 不会在事务句柄上静默降级：
+         `NtQueryKey(事务键句柄, KeyNameInformation)` **能拿到路径**
+         （事务 91 字符 / 非事务 91 字符，完全一致），
+         所以 `ResolveKeyPath` 这条路在事务句柄上照样通。
+         探针里"枚举 detour 取不到父路径的次数 = 0"。
+
+[结论 6] 事务语义实测：**读己之写成立**（事务内写 0x55667788，事务内读回同值）；
+         `RollbackTransaction` 后该值 `0xC0000034 OBJECT_NAME_NOT_FOUND`（回滚干净）；
+         对照事务 `CommitTransaction` 后 `0x0BADF00D` 读得到（写确实落地）。
+
+[坑位 A] ★★ `NtOpenKey` / `NtOpenKeyTransacted` **不接受预定义伪句柄**
+         （`HKEY_CURRENT_USER` / `HKEY_LOCAL_MACHINE` / `HKEY_USERS`）作为
+         `RootDirectory` => 一律 `0xC0000008 STATUS_INVALID_HANDLE`。
+         `RegOpenKeyExW(HKEY_CURRENT_USER, ...)` 能跑，是因为 **advapi32 自己
+         把伪句柄换成了真句柄** —— 这掩盖了上面的坑（本探针第一版就栽在这里，
+         全部用例报 0xC0000008）。
+         => Nt* 这条路只能用：① `RootDirectory = 真键句柄` + 相对名；
+            ② `RootDirectory = NULL` + **绝对 NT 路径**。
+         （生产 `registry_guard.cpp` 不构造 ObjectAttributes，所以**不受影响**；
+           但真实调用方会走这两种形态之一。）
+
+################################################################
+# 1. 原始输出（GBK 控制台 → UTF-8 转写）
+################################################################
+=== 事务注册表（KTM）机制探针（自挂自测，不经过引擎）===
+
+（本探针只碰 HKCU 下自己建的临时键，不注入、不跑引擎）
+
+
+
+--- 0. 导出存在性 / 地址 / syscall 号 / 可挂性 ---
+
+  [ OK ] ntdll!NtOpenKey 存在
+
+  [ OK ] ntdll!NtOpenKeyTransacted 存在
+
+  [ OK ] ntdll!NtOpenKeyTransactedEx 存在
+
+  [ OK ] ntdll!NtCreateKeyTransacted 存在
+
+  [ OK ] ntdll!NtQueryKey 存在（取路径用）
+
+  [obs ] NtOpenKey              addr=00007FF8956A2000 ssn=18
+
+  [obs ] NtOpenKeyTransacted    addr=00007FF8956A4330 ssn=300
+
+  [obs ] NtOpenKeyTransactedEx  addr=00007FF8956A4350 ssn=301
+
+  [obs ] NtOpenKeyEx            addr=00007FF8956A4310 ssn=299
+
+  [obs ] NtCreateKey            addr=00007FF8956A2160 ssn=29
+
+  [obs ] NtCreateKeyTransacted  addr=00007FF8956A3470 ssn=182
+
+  [ OK ] NtOpenKeyTransacted 与 NtOpenKey 是**不同的函数**
+
+  [ OK ] NtOpenKeyTransactedEx 与 NtOpenKeyEx 是**不同的函数**
+
+  [ OK ] NtCreateKeyTransacted 与 NtCreateKey 是**不同的函数**
+
+  [ OK ] NtOpenKey 与 NtOpenKeyTransacted 的 syscall 号**不同**（内核入口不同）
+
+
+
+--- 0.5 坑位勘察：`RootDirectory` 吃不吃**预定义伪句柄** ---
+
+  [ OK ] root=HKEY_CURRENT_USER（伪句柄）-> st=0xC0000008（**不接受**，advapi32 才消化它）
+
+  [ OK ] root=NULL + abs=\REGISTRY\USER\S-1-5-21-2945951036-705669437-1278233025-1001\Software -> st=0x00000000（**接受**）
+
+  [ OK ] 7/7 个 hook 安装成功
+
+
+
+夹具：HKCU\Software\R3ShieldCoreProbe\Ktm（值 Text/Dword，子键 Vis1/HiddenChild/Vis2）
+
+      绝对路径 = \REGISTRY\USER\S-1-5-21-2945951036-705669437-1278233025-1001\Software\R3ShieldCoreProbe\Ktm
+
+  [obs ] CreateTransaction 成功（KTM 可用）
+
+
+
+--- A. 基线（负对照）：判据关着时，事务路径能正常打开 ---
+
+  [ OK ] 判据关时 NtOpenKeyTransacted 打开探针键成功（st=0x00000000）
+
+  [ OK ] 判据关时 NtOpenKeyTransactedEx 打开探针键成功（st=0x00000000）
+
+
+
+--- B/C. 缺口演示（关事务 detour）与修复生效（开事务 detour）---
+
+  [ OK ] 非事务 NtOpenKey(KEY_SET_VALUE) 被拒（st=0xC0000022 == ACCESS_DENIED）
+
+  [ OK ] ★ 事务 detour 关闭时 NtOpenKeyTransacted(KEY_SET_VALUE) **拿到句柄**（绕过成立，st=0x00000000）
+
+  [ OK ] ★ 非事务 NtOpenKey detour **没有**被顺带触发（3 -> 3）—— 缺口确实存在
+
+  [ OK ] 同一时刻非事务路径**仍被拒**（st=0xC0000022）
+
+  [ OK ] ★ 修复后 NtOpenKeyTransacted(KEY_SET_VALUE) 被拒（st=0xC0000022）
+
+  [ OK ] ★ 修复后 NtOpenKeyTransactedEx(KEY_SET_VALUE) 被拒（st=0xC0000022）
+
+  [ OK ] ★ 修复后 NtCreateKeyTransacted(建子键) 被拒（st=0xC0000022）
+
+  [ OK ] 负对照：事务打开**不受保护**的键仍放行（st=0x00000000）
+
+  [ OK ] 三个事务 detour 都被调到过（open=3 ex=2 create=1）
+
+
+
+--- D. 事务键句柄上**复用同一 API**（v71 值替换 / v72 枚举隐藏）---
+
+  [ OK ] 拿到事务键句柄（st=0x00000000）
+
+  [ OK ] 拿到非事务键句柄（对照，st=0x00000000）
+
+  [ OK ] ★ NtQueryKey 吃**事务键句柄**（事务 91 字符 / 非事务 91 字符）
+
+  [obs ]    事务键句柄的路径 = \REGISTRY\USER\S-1-5-21-2945951036-705669437-1278233025-1001\Software\R3ShieldCoreProbe\Ktm
+
+  [ OK ] 事务句柄上的 NtQueryValueKey **走同一个 detour**（hits 0 -> 2，本次 +2）
+
+  [ OK ] ★ 事务句柄上 v71 值替换生效（成功 st=0x00000000，数据区全 0）
+
+  [ OK ] 非事务句柄上结果**逐字节相同**（st=0x00000000，两路同一份代码）
+
+  [ OK ] 事务句柄上的 NtEnumerateKey **走同一个 detour**（hits 0 -> 3）
+
+  [ OK ] ★ 事务句柄上 v72 枚举隐藏生效：0 -> Vis1，1 -> Vis2（HiddenChild 被跳过）
+
+  [ OK ] ★ 索引 2 越界（st=0x8000001A == NO_MORE_ENTRIES，可见项只有 2 个）
+
+  [ OK ] 真的藏掉了项（hidden=3）
+
+  [ OK ] 非事务句柄上枚举结果**逐项相同**（Vis1 / Vis2）
+
+  [ OK ] 事务句柄上的 NtSetValueKey **走同一个 detour**（hits 2 -> 3，st=0x00000000）
+
+
+
+--- E. 事务语义：读己之写 + 回滚 ---
+
+  [ OK ] 事务内打开键句柄（st=0x00000000）
+
+  [ OK ] 事务内写入 TxnVal 成功（st=0x00000000）
+
+  [ OK ] ★ 读己之写：事务内读回 TxnVal == 0x55667788（st=0x00000000）
+
+  [ OK ] RollbackTransaction 成功（1）
+
+  [ OK ] ★ 回滚后 TxnVal 读不到（st=0xC0000034 == OBJECT_NAME_NOT_FOUND）
+
+  [ OK ] CommitTransaction 成功（1）
+
+  [ OK ] 对照：提交后 CommittedVal == 0x0BADF00D（写确实落地了）
+
+  [obs ] detour 计数自检：query=5 enum=5 set=5 open=7
+
+  [obs ] 枚举 detour 取不到父路径的次数 = 0（>0 -> v72 会静默降级）
+
+
+
+=== 结果：通过 42 / 失败 0 / 跳过 0 ===
+

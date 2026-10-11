@@ -1,0 +1,56 @@
+剪贴板回传数据替换 —— 机制探针实测输出（v70，2026-10-10）
+来源: tools/spoof_clipboard_probe.exe（自挂自测，不经过引擎，不受铁律 175 约束）
+命令: bash build_spoof_clipboard_probe.sh --run   （x64；x86 结果同为 25/0/0）
+说明: 引擎/探针的控制台输出是 GBK，本文件已用 iconv -f GBK -t UTF-8 转码
+================================================================
+
+=== 剪贴板回传数据替换探针（自挂自测，不经过引擎）===
+进程 pid=18832  架构=x64
+伪造逻辑来源：clipboard_spoof_codec.h（与生产同一份）
+
+--- 阶段 0：基线（未挂任何 hook，负对照）---
+  读回文本 = "SECRET-TOKEN-12345"
+  位图像素[0,0] = 0x00FF0000
+  [PASS] 基线：GetClipboardData 读到真实文本
+  [PASS] 基线：CF_DIB 是真实内容（头部合法且像素非全 0）
+  [PASS] 基线：CF_BITMAP 是真实内容（非黑）
+
+--- 阶段 1：挂 user32!GetClipboardData + CloseClipboard（替换开）---
+  MH_CreateHook(GetClipboardData) = 0 (MH_OK)
+  MH_CreateHook(CloseClipboard) = 0 (MH_OK)
+  读回文本 = ""（长度 0）
+  detour 命中=3 次  造出替代物=3 个
+  [PASS] 替换生效：文本被换成空串
+  [PASS] 替换生效：返回的文本句柄 ≠ 真实文本句柄（是另一块内存）
+  [PASS] 替换生效：返回的位图句柄 ≠ 真实位图句柄
+  [PASS] 返回码完好：拿到的是**可用句柄**而非 nullptr（与 Block 的分水岭）
+  [PASS] 原函数确实被调用过（detour 命中 >= 1）
+  [PASS] 未误伤源：剪贴板本体的真实 DIB 仍是真内容（只换了返回值）
+  替代 DIB：4 x -4 @ 32 bit，共 104 字节（真实请求 104 字节）
+  [PASS] 替代 DIB：头部合法（DibHeaderBytes 认得出）
+  [PASS] 替代 DIB：与真实**同尺寸同位深**（"同格式"而非随便一块）
+  [PASS] 替代 DIB：头部 + 调色板字节与真实**逐字节相同**
+  [PASS] 替代 DIB：不小于真实大小（没有截断）
+  [PASS] 替代 DIB：像素字节全 0（内容被中性化）
+  替代位图：4 x 4 @ 1 bit，像素[0,0]=0x00000000
+  [PASS] 替代位图：是合法 HBITMAP 且同尺寸
+  [PASS] 替代位图：内容全黑
+  CloseClipboard 后：回收 3 个（此前累计 0）
+  [PASS] CloseClipboard 时替代物被回收（3 个：文本 + DIB + 位图）
+  [PASS] 回收后再查：替代 DIB 句柄已失效（GlobalSize == 0）
+  [PASS] 回收后所有槽都已清空（没有残留，不会重复释放）
+  [PASS] 槽没有溢出（正常 open/close 配对下不该发生）
+
+--- 阶段 2：不可伪造的格式必须拒绝伪造 ---
+  [PASS] CF_HDROP(15) 判为不可伪造
+  [PASS] 注册格式(0xC001) 判为不可伪造
+  [PASS] BuildFake 对不可伪造格式返回 nullptr（调用方据此回落拒绝）
+  [PASS] CF_TEXT(1)/CF_BITMAP(2)/CF_OEMTEXT(7)/CF_DIB(8)/CF_UNICODETEXT(13)/CF_DIBV5(17) 判为可伪造
+
+--- 阶段 3：关掉替换（负对照 —— 必须拿到真内容）---
+  读回文本 = "SECRET-TOKEN-12345"
+  [PASS] 关掉替换后拿到的是真实内容（证明前面的"空串"确实来自替换）
+
+=== 结果：25 passed, 0 failed ===
+结论：detour 内「真调原函数 → 换成自己的句柄 → 返回成功」在剪贴板面可行；
+      且句柄所有权（CloseClipboard 回收）能按契约闭合。

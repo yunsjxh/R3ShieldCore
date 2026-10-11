@@ -1,0 +1,74 @@
+# 注册表枚举隐藏 机制探针 —— 实测输出（2026-10-10，v72）
+# 生成命令：bash build_spoof_reg_enum_probe.sh 然后 tools/spoof_reg_enum_probe.exe
+# 说明：本文件由探针的 stdout 原样转码（GBK -> UTF-8）保存，未做任何改写。
+
+=== 注册表枚举隐藏 机制探针（自挂自测，不经过引擎）===
+
+已挂钩 ntdll!NtEnumerateKey / NtEnumerateValueKey（本进程内）。
+
+受保护前缀（原始形式）= \REGISTRY\USER\S-1-5-21-2945951036-705669437-1278233025-1001\Software\R3ShieldCoreProbe\RegEnum\Secret
+
+--- 0. 布局勘察：class 0 的原始头（★ 实测，不靠记忆）---
+  NtEnumerateKey      : status=0x00000000 ResultLength=26 dwords: [+0]=0x1FEE87AC [+4]=0x01DD58D1 [+8]=0x00000000 [+12]=0x0000000A [+16]=0x006C0041 [+20]=0x00680070
+  NtEnumerateValueKey : status=0x00000000 ResultLength=12 dwords: [+0]=0x00000000 [+4]=0x00000001 [+8]=0x00000000 [+12]=0x00000000 [+16]=0x00000000 [+20]=0x00000000
+  [PASS] 布局：KEY_BASIC_INFORMATION 头 == 16 字节（ResultLength - NameLength）
+  [PASS] 布局：KEY_BASIC_INFORMATION 的 NameLength 在 +12
+  [PASS] 布局：KEY_BASIC_INFORMATION 的 Name 在 +16（内容是 "Alpha"）
+  [PASS] ★ 实测：值枚举的索引 0 是名字为空的默认项（NameLength == 0）
+  [PASS] 布局：KEY_VALUE_BASIC_INFORMATION 头 == 12 字节
+  [PASS] 布局：KEY_VALUE_BASIC_INFORMATION 的 NameLength 在 +8
+  [PASS] 布局：KEY_VALUE_BASIC_INFORMATION 的 Name 在 +12（内容是 "AlphaV"）
+
+--- A. 基线（负对照）：隐藏**关** ---
+  子键：Alpha Beta SecretA SecretB Zulu 
+  值  ：(默认) AlphaV BetaV SecretV1 SecretV2 ZuluV 
+  [PASS] 隐藏关：枚举到 5 个子键
+  [PASS] 隐藏关：子键顺序为 Alpha/Beta/SecretA/SecretB/Zulu
+  [PASS] 隐藏关：枚举到 6 个值（含空名默认项）
+  [PASS] 隐藏关：值索引 0 是空名默认项
+  [PASS] 隐藏关：一次都没发生隐藏（计数为 0）
+
+--- B/C/D. 打开隐藏：子键列表变短、无重复、越界语义正确 ---
+  子键：Alpha Beta Zulu 
+  [PASS] ★ 隐藏开：子键只剩 3 个（SecretA / SecretB 被藏）
+  [PASS] ★ 隐藏开：剩下的是 Alpha / Beta / Zulu（顺序不变）
+  [PASS] ★ 无重复（「命中就往后挪一格」的错法会在这里变红）
+  [PASS] ★ 越界：索引 3 返回 STATUS_NO_MORE_ENTRIES
+  [PASS] ★ 越界：*ResultLength 被置 0
+  [PASS] ★ 负对照：隐藏关时同一索引确实是 SecretB（证明少了两项不是错觉）
+
+--- C2. 隐藏开时拿到的项 == 直接按原始索引真调的项（逐字节）---
+  [PASS] ★ 可见索引拿到的项与直接真调原始索引逐字节相同（长度字段没被改）
+
+--- E. 值枚举：空名默认项**不能**让隐藏失效 ---
+  值  ：(默认) AlphaV BetaV ZuluV 
+  [PASS] ★ 隐藏开：值只剩 4 个（SecretV1 / SecretV2 被藏）
+  [PASS] ★ 空名默认项仍在索引 0（空名按可见处理，不中止扫描）
+  [PASS] ★ 默认项之后的可见值映射正确：AlphaV / BetaV / ZuluV
+  [PASS] ★ 值越界：索引 4 -> NO_MORE_ENTRIES + ResultLength=0
+
+--- F. 缓冲区太小：行为不变（BUFFER_OVERFLOW + 所需长度）---
+  （status=0xC0000023 ResultLength=24）
+  [PASS] 缓冲区太小 -> STATUS_BUFFER_TOO_SMALL（0xC0000023，实测）
+  [PASS] 缓冲区太小 -> 该状态被 IsNothingWritten 认作「什么都没写」
+  [PASS] 缓冲区太小 -> *ResultLength 给出所需长度（16 + 名字字节）
+
+--- G. 负对照：与保护前缀无关的键 -> 一项都不藏 ---
+  [PASS] 无关键：隐藏开时列表与隐藏关时完全一致（只看到 RegEnum）
+  [PASS] 无关键：走 detour 与不走 detour 的列表一致
+
+--- H. 真实调用方：RegEnumKeyExW / RegEnumValueW 也看到短列表 ---
+  [PASS] RegEnumKeyExW 只看到 3 个子键
+  [PASS] RegEnumKeyExW 看不到 SecretA / SecretB
+  [PASS] RegEnumValueW 只看到 4 个值（含空名默认项）
+  [PASS] RegEnumValueW 看不到 SecretV1 / SecretV2
+
+--- I. 诚实边界：被隐藏的项仍可按名字直接访问（列表级隐藏，不是访问级）---
+  [PASS] ★ 被隐藏的子键仍能被 RegOpenKeyExW 直接打开（如实标注，别吹成硬隐藏）
+  [PASS] ★ 被隐藏的值仍能被 RegQueryValueExW 直接读到真内容（隐藏只管枚举）
+
+--- 计数自检 ---
+  [PASS] 发生过隐藏（hiddenCalls=12）
+  [PASS] detour 命中次数 >= 隐藏次数（hits=39 >= 12）
+
+=== 结果：36 passed, 0 failed ===

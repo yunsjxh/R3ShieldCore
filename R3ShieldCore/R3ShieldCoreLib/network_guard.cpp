@@ -264,12 +264,11 @@ namespace
 	int g_hookCount = 0;
 	volatile LONG g_activeHooks = 0;
 
-	enum class Action
-	{
-		Pass,
-		Record,
-		Block,
-	};
+	// v74：决策档位收敛到共享 ABI（`R3ShieldCore::Action`，见
+	//   shared/r3shieldcore/r3shieldcore_shared.h）。本文件**不再**自己定义。
+	//   ★ 本面暂不产生 `Spoof`（替换），但档位类型是同一个 —— 将来要接
+	//     替换时不必再改类型，只是多一个 `RejectOrSpoof` 分支。
+	using Action = R3ShieldCore::Action;
 
 	bool BlockAllOnException() noexcept
 	{

@@ -1,0 +1,97 @@
+# 注册表值替换 机制探针 —— 实测输出（2026-10-10，v71）
+# 生成命令：bash build_spoof_reg_probe.sh --run   （x64；x86 结果相同）
+# 说明：本文件由探针的 stdout 原样转码（GBK -> UTF-8）保存，未做任何改写。
+
+=== 注册表值替换 机制探针（自挂自测，不经过引擎）===
+
+已挂钩 ntdll!NtQueryValueKey（本进程内）。
+
+--- 0. 布局勘察：class 0~4 的原始头（值 Text="Secret123"，数据 20 字节）---
+  class=0 status=0x00000000 ResultLength=20  dwords: [+0]=0x00000000 [+4]=0x00000001 [+8]=0x00000008 [+12]=0x00650054 [+16]=0x00740078
+  class=1 status=0x00000000 ResultLength=52  dwords: [+0]=0x00000000 [+4]=0x00000001 [+8]=0x00000020 [+12]=0x00000014 [+16]=0x00000008
+  class=2 status=0x00000000 ResultLength=32  dwords: [+0]=0x00000000 [+4]=0x00000001 [+8]=0x00000014 [+12]=0x00650053 [+16]=0x00720063
+  class=3 status=0x00000000 ResultLength=52  dwords: [+0]=0x00000000 [+4]=0x00000001 [+8]=0x00000020 [+12]=0x00000014 [+16]=0x00000008
+  class=4 status=0x00000000 ResultLength=28  dwords: [+0]=0x00000001 [+4]=0x00000014 [+8]=0x00650053 [+12]=0x00720063 [+16]=0x00740065
+  [PASS] 布局：class 0 无数据区（ResultLength == 12 + 名字字节）
+  [PASS] 布局：class 2 头 == 12 字节（ResultLength - DataLength）
+  [PASS] 布局：class 2 的 Type 在 +4
+  [PASS] 布局：class 4 头 == **8** 字节（不是 12！）
+  [PASS] 布局：class 4 的 Type 在 +0（? **没有 TitleIndex**）
+  [PASS] 布局：class 1 的 DataOffset 在 +8、DataLength 在 +12，且 DataOffset+DataLength == ResultLength
+  [PASS] 布局：class 3 与 class 1 **逐字节相同**（含 TitleIndex）
+--- A. 基线（负对照）：替换**关** ---
+  [PASS] 替换关时调用成功
+  [PASS] 替换关时拿到真值（数据区非 0）
+  [PASS] 替换关时计数为 0（没发生替换）
+
+--- B/C/D. 打开替换，逐类型验证（Partial class=2）---
+  [PASS] REG_SZ：真实调用成功且定位到数据区
+  [PASS] REG_SZ：真实数据区里确实有非 0 内容（非空真）
+  [PASS] REG_SZ：替换后数据区**全 0**
+  [PASS] REG_SZ：数据区**之外逐字节相同**（长度/偏移/名字全没动）
+  [PASS] REG_SZ：*ResultLength 不变
+         （类型=REG_SZ 数据长度=20 数据偏移=12）
+  [PASS] REG_DWORD：真实调用成功且定位到数据区
+  [PASS] REG_DWORD：真实数据区里确实有非 0 内容（非空真）
+  [PASS] REG_DWORD：替换后数据区**全 0**
+  [PASS] REG_DWORD：数据区**之外逐字节相同**（长度/偏移/名字全没动）
+  [PASS] REG_DWORD：*ResultLength 不变
+         （类型=REG_DWORD 数据长度=4 数据偏移=12）
+  [PASS] REG_MULTI_SZ：真实调用成功且定位到数据区
+  [PASS] REG_MULTI_SZ：真实数据区里确实有非 0 内容（非空真）
+  [PASS] REG_MULTI_SZ：替换后数据区**全 0**
+  [PASS] REG_MULTI_SZ：数据区**之外逐字节相同**（长度/偏移/名字全没动）
+  [PASS] REG_MULTI_SZ：*ResultLength 不变
+         （类型=REG_MULTI_SZ 数据长度=24 数据偏移=12）
+  [PASS] REG_BINARY：真实调用成功且定位到数据区
+  [PASS] REG_BINARY：真实数据区里确实有非 0 内容（非空真）
+  [PASS] REG_BINARY：替换后数据区**全 0**
+  [PASS] REG_BINARY：数据区**之外逐字节相同**（长度/偏移/名字全没动）
+  [PASS] REG_BINARY：*ResultLength 不变
+         （类型=REG_BINARY 数据长度=4 数据偏移=12）
+  [PASS] REG_QWORD：真实调用成功且定位到数据区
+  [PASS] REG_QWORD：真实数据区里确实有非 0 内容（非空真）
+  [PASS] REG_QWORD：替换后数据区**全 0**
+  [PASS] REG_QWORD：数据区**之外逐字节相同**（长度/偏移/名字全没动）
+  [PASS] REG_QWORD：*ResultLength 不变
+         （类型=REG_QWORD 数据长度=8 数据偏移=12）
+
+--- D2. 归零后的值语义（真实调用方视角）---
+  [PASS] REG_SZ 归零后是空串（首 WCHAR == 0）
+  [PASS] REG_DWORD 归零后是 0
+  [PASS] REG_MULTI_SZ 归零后是空列表（首 WCHAR == 0）
+
+--- C2. Full 类（class=1）与 Align64（class=3/4）---
+         （class=1 Full: stReal=0x00000000 realLen=52 located=1 stSpoof=0x00000000 spoofLen=52）
+  [PASS] class=1 Full：定位到数据区且替换后全 0
+  [PASS] class=1 Full：数据区之外逐字节相同（含 DataOffset/NameLength）
+  [PASS] class=1 Full：*ResultLength 不变
+         （class=3 FullAlign64: stReal=0x00000000 realLen=52 located=1 stSpoof=0x00000000 spoofLen=52）
+  [PASS] class=3 FullAlign64：定位到数据区且替换后全 0
+  [PASS] class=3 FullAlign64：数据区之外逐字节相同（含 DataOffset/NameLength）
+  [PASS] class=3 FullAlign64：*ResultLength 不变
+         （class=4 PartialAlign64: stReal=0x00000000 realLen=28 located=1 stSpoof=0x00000000 spoofLen=28）
+  [PASS] class=4 PartialAlign64：定位到数据区且替换后全 0
+  [PASS] class=4 PartialAlign64：数据区之外逐字节相同（含 DataOffset/NameLength）
+  [PASS] class=4 PartialAlign64：*ResultLength 不变
+
+--- E. 边界：不认识 / 不合法的一律不替换 ---
+  [PASS] class=0 Basic 被判定为无数据区
+  [PASS] class=5 Layer 被判定为无数据区（宁可漏不可崩）
+  [PASS] class=0 调用成功
+  [PASS] class=0 没有发生替换（计数未增）
+  [PASS] 缓冲区短于结构头 -> 定位失败
+  [PASS] dataLength==0 -> 定位失败（清零 0 字节是空操作）
+  [PASS] dataOffset+dataLength 回绕 -> 定位失败（64 位算加法）
+  [PASS] info==nullptr -> 定位失败
+
+--- F. 真实调用方视角：RegQueryValueExW 也读到空串 ---
+  [PASS] RegQueryValueExW 调用成功
+  [PASS] RegQueryValueExW 拿到的类型仍是 REG_SZ
+  [PASS] RegQueryValueExW 拿到的是空串（替换对真实调用方生效）
+
+--- 计数自检 ---
+  [PASS] 发生过替换（spoofed=12）
+  [PASS] detour 命中次数 >= 替换次数（hits=14 >= 12）
+
+=== 结果：60 passed, 0 failed ===

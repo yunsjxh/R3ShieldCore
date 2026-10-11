@@ -672,16 +672,14 @@ namespace R3ShieldCoreRules
 		//
 		//   现在：原始形式先试（向后兼容已经在用完整形式的老配置），
 		//        归一化后的**相对**形式再试（文档写法 / 用户 hive 自动跳过 SID 段）。
-		if (MatchesUserProtectRegistry(keyPath)) {
+		// ★ v71：两种写法的判断抽成 `MatchesUserProtectRegistryBothForms`
+		//   —— 读替换那条路（`IsProtectedRegistryPathForSpoof`）要用**同一份**，
+		//   抄两份必然漂（铁律 127）。
+		if (MatchesUserProtectRegistryBothForms(keyPath)) {
 			return "自定义保护路径";
 		}
 
 		NormalizedKey key = NormalizeKey(keyPath);
-		if (key.relative && key.relative[0] != L'\0'
-			&& MatchesUserProtectRegistry(key.relative)) {
-			return "自定义保护路径";
-		}
-
 		if (!key.relative || key.relative[0] == L'\0') {
 			return nullptr;
 		}
@@ -2819,6 +2817,100 @@ namespace R3ShieldCoreRules
 	bool MatchesUserProtectRegistry(PCWSTR keyPath) noexcept
 	{
 		return MatchesProtectList(keyPath, ProtectRegAt, ProtectRegCount());
+	}
+
+	// protect_reg 的**两种写法**（原始完整形式 + 归一化相对形式）。
+	// 见头文件里的说明：抽出来是因为有两个调用点，抄两份必漂（铁律 127）。
+	bool MatchesUserProtectRegistryBothForms(PCWSTR keyPath) noexcept
+	{
+		if (MatchesUserProtectRegistry(keyPath)) {
+			return true;
+		}
+
+		NormalizedKey key = NormalizeKey(keyPath);
+		return key.relative && key.relative[0] != L'\0'
+			&& MatchesUserProtectRegistry(key.relative);
+	}
+
+	// v71：注册表「读替换」的触发面（只看 protect_reg，不看操作类型）。
+	bool IsProtectedRegistryPathForSpoof(PCWSTR keyPath) noexcept
+	{
+		return MatchesUserProtectRegistryBothForms(keyPath);
+	}
+
+	// ------------------------------------------------------------------
+	// v72：枚举隐藏的"要不要扫"判据（保守上界）
+	// ------------------------------------------------------------------
+	//
+	// `prefix` 是不是"就挂在 `path` 下面"（**带路径边界**）。
+	//
+	//   PrefixIsUnderPath(L"...\\MyCompany\\Critical", L"...\\MyCompany")  == true
+	//   PrefixIsUnderPath(L"...\\SOFTWARE\\X",       L"...\\SOFT")         == false  ← 边界挡住
+	//
+	// ★ 边界那一条不是洁癖：没有它，`protect_reg=SOFTWARE\MyCompany\Critical`
+	//   会让**所有以 `S`/`SO`/`SOF`… 结尾的键**都判"可能有受保护子项"
+	//   ⇒ 正常枚举被无谓地全量扫描（性能问题，不是正确性问题，
+	//   但性能问题在这条 hook 上就是"整个系统变卡"）。
+	static bool PrefixIsUnderPath(PCWSTR prefix, PCWSTR path) noexcept
+	{
+		if (!prefix || !path || prefix[0] == L'\0' || path[0] == L'\0') {
+			return false;
+		}
+
+		const size_t pathChars = wcslen(path);
+		if (_wcsnicmp(prefix, path, pathChars) != 0) {
+			return false;
+		}
+
+		// path 以 `\` 结尾 ⇒ 已经是边界；否则要求 prefix 的下一个字符是 `\`。
+		if (path[pathChars - 1] == L'\\') {
+			return true;
+		}
+		return prefix[pathChars] == L'\\';
+	}
+
+	bool CouldHaveProtectedChildRegistry(PCWSTR keyPath) noexcept
+	{
+		if (!keyPath || keyPath[0] == L'\0') {
+			return false;
+		}
+
+		const ULONG count = ProtectRegCount();
+		if (count == 0) {
+			return false;
+		}
+
+		// 与 `MatchesUserProtectRegistryBothForms` **同一套两种写法**：
+		// 策略里存的始终是原始串，比较时既比原始完整形式（`\REGISTRY\MACHINE\...`）
+		// 也比归一化后的相对形式（`SOFTWARE\...`）。
+		// 抄两套口径 ⇒ 必漂（铁律 127）；这里复用同一个 `NormalizeKey`。
+		NormalizedKey key = NormalizeKey(keyPath);
+		const bool haveRelative = key.relative && key.relative[0] != L'\0';
+
+		for (ULONG i = 0; i < count; i++) {
+			PCWSTR prefix = ProtectRegAt(i);
+			if (!prefix || prefix[0] == L'\0') {
+				continue;
+			}
+
+			// ① 被枚举的键**本身**就在前缀下 ⇒ 子项全部在前缀下。
+			if (StartsWithNoCase(keyPath, prefix)) {
+				return true;
+			}
+			if (haveRelative && StartsWithNoCase(key.relative, prefix)) {
+				return true;
+			}
+
+			// ② 前缀挂在被枚举的键**下面** ⇒ 某个子项可能正是前缀的那一段。
+			if (PrefixIsUnderPath(prefix, keyPath)) {
+				return true;
+			}
+			if (haveRelative && PrefixIsUnderPath(prefix, key.relative)) {
+				return true;
+			}
+		}
+
+		return false;
 	}
 
 	bool MatchesUserProtectFile(PCWSTR path) noexcept

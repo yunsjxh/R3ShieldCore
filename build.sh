@@ -196,6 +196,16 @@ build_lib() {
     # 注意：这两个选项必须用正斜杠。用 "-MANIFEST" 时 link 不报错，
     # 但产物里根本没有资源区，manifest 静默丢失（实测确认）。
     # 所以这里临时关掉 MSYS 的路径转换。
+    #
+    # ★ v73：`mfuuid.lib` —— 摄像头帧替换要读 `MF_MT_MAJOR_TYPE` /
+    #   `MF_MT_SUBTYPE` / `MF_MT_FRAME_SIZE` / `MF_MT_DEFAULT_STRIDE` /
+    #   `MFMediaType_Video` 这 5 个 GUID 常量，它们由 **mfuuid.lib** 提供。
+    #   ⚠️ 为什么可以放心加：mfuuid.lib 是**纯 GUID 数据**的静态库
+    #      （和 uuid.lib 同类）—— **不引入任何 DLL 导入**，
+    #      所以不会给"被注入到每个进程"的 DLL 添新的加载期依赖。
+    #   ⚠️ 反过来，`MFGetAttributeSize` 是 mfapi.h 里的 **inline**
+    #      （`dumpbin -SYMBOLS` 实测它在 obj 里是**已定义**的 SECT 符号），
+    #      所以**不需要** mfplat.lib —— 那个才是真·导入库，绝不能加。
     MSYS_NO_PATHCONV=1 "$LINK" -nologo -DLL \
         -DEF:R3ShieldCoreLib/_exports.def \
         -SUBSYSTEM:WINDOWS \
@@ -206,6 +216,7 @@ build_lib() {
         "${COMPILED_OBJECTS[@]}" \
         "$MINHOOK" \
         kernel32.lib user32.lib gdi32.lib advapi32.lib wtsapi32.lib ntdll.lib shell32.lib ole32.lib oleaut32.lib comctl32.lib uuid.lib taskschd.lib wintrust.lib crypt32.lib \
+        mfuuid.lib \
         || { FAILED=1; return 1; }
 
     echo "--> $CONFIG/$archdir/r3shieldcore-lib.dll"
@@ -245,6 +256,10 @@ build_demo() {
     EXTRA_INCLUDES=(
         -I shared
         -I shared/libraries
+        # ★ v77：主程序「高级」页要显示"改前 / 改后"的字节，用的是
+        #   **生产同源**的注册表 / 剪贴板 codec（铁律 195：同一份逻辑不抄第二遍）。
+        #   那些 codec 住在 R3ShieldCoreLib/ 下，所以要把它也放进搜索路径。
+        -I R3ShieldCoreLib
     )
 
     local sources=(

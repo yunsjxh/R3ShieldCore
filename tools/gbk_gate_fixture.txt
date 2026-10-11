@@ -24,13 +24,15 @@
 //   CMT : comment containing U+21D2          -> 1 bad, ONLY in --comments mode
 //   N1  : narrow literal, real chars         -> 2 bad (U+26A0, U+21D2)
 //   N2  : narrow literal, \uXXXX escapes     -> 2 bad (ASCII-only source text!)
-//   W1  : wide L"..." literal, real chars    -> 0 bad
-//   W2  : wide L"..." literal, \uXXXX escape -> 0 bad
-//   U1  : u8"..." literal, real char         -> 0 bad
-//   E1  : narrow literal + `gbk-ok` on line  -> 0 bad
+//   W1  : wide L"..." literal, real chars    -> 0 bad  /  2 bad in --wide mode
+//   W2  : wide L"..." literal, \uXXXX escape -> 0 bad  /  1 bad in --wide mode
+//   U1  : u8"..." literal, real char         -> 0 bad  /  0 bad in --wide mode
+//        (u8 is UTF-8 execution charset: neither narrow nor wide -> never flagged)
+//   E1  : narrow literal + `gbk-ok` on line  -> 0 bad  /  0 bad in --wide mode
 //
 //   literals-only mode : 4 bad
 //   literals+comments  : 5 bad
+//   --wide mode        : 3 bad  (W1:2 + W2:1)
 
 // === FIXTURE BODY BEGINS (sentinel; do not remove) ===
 

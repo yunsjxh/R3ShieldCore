@@ -77,10 +77,45 @@ check_source_gbk.py —— 找出 MSVC 在中文代码页(936)下**放不下**�
       没有负对照，"我修好了"就只是一句话；有了负对照，
       "它会红、而且只在真该红的时候红"才是被证明过的事实。
 
+================================================================================
+★ v75 修正五：新增 `--wide` —— 查**宽**字面量的"运行时丢字"（铁律 226）
+================================================================================
+
+    前面四条都在管**窄**字面量的 **C4566**（编译期丢字）。
+    但 v75 做「替换 API 结果」控制台时踩到一个**新的、发生在运行时**的同类坑：
+
+        控制台所有用户可见文本都在宽字面量里，输出走
+            WideCharToMultiByte(CP_ACP, ...) + fputs
+        —— 宽字面量**不会** C4566（编译器不管它），
+           但 CP936 **编不出**的字符在转换时会被**静默换成 `?`**：
+
+            Say(L"...（RejectOrSpoof）⇒ 不拒就不换。")  →  实际输出 "...（RejectOrSpoof）? 不拒就不换。"
+
+        编译零警告、零错误，跑起来也不崩 —— 只是那句话里少了一个箭头。
+        **和 C4566 是一模一样的病症（静默少字），只是换了发生时机。**
+
+    ⇒ `--wide` 模式：把检测器对准**宽**字面量（前缀 `L` / `LR`），
+      判据仍是"能不能用 CP936 编码"。
+      同一个词法器、同一个判据、同一套豁免标记，只是选中的字面量类别相反。
+      ★ `u"..."` / `U"..."` / `u8"..."` 这类**既不是窄也不是宽**（UTF-16/32/8
+        执行字符集），两类问题都不沾 ⇒ 两种模式都**不查**（否则就是假 FAIL）。
+
+      ★ 只在"输出会走 CP_ACP"的文件上用它（控制台 / CLI 工具）。
+        纯 GUI 程序把宽字面量直接交给 `MessageBoxW` / `SetWindowTextW`
+        —— 那些 API 吃的是 `wchar_t`，**不经过** CP936 ⇒ 用 `--wide` 查它们
+        会制造**假 FAIL**（铁律 127：假 FAIL 比漏报更贵）。
+
+    ★ 负对照同样覆盖：夹具里的 `W1` / `W2`（宽字面量）在 `--wide` 下
+      **必须**被检出，而 `N1` / `N2`（窄字面量）**必须**一处不报
+      —— 见 `tools/selftest_gbk_gate.py` 第 ⑥ 节。
+
+================================================================================
 用法：
     python tools/check_source_gbk.py driver/r3shieldcore_kernel.c driver/driver_probe.c
     python tools/check_source_gbk.py --all                # 扫全仓 .c/.cpp/.h（仅字面量）
     python tools/check_source_gbk.py --all --comments     # 连注释一起查（严格模式）
+    python tools/check_source_gbk.py --wide tools/spoof_console.cpp
+                                                          # 查宽字面量（CP_ACP 输出）
 退出码：0 = 全部安全；1 = 有不安全字符
 """
 
@@ -108,11 +143,31 @@ SKIP_DIRS = {"obj", "_t", "build", "dist", ".git", "libraries", "verdir", "demo"
              "backup", "verification"}
 
 
-def scan(path, include_comments=False):
+def _wanted(narrow, is_wide, wide_only):
+    """当前字面量是否属于本次要检查的类别。
+
+    ★ 字面量其实是**三类**，不是两类：
+        narrow（空 / R 前缀）      —— 执行字符集 = CP936 ⇒ 会被 C4566 丢字
+        wide  （L / LR 前缀）      —— wchar_t；**不经** CP936，
+                                      但经 CP_ACP 输出时会变成 `?`
+        other （u / U / u8 / …）   —— UTF-16 / UTF-32 / UTF-8 执行字符集，
+                                      两类问题都不沾 ⇒ 两种模式都**不查**
+
+    wide_only=False（默认）：只查 narrow。
+    wide_only=True        ：只查 wide（**不**把 u8 之类误当成宽字面量）。
+    """
+    return is_wide if wide_only else narrow
+
+
+def scan(path, include_comments=False, wide_only=False):
     """返回 (bad, err)。
 
     bad = [(行号, 列号, 字符, 码点, 位置, 字面量前缀)]
     err = None 或错误串。
+
+    ★ wide_only（v75 新增，见文件头"修正五"）：
+        默认 False —— 查**窄**字面量会不会被 C4566 丢字。
+        置 True   —— 查**宽**字面量能不能被 CP936 编码（运行时 CP_ACP 输出）。
 
     ★ 实现是一个**极简 C/C++ 词法器**，只为回答一个问题：
       "这个字符在不在**窄**字面量里？"
@@ -144,6 +199,7 @@ def scan(path, include_comments=False):
     col = 1
     state = "code"          # code | line_comment | block_comment | string | char
     narrow = True           # 当前字面量是否是"窄"的（会被 C4566 丢字）
+    is_wide = False         # 当前字面量是否是"宽"的（L / LR ⇒ 运行时可能变 ?）
     prefix = ""             # 当前字面量的前缀，用于诊断输出
 
     def bump(ch):
@@ -185,6 +241,7 @@ def scan(path, include_comments=False):
             if ch == '"' or ch == "'":
                 prefix = prefix_before(i)
                 narrow = prefix not in SAFE_PREFIXES
+                is_wide = prefix in ("L", "LR")   # ★ 只有 L / LR 才是 wchar_t 宽字面量
                 state = "string" if ch == '"' else "char"
                 bump(ch)
                 i += 1
@@ -236,8 +293,9 @@ def scan(path, include_comments=False):
                     if len(hexs) == hexlen and all(
                             c in "0123456789abcdefABCDEF" for c in hexs):
                         cp = int(hexs, 16)
-                        if narrow and not (0xD800 <= cp <= 0xDFFF) and cp <= 0x10FFFF \
-                                and not suppressed(line):
+                        if _wanted(narrow, is_wide, wide_only) \
+                                and not (0xD800 <= cp <= 0xDFFF) \
+                                and cp <= 0x10FFFF and not suppressed(line):
                             _check_gbk(chr(cp), line, col, state,
                                        prefix + "\\" + esc, bad)
                         for k in range(2 + hexlen):
@@ -256,12 +314,13 @@ def scan(path, include_comments=False):
             if (state == "string" and ch == '"') or (state == "char" and ch == "'"):
                 state = "code"
                 narrow = True
+                is_wide = False
                 prefix = ""
                 bump(ch)
                 i += 1
                 continue
-            # ★ 只查**窄**字面量 —— 宽/UTF-8 字面量不会 C4566（见文件头探针）。
-            if narrow and ord(ch) >= 128 and not suppressed(line):
+            # ★ 只查本次要查的那一类字面量（默认窄；--wide 时只查 L/LR）。
+            if _wanted(narrow, is_wide, wide_only) and ord(ch) >= 128 and not suppressed(line):
                 _check_gbk(ch, line, col, state, prefix, bad)
             bump(ch)
             i += 1
@@ -291,14 +350,18 @@ def gather_all(root):
 def main():
     argv = sys.argv[1:]
     include_comments = "--comments" in argv
+    wide_only = "--wide" in argv
     want_all = "--all" in argv
     args = [a for a in argv if not a.startswith("--")]
+
+    scope = "宽字面量（--wide：CP_ACP 输出时会不会变成 '?'）" if wide_only else "窄字面量"
+    if include_comments:
+        scope += " + 注释"
 
     if want_all:
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         targets = gather_all(root)
-        print("扫描全仓 %d 个源文件（范围：%s）..."
-              % (len(targets), "窄字面量 + 注释" if include_comments else "仅窄字面量"))
+        print("扫描全仓 %d 个源文件（范围：%s）..." % (len(targets), scope))
     elif args:
         targets = args
     else:
@@ -310,7 +373,7 @@ def main():
     missing = []
 
     for path in targets:
-        bad, err = scan(path, include_comments)
+        bad, err = scan(path, include_comments, wide_only)
         if bad is None:
             if "No such file" in err or not os.path.exists(path):
                 missing.append(path)
@@ -322,25 +385,37 @@ def main():
         if bad:
             total_bad += len(bad)
             files_bad += 1
-            print("[FAIL] %s —— %d 个字符在 CP936 下编不出（会被 C4566 静默丢掉）:"
-                  % (path, len(bad)))
+            if wide_only:
+                print("[FAIL] %s —— %d 个字符在 CP936 下编不出"
+                      "（宽字面量经 WideCharToMultiByte(CP_ACP) 输出时会变成 '?'）:"
+                      % (path, len(bad)))
+            else:
+                print("[FAIL] %s —— %d 个字符在 CP936 下编不出（会被 C4566 静默丢掉）:"
+                      % (path, len(bad)))
             for line, col, ch, cp, where, prefix in bad[:40]:
                 print("        行 %d 列 %d  %r  U+%04X  [%s%s]"
                       % (line, col, ch, cp, where,
                          (" 前缀=" + prefix) if prefix else ""))
             if len(bad) > 40:
                 print("        ...（还有 %d 处）" % (len(bad) - 40))
-            print("       修法：换成 ASCII 写法（例如 ⚠ → [!]、⇒ → ->），"
-                  "或把该字面量改成宽字面量 L\"...\"（宽字面量不受 C4566 影响）；"
-                  "确属合法假阳性（如 TEXT(\"...\") 宏）可在该行加 `// %s` 豁免。"
-                  % SUPPRESS_MARK)
+            if wide_only:
+                print("       修法：换成 ASCII 写法（例如 ⇒ → =>、→ → ->、⚠ → [!]）；"
+                      "确属合法假阳性可在该行加 `// %s` 豁免。" % SUPPRESS_MARK)
+            else:
+                print("       修法：换成 ASCII 写法（例如 ⚠ → [!]、⇒ → ->），"
+                      "或把该字面量改成宽字面量 L\"...\"（宽字面量不受 C4566 影响）；"
+                      "确属合法假阳性（如 TEXT(\"...\") 宏）可在该行加 `// %s` 豁免。"
+                      % SUPPRESS_MARK)
 
     for path in missing:
         print("[INFO] 跳过不存在的文件: %s" % path)
 
     print()
     if total_bad == 0:
-        print("PASS: 所有窄字面量在 CP936 执行字符集下都能完整表示。")
+        if wide_only:
+            print("PASS: 所有宽字面量都能被 CP936 编码（经 CP_ACP 输出不会变成 '?'）。")
+        else:
+            print("PASS: 所有窄字面量在 CP936 执行字符集下都能完整表示。")
         return 0
     print("FAIL: %d 个文件、共 %d 个字符会被静默丢弃 —— 先修掉再编译。"
           % (files_bad, total_bad))

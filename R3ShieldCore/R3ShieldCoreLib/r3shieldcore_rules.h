@@ -229,6 +229,53 @@ namespace R3ShieldCoreRules
 	// 是否命中用户自定义的 protect_reg / protect_file 前缀。
 	bool MatchesUserProtectRegistry(PCWSTR keyPath) noexcept;
 	bool MatchesUserProtectFile(PCWSTR path) noexcept;
+
+	//
+	// protect_reg 的**两种写法**都要认：原始完整形式（`\REGISTRY\MACHINE\...`）
+	// 与归一化后的相对形式（`SOFTWARE\MyCompany\Critical`，文档给用户的就是这种）。
+	//
+	// ★ 为什么抽成一个函数：这条逻辑有**两个**调用点 ——
+	//   ① 写操作的"自定义保护路径"高危判据（`RegistryRiskReason`）；
+	//   ② v71 读替换的"受保护值"判据（`IsProtectedRegistryPathForSpoof`）。
+	//   抄两份必然漂（铁律 127：同一份清单拷贝多份 ⇒ 必漂，且漂了之后
+	//   一条路命中、另一条静默不命中，**极难发现**）。
+	bool MatchesUserProtectRegistryBothForms(PCWSTR keyPath) noexcept;
+
+	//
+	// v71：**注册表「读替换」的触发面** —— 这个键路径是不是"受保护位置"。
+	//
+	// ★ 判据**只有** `protect_reg=`，**不含**内置高危规则表。理由：
+	//   高危表里有 `...\CurrentVersion\Run` 这类**正常软件天天读**的位置
+	//   （任务管理器 / 启动项管理 / 安装程序都在枚举），拿它当替换触发面
+	//   会大面积误伤正常软件；而 `protect_reg=` 是用户**显式声明**的，
+	//   语义天然是"保护" ⇒ "写不进 + 读不到"。
+	//
+	// ⚠️ 与写判据的关键差别：这里**不看操作类型**。写判据要求
+	//   `IsHighRiskOp(op)`（读操作不算高危），而本判据**就是给读操作用的**。
+	bool IsProtectedRegistryPathForSpoof(PCWSTR keyPath) noexcept;
+
+	//
+	// v72：**枚举隐藏**的"要不要扫"判据 —— 被枚举的这个键，它的**直接子项**
+	// 有没有可能命中 `protect_reg=`？
+	//
+	// ★ 为什么需要它：枚举隐藏要正确重映射索引，就必须**从索引 0 开始扫**
+	//   （数出前面有几个被隐藏的项）。如果每个枚举调用都无条件扫一遍，
+	//   正常的枚举（任务管理器、安装程序、任何遍历注册表的程序）都会被打上
+	//   O(n) 的额外开销 —— 而它们**根本不在保护范围内**。
+	//   本判据是**保守上界**：返回 false ⇒ 保证一个子项都不可能命中 ⇒ 直接放行；
+	//   返回 true ⇒ **可能**有（也可能没有）⇒ 值得扫一次。
+	//   ★ 方向很重要：**宁可多扫一次，不可漏藏**（假阴性会"藏不住"，
+	//     假阳性只是慢一点）。
+	//
+	// 判据（与 `IsProtectedRegistryPathForSpoof` 同一套"两种写法"口径）：
+	//   存在某个 `protect_reg=` 前缀 P，使
+	//     ① `keyPath` 本身就以 P 开头（⇒ 子项**全部**在前缀下），或
+	//     ② P 就挂在 `keyPath` **下面**（⇒ 某个子项可能正是 P 的那一段）。
+	//   ②必须**带路径边界**（P 的前 `len(keyPath)` 个字符等于 keyPath，
+	//   且下一个字符是 `\`）—— 否则 `SOFT` 会"命中" `SOFTWARE\...` 而
+	//   实际没有任何子项能匹配上（无谓的全量扫描）。
+	bool CouldHaveProtectedChildRegistry(PCWSTR keyPath) noexcept;
+
 	bool MatchesUserProtectProcess(PCWSTR imagePath) noexcept;
 	bool MatchesUserProtectDriver(PCWSTR driverPath) noexcept;
 

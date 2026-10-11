@@ -50,10 +50,14 @@ DIST_DIR="dist/R3ShieldCore-x64"
 
 CHECK_ONLY=0
 DO_DSKILL=1
+DO_CFGTOOL=1
+DO_VERIFY_INI=1
 for a in "$@"; do
     case "$a" in
-        --check)     CHECK_ONLY=1 ;;
-        --no-dskill) DO_DSKILL=0 ;;
+        --check)          CHECK_ONLY=1 ;;
+        --no-dskill)      DO_DSKILL=0 ;;
+        --no-cfgtool)     DO_CFGTOOL=0 ;;
+        --no-verify-ini)  DO_VERIFY_INI=0 ;;
         *) echo "未知参数: $a"; exit 2 ;;
     esac
 done
@@ -136,6 +140,19 @@ else
     echo ""
 fi
 
+# ---- 1b) r3shieldcore-cfg.exe：独立「配置编辑 + 日志观察」工具 ----
+#      不注入、不挂钩、不依赖引擎/服务在跑 —— 只读写 ini + tail 日志。
+#      ★ 它**不来自 Release/**：由 build_cfgtool.sh 直接编进 dist（和 dskill 同类）。
+#      ★ 也不走下面的 MAP 拷贝 —— 那样会出现"自己拷自己"的空判据。
+if [ "$DO_CFGTOOL" = "1" ]; then
+    echo "=== 构建配置与日志工具（build_cfgtool.sh x64）==="
+    bash build_cfgtool.sh x64 || { echo "[败] build_cfgtool.sh 失败"; exit 1; }
+    echo ""
+else
+    echo "[跳过] r3shieldcore-cfg.exe（--no-cfgtool）"
+    echo ""
+fi
+
 # ---- 2) 拷贝（按布局建子目录）
 echo "=== 拷贝 ==="
 for entry in "${MAP[@]}"; do
@@ -147,6 +164,47 @@ for entry in "${MAP[@]}"; do
     echo "  $rel  ($(stat -c%s "$dst") B)"
 done
 echo ""
+
+# ---- 2b) 清掉**运行时残留**的日志
+#      ★ 为什么必须清：这两个日志是**引擎自己跑起来之后写的**（写在 exe 同目录），
+#        不是发布内容。谁在 dist 目录里直接跑过一次引擎，它们就会留在那里，
+#        然后被打进 zip / 安装包。后果有两条，都不轻：
+#          ① 泄漏：开发机上的**键路径 / 进程路径 / 事件**会随发布包发出去；
+#          ② 骗人：`tools/spoof_e2e.sh` 的 `read_console` 在"引擎还没跑"时
+#             会退到读这个文件 ⇒ 用户看到的是**上一次**的日志，却以为是本次的
+#             （铁律 97：诊断不能自己变成假信息）。
+#      ★ 安装器的自测（installer/selftest_setup.py）早就把它们归到
+#        `is_runtime_artifact` 一类（"引擎跑起来之后自己写的，不算安装出来的
+#        文件"）⇒ 从这里删掉与那份口径**一致**，不会让任何闸门变红。
+#      ⚠️ 只删顶层这两个已知名 —— 不用通配 `*.log`，免得将来真有随包发的
+#        日志文件被误删（铁律 117：判据要窄，别顺手扩大）。
+for _stale in r3shieldcore-console.log r3shieldcore-events.log; do
+    if [ -f "$DIST_DIR/$_stale" ]; then
+        rm -f "$DIST_DIR/$_stale"
+        echo "  清掉运行时残留: $_stale"
+    fi
+done
+echo ""
+
+# ---- 2c) 发布闸门：随包 ini **真的解析成预期配置**吗
+#      ★★ 为什么必须接进流水线（2026-10-11 补）：`tools/verify_dist_ini.cpp`
+#        这个闸门**早就存在**（build_verify_dist.sh 能编能跑），但**一直没人调**
+#        —— 于是某次把 `mode=block` 手改成 `mode=ask` 的漂移一路飘进了 dist：
+#        文档（配置详解 / 部署指南 / 模式选择说明）、预设、以及这个闸门自己的
+#        断言**三处都写着 block**，只有 ini 是 ask，谁都没发现。
+#        ⇒ 铁律：**闸门不接进流水线 = 没有闸门**。
+#      ★ 它链的是**引擎侧同一个解析器**（r3shieldcore_config.cpp），所以验的是
+#        "引擎认不认"，不是"grep 找不找得到"（铁律 17）。
+#      ⚠️ 它必须跑在 **2) 拷贝之后** —— 校验对象是 dist 里那份，不是 Release 里的。
+if [ "$DO_VERIFY_INI" = "1" ]; then
+    echo "=== 发布闸门：随包 ini 解析校验（build_verify_dist.sh）==="
+    bash build_verify_dist.sh x64 "$DIST_DIR" \
+        || { echo "[败] 随包 ini 未通过发布闸门 —— 不要出包"; exit 1; }
+    echo ""
+else
+    echo "[跳过] 随包 ini 解析校验（--no-verify-ini）"
+    echo ""
+fi
 
 # ---- 3) 验收：内容相等（md5），不是"文件存在"
 #      ★ 这一步不能省 —— 它正是 v57 事故之后补的那道闸门。

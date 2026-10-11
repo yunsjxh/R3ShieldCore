@@ -54,6 +54,14 @@ namespace R3ShieldCoreGui
 	// 供发布包自检使用。
 	int RunTopMostSelfTest() noexcept;
 
+	// ★ v77：**界面预览**模式（`--gui-preview`）。
+	//   把完整窗口建起来并一直跑着，但**不初始化注入引擎** ——
+	//   所以可以在开发机上安全地反复看界面、截图核对（铁律 175 禁跑引擎）。
+	//   和 RunTopMostSelfTest 是同一位置分流（引擎初始化之前），
+	//   区别是它"建窗→自检→立刻退"，本函数"建窗→等你关"。
+	//   配合环境变量 `R3SHIELDCORE_START_TAB` 可直接停在指定页签。
+	int RunPreview() noexcept;
+
 	// 销毁窗口并结束 GUI 线程。
 	void Stop() noexcept;
 

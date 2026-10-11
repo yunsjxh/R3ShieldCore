@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!--
+  r3shieldcore_cfg.manifest —— 「配置与日志」工具的应用程序清单。
+
+  ⚠️ 与引擎（r3shieldcore-uac.manifest）的关键区别：
+     · 引擎要求 requireAdministrator（它要全局注入）；
+     · **本工具不要求管理员** —— 它只读写 ini + 读日志。
+       v66 起 ProgramData 下那份配置对 Users 可写（铁律 163），
+       绿色包时配置就在 exe 同目录，通常也可写。
+       ⇒ 用默认的 asInvoker，**不弹 UAC**，普通用户双击即用。
+
+  ⚠️ comctl32 v6 依赖：要用主题化的标准控件（勾选框 / 下拉框 / 列表）。
+     没有这一段会加载到 v5，控件外观退回 Win95 风格。
+
+  ⚠️ DPI：只声明 system aware（不做 PerMonitorV2）—— 本工具用固定像素布局，
+     没有逐显示器缩放的处理，声明 system aware 才不会在高 DPI 下糊成一团。
+-->
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0"
+          xmlns:asmv3="urn:schemas-microsoft-com:asm.v3">
+
+  <dependency>
+    <dependentAssembly>
+      <assemblyIdentity type="win32" name="Microsoft.Windows.Common-Controls"
+                        version="6.0.0.0" processorArchitecture="*"
+                        publicKeyToken="6595b64144ccf1df" language="*"/>
+    </dependentAssembly>
+  </dependency>
+
+  <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">
+    <application>
+      <supportedOS Id="{e2011457-1546-43c5-a5fe-008deee3d3f0}"/>
+      <supportedOS Id="{35138b9a-5d96-4fbd-8e2d-a2440225f93a}"/>
+      <supportedOS Id="{4a2f28e3-53b9-4441-ba9c-d69d4a4a6e38}"/>
+      <supportedOS Id="{1f676c76-80e1-4239-95bb-83d0f6d0da78}"/>
+      <supportedOS Id="{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}"/>
+    </application>
+  </compatibility>
+
+  <asmv3:application>
+    <asmv3:windowsSettings>
+      <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true</dpiAware>
+      <longPathAware xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">true</longPathAware>
+    </asmv3:windowsSettings>
+  </asmv3:application>
+</assembly>

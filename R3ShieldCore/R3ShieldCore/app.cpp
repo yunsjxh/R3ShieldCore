@@ -208,6 +208,10 @@ namespace
 	//   ① 改 DLL 侧共享内存的 Mode —— 全局立刻生效（被注入进程每次判定都重读）
 	//   ② 把新值写回 r3shieldcore.ini —— 让切换活过下次重启
 	//   ③ 通知界面刷新徽章 —— 只有走到这里才变，切失败就保持原样
+	//
+	// ★ v69 注意：切换**不会**动 `test_inject_only=`（`SaveMode` 只改 `mode=`
+	//   一行）。这是**安全的**：注入白名单与 `mode=` 解耦（只要名单非空就生效），
+	//   所以"测试模式里点了切换 ⇒ 重启后退化成全局注入"这件事**不会发生**。
 	void ApplyMode(EngineControl& engineControl, R3ShieldCore::Mode mode,
 		const std::filesystem::path& exeDirectory)
 	{
@@ -333,6 +337,15 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
 		return R3ShieldCoreGui::RunTopMostSelfTest();
 	}
 
+	// ★ v77 界面预览（--gui-preview）：建窗 + 一直跑着，**不初始化注入引擎**。
+	//   用途 = 在开发机上安全地看 / 截图核对界面（铁律 175：本机禁跑引擎，
+	//   因为全局注入会 hook 编辑器）。和 --topmost-selftest 一样必须在
+	//   引擎初始化**之前**分流，否则会顺带注入一整套 hook。
+	//   配合 R3SHIELDCORE_START_TAB=log|process|config|ark|advanced 指定页签。
+	if (std::wstring(GetCommandLineW()).find(L"--gui-preview") != std::wstring::npos) {
+		return R3ShieldCoreGui::RunPreview();
+	}
+
 	// 全链路自检（--superdesk-selftest）：自己扮演引擎，走完整条 A 配方
 	//（SYSTEM 令牌 → 改会话号 → TokenUIAccess → CreateProcessWithTokenW
 	//  到 winsta0\Winlogon），等面板按 6 秒寿命自己退掉后收尾。
@@ -441,6 +454,55 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
 		printf("模式        : %ls\n", ModeDisplayText(policy.Mode));
 		printf("  切换方式  : 界面页签栏右侧的「切换: xxx」按钮（运行期生效，会写回 ini）\n");
 
+		//
+		// ★ v68/v69：**限定注入范围**（ini: `test_inject_only=`；`mode=test` 是便捷写法）。
+		//
+		// 动机：本机做端到端验证时，全局注入会 hook 编辑器 ⇒ 崩（铁律 175）。
+		//   把注入范围缩到一个**白名单**，引擎就能在开发机上安全地跑。
+		//
+		// ★ 为什么单独印一段、而不是并进上面那行：
+		//   注入范围与 `mode=` 是**两件事**（只要名单非空就生效，见
+		//   `functions.cpp` 里那段"解耦"的理由）。所以「模式」那行可能是
+		//   BLOCK 也可能是 LOG，**看不出**引擎其实只在注入白名单 ——
+		//   铁律 97：这件事必须可诊断，不能靠"我记得我配过"。
+		//
+		// ★ fail-closed：写了 `mode=test` 却没给名单 ⇒ 用户的本意是"只碰这几个
+		//   进程"，实际会变成"一个都不注入"（引擎看着在跑、实际全盲）。宁可起不来，
+		//   也不要一个"正常"的假实例（铁律 110：别让"全零"也算成立）。
+		//   走 throw ⇒ 复用既有启动失败路径（startup-failure 日志 + 弹框 + 退出码 1）。
+		//
+		if ((policy.Flags2 & R3ShieldCore::FlagTestMode) && policy.TestInjectCount == 0) {
+			throw std::runtime_error(
+				"mode=test 已开启，但 test_inject_only= 一条都没有（或全是空白）。"
+				"那样注入范围会缩成零个进程，引擎看着在跑却什么都不监控。"
+				"请补上白名单，或把 mode= 改回 log。");
+		}
+
+		if (policy.TestInjectCount > 0) {
+			// ⚠️ 本段是**窄**字符串 printf，走 936 代码页 ⇒ 不能出现 CP936 之外
+			//   的符号（`⇒` U+21D2 会被 MSVC 报 C4566 并实际打出 `?`）。
+			printf("\n");
+			printf("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n");
+			printf("!! 注入范围已被限定（test_inject_only=）                   !!\n");
+			printf("!! 只注入下列白名单条目匹配的进程，其余**一律跳过**。       !!\n");
+			printf("!! 名单之外的进程**完全不受监控**（一个 hook 都没有）。     !!\n");
+			printf("!! 这是给开发机做验证用的；日常使用请把 test_inject_only=   !!\n");
+			printf("!! 整行删掉（或注释掉），再重启引擎。                       !!\n");
+			printf("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n");
+			if (policy.Flags2 & R3ShieldCore::FlagTestMode) {
+				printf("（mode=test 的拦截行为 = LOG：只记录、全部放行）\n");
+			}
+			printf("测试白名单  : %u 条（ini: test_inject_only=，可重复/可逗号分隔）\n",
+				static_cast<unsigned>(policy.TestInjectCount));
+			for (ULONG i = 0; i < policy.TestInjectCount && i < R3ShieldCore::MaxTestInjectPaths; ++i) {
+				printf("  [%u] %ls\n", static_cast<unsigned>(i), policy.TestInjectPaths[i]);
+			}
+			// ⚠️ 本行是**窄**字符串 printf，走 936 代码页 ⇒ 不能出现 CP936 之外
+			//   的符号（`⇒` U+21D2 会被 MSVC 报 C4566 并实际打出 `?`）。
+			printf("  匹配规则  : 含 \\ 或 / = 完整路径前缀（带路径边界）；否则 = 镜像基名（不区分大小写）\n");
+			printf("\n");
+		}
+
 		if (policy.Mode == static_cast<ULONG>(R3ShieldCore::Mode::BlockAll)) {
 			// 这个模式的后果很重，横幅必须写足，免得用户过两天忘了是自己开的。
 			printf("\n");
@@ -513,6 +575,37 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
 		}
 
 		printf("挂读操作    : %s\n", (policy.Flags & R3ShieldCore::FlagHookReads) ? "是" : "否");
+		// ★ v71：注册表值替换状态。触发面与截屏/剪贴板**不同** ——
+		//   它只在 `protect_reg=` 命中的键上生效，所以**必须同时把名单打出来**，
+		//   否则"名单为空 ⇒ 一个字节都没动"和"功能没写"在界面上一模一样
+		//   （铁律 97：布尔判定必须可诊断）。
+		if (policy.Flags2 & R3ShieldCore::FlagSpoofRegistry) {
+			if (policy.ProtectRegCount > 0) {
+				printf("  注册表值替换: 开（受保护位置的读返回全 0，长度/类型不变；名单 %u 条）\n",
+					static_cast<unsigned>(policy.ProtectRegCount));
+			}
+			else {
+				// ⚠️ 这是**窄**字符串 printf，走 936 代码页 ⇒ 不能出现 CP936
+				//   之外的符号（`⇒` U+21D2 会被 MSVC 报 C4566 并实际打出 `?`）。
+				//   同 473/491 行的规矩。
+				printf("  注册表值替换: 开，但 protect_reg 名单为空，实际不生效（没有任何键受保护）\n");
+			}
+		}
+		// ★ v72：注册表**枚举隐藏**状态。与值替换**共用触发面**
+		//   （都只看 `protect_reg=`），所以同样必须把名单条数打出来 ——
+		//   否则"名单为空 ⇒ 一项都没藏"与"功能没写"在界面上一模一样
+		//   （铁律 97：布尔判定必须可诊断）。
+		//   ⚠️ 与值替换是**两个独立的位**（风险画像不同：值替换长度不变、
+		//   枚举隐藏长度会变），所以这里单独一行、单独判。
+		if (policy.Flags2 & R3ShieldCore::FlagSpoofRegistryEnum) {
+			if (policy.ProtectRegCount > 0) {
+				printf("  注册表枚举隐藏: 开（受保护项从枚举结果里去掉，列表变短；名单 %u 条）\n",
+					static_cast<unsigned>(policy.ProtectRegCount));
+			}
+			else {
+				printf("  注册表枚举隐藏: 开，但 protect_reg 名单为空，实际不生效（没有任何键受保护）\n");
+			}
+		}
 		printf("挂 Hive 操作: %s\n", (policy.Flags & R3ShieldCore::FlagHookHive) ? "是" : "否");
 		printf("挂键信息操作: %s\n", (policy.Flags & R3ShieldCore::FlagHookSetInfo) ? "是" : "否");
 		printf("挂文件操作  : %s\n", (policy.Flags & R3ShieldCore::FlagHookFile)
@@ -536,14 +629,39 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
 			: "否（引擎可被任意进程终止或注入）");
 		printf("挂摄像头    : %s\n", (policy.Flags & R3ShieldCore::FlagHookCamera)
 			? "是（VFW + Media Foundation；打开设备即高危）" : "否");
+		// ★ v73：摄像头帧替换状态。只在 hook_camera 开着时才有意义
+		//   （hook_camera=0 ⇒ CameraGuard 根本不装 hook，spoof 无处生效）。
+		//   ⚠️ 三态而不是布尔（铁律 97）：只有"建读取器"这一条入口能替换，
+		//   其余入口（VFW / 设备源 / 音频）**仍然直接拒绝** —— 必须说清楚，
+		//   否则用户会以为"开了它就全放行了"。
+		if (policy.Flags & R3ShieldCore::FlagHookCamera) {
+			printf("  摄像头帧替换: %s\n", (policy.Flags2 & R3ShieldCore::FlagSpoofCamera)
+				? "开（建读取器的那条路改为返回中性帧：RGB→全 0、YUV→Y16/UV128；"
+				  "VFW/设备源/音频仍直接拒绝；压缩子类型如 MJPG 仍拒绝）"
+				: "关（本应拒绝的摄像头数据流直接失败）");
+		}
 		printf("挂输入钩子  : %s\n", (policy.Flags & R3ShieldCore::FlagHookInputHook)
 			? "是（SetWindowsHookEx + 原始输入；低级/全局钩子即高危）" : "否");
 		printf("挂截屏      : %s\n", (policy.Flags & R3ShieldCore::FlagHookScreen)
 			? "是（BitBlt/StretchBlt/GetDIBits 源为屏幕 DC + PrintWindow）" : "否");
+		// ★ v67：截屏替换状态。只在 hook_screen 开着时才有意义
+		//   （hook_screen=0 ⇒ ScreenGuard 根本不装 hook，spoof 无处生效）。
+		if (policy.Flags & R3ShieldCore::FlagHookScreen) {
+			printf("  截屏替换  : %s\n", (policy.Flags2 & R3ShieldCore::FlagSpoofScreen)
+				? "开（本应拒绝的截屏改为返回黑帧 —— 调用方以为成功）"
+				: "关（本应拒绝的截屏直接失败）");
+		}
 		printf("挂 DLL 加载 : %s\n", (policy.Flags & R3ShieldCore::FlagHookDllLoad)
 			? "是（LdrLoadDll + NtMapViewOfSection；仅非系统目录上报）" : "否");
 		printf("挂剪贴板    : %s\n", (policy.Flags & R3ShieldCore::FlagHookClipboard)
 			? "是（GetClipboardData 高危；OpenClipboard 只记录）" : "否");
+		// ★ v70：剪贴板替换状态。同样只在 hook_clipboard 开着时才有意义
+		//   （hook_clipboard=0 ⇒ ClipboardGuard 根本不装 hook）。
+		if (policy.Flags & R3ShieldCore::FlagHookClipboard) {
+			printf("  剪贴板替换: %s\n", (policy.Flags2 & R3ShieldCore::FlagSpoofClipboard)
+				? "开（本应拒绝的剪贴板读取改为返回中性内容 —— 调用方以为成功）"
+				: "关（本应拒绝的剪贴板读取直接失败）");
+		}
 		printf("挂进程旁路  : %s\n", (policy.Flags & R3ShieldCore::FlagHookSpawn)
 			? "是（ShellExecuteEx/WinExec/WithToken/WithLogon/AsUser，一律高危）" : "否");
 		printf("挂服务权限  : %s\n", (policy.Flags & R3ShieldCore::FlagHookServiceConfig)

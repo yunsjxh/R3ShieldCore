@@ -25,12 +25,20 @@ check_spaced_name_quoted.py -- 主程序名里**带空格**，所有引用必须
 逐行扫描，维护一个"当前是否在引号内"的状态机（同时处理 ' " ` 和 \\ 转义）。
 如果某个 `R3 ShieldCore` 的**起始字符**落在引号外 => 报错。
 
+★ 状态机会**正确穿过 `"$( ... )"` 嵌套命令替换**：内层是全新的解析上下文，
+  里面出现的 `"` 不会提前结束外层双引号。这是修一个**假 FAIL** 加的 ——
+  `ENGINE_BASE="$(basename "${ENGINE:-R3 ShieldCore.exe}")"` 曾被误报
+  （假 FAIL 比漏报更贵：它逼人改正确的代码，或干脆关掉闸门）。
+
 已知不能覆盖的情况（必须人工看）
 ================================
 PowerShell 的 `-Command "…"` 里再出现空格名 —— 外层双引号让它"看起来"是引号内，
 但 PS 收到字符串后还会**再解析一次**。这类地方要求内层用**单引号**，
 本脚本会在检测到 `-Command` / `-c ` 行里出现空格名时**额外提示**（不 FAIL，
 因为其中一部分是正确的单引号写法）。
+
+另外：裸 `(` 子 shell（`( cd x && y )`）**不做**压栈处理（只处理 `$(`）——
+裸括号出现在普通文本里的概率高得多，乱压栈会引入漏报，而漏报 = 静默失效。
 
 用法
 ====
@@ -106,8 +114,28 @@ FIXES: list[tuple[str, str]] = [
 
 
 def quote_state(line: str) -> list[bool]:
-    """返回一个列表：每个字符位置上"是否处于引号内"。"""
+    """返回一个列表：每个字符位置上"是否处于引号内"。
+
+    ★★ 必须处理 `"$( ... )"` 这种**嵌套命令替换**。
+
+    POSIX shell 里，双引号内的 `$(` 会**开启一个新的解析上下文**：里面再出现的
+    `"` 只关闭内层那个，**不会**提前结束外层双引号。朴素状态机（见到 `"` 就翻转）
+    会把下面这种**完全正确**的写法判成"引号外"：
+
+        ENGINE_BASE="$(basename "${ENGINE:-R3 ShieldCore.exe}")"
+
+    实测这一处曾被误报为 FAIL（`tools/spoof_e2e.sh`）。按铁律 127 的说法，
+    **假 FAIL 比漏报更贵**（它逼人要么改正确的代码、要么关掉闸门）。
+
+    ⇒ 用一个栈：进 `$(` 时把当前引号状态**压栈并清空**（内层是全新上下文），
+      遇到配对的 `)`（且当时不在任何引号里）再弹回来。
+
+    ⚠️ 只对 `$(` 做这件事，**不**对裸 `(` 做 —— 裸 `(` 在 bash 里也可能是
+      子 shell，但它出现在文本/字符串里的概率高得多，乱压栈会引入**漏报**。
+      宁可少救一种写法，也不要让闸门漏报（漏报 = 静默失效）。
+    """
     state = [False] * len(line)
+    stack: list[tuple[bool, bool]] = []   # 进入 `$(` 之前的 (in_s, in_d)
     in_s = in_d = in_b = False
     i = 0
     while i < len(line):
@@ -118,6 +146,21 @@ def quote_state(line: str) -> list[bool]:
                 state[i] = in_s or in_d or in_b
                 i += 1
                 state[i] = in_s or in_d or in_b
+            i += 1
+            continue
+        # ---- 进入命令替换：内层是**新的解析上下文** ----
+        if ch == "$" and not in_s and i + 1 < len(line) and line[i + 1] == "(":
+            state[i] = in_s or in_d or in_b
+            i += 1
+            state[i] = in_s or in_d or in_b
+            stack.append((in_s, in_d))
+            in_s = in_d = False
+            i += 1
+            continue
+        # ---- 退出命令替换（只在**不在任何引号里**时才配对）----
+        if ch == ")" and stack and not in_s and not in_d:
+            in_s, in_d = stack.pop()
+            state[i] = in_s or in_d or in_b
             i += 1
             continue
         if ch == "'" and not in_d and not in_b:

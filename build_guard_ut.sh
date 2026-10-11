@@ -112,6 +112,10 @@ TESTS=(
     "v28_guard_ut|"
     "v29_guard_ut|$OBJDIR_REL/token_theft_guard.obj"
     "uacwhitelist_ut|"
+    "v72_guard_ut|"
+    # ★ v73：摄像头帧替换的 codec 层（纯逻辑，**不链 MF 库** —— 只 include
+    #   `camera_spoof_codec.h`，那个头全 inline、不碰 COM）。
+    "v73_guard_ut|"
 )
 
 DECLARED=${#TESTS[@]}
