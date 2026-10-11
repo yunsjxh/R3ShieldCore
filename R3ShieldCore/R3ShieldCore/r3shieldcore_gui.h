@@ -45,6 +45,19 @@ namespace R3ShieldCoreGui
 		// 它只决定"界面多久重取 + 重绘一次"，不改变引擎的枚举节奏
 		// （那是 `ArkScanMs`）—— 两者区别见 r3shieldcore_config.h。
 		ULONG ArkRefreshMs;
+		// ★ v78：「高级」页要显示**规则的总闸**。
+		//
+		// 规则的三个面各自受一个 ini 开关管辖（`spoof_reg` / `spoof_clipboard` /
+		// `spoof_reg_enum`，默认**全关**）。开关关着 ⇒ 规则一律不生效。
+		// 界面上必须把这件事**显示出来** —— 否则用户写完规则、存了、重启引擎，
+		// 什么都没发生，而界面上看不出任何原因（铁律 97）。
+		//
+		// ⚠️ 这三个值来自**引擎真正读到的那份配置**（`policy.Flags2`），
+		//    不是界面自己再解析一遍 ini —— 再解析一遍就会出现"界面显示开、
+		//    引擎其实是关"的假象，比不显示更坏（铁律 195）。
+		bool SpoofReg;
+		bool SpoofClipboard;
+		bool SpoofRegEnum;
 	};
 
 	// 建立窗口（非阻塞，内部起一个 GUI 线程）。

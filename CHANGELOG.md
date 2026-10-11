@@ -11,6 +11,94 @@
 
 ## [未发布]
 
+### 新增 — 「高级」页从**只读预览**变成**可编辑的规则编辑台**，且规则**真的作用于引擎**（v78）
+
+v77 的「高级」页只是"把规则跑一遍给你看字节"。v78 把它补成**能写、能存、引擎真读**的闭环。
+
+- **页内三道题闸门**。三道 Win32 题（伪句柄当 `RootDirectory` / vtable 模块级共享 /
+  32 位不带 `KEY_WOW64_*`）**就地**画在内容区，未全对之前编辑区锁住；答错**只说哪几题错**、
+  可重选重交（**不报答案** —— 报了闸门就白设了）。全对之后先展示三道题的解析，
+  点「开始编辑规则」才进编辑台。
+  ★ 题目与命令行控制台**共用同一份** `shared/r3shieldcore/advanced_quiz.h`（铁律 195）——
+  抄两份必然漂，漂了之后"控制台过了、界面过不了"而两边都不报错。
+- **规则可以在窗口里编辑**，两种输入方式都有：
+  · **结构化点选搭骨架** —— 三行模板芯片（面 / 算子 / 动作）。点「面」插入**整条骨架**，
+    点「算子」「动作」在**光标处**插入该词。
+  · **文本框改模式** —— 原生 `EDIT` 子控件（中文必须靠 IME，自绘输入框等于重写一个）。
+  外加规则表（点一行载入编辑框）、加入/更新、删除选中、重置为示例、清空。
+  ★ 模板一律是**中文 DSL 原文**，走用户手敲那条**同一条解析路径**（铁律 22）——
+  直接拼 `Rule` 结构体会出现"示例能用、照抄的不能用"。
+- **规则持久化 + 引擎真的读它**（这一条是 v78 的重头）：
+  · 新增 `shared/r3shieldcore/rules_file.h` —— 规则文件路径的**唯一一份**解析
+    （`%ProgramData%\R3 Shield Core\r3shieldcore-rules.txt`，目录不存在则回退到本模块目录）。
+    界面**写**它、引擎（每个被注入进程）**读**它，两边必须是同一个文件；
+    抄两份的后果是"界面显示已保存、引擎一条都不生效"且两边都不报错（铁律 195/127）。
+  · 新增 `R3ShieldCoreLib/rules_script_runtime.h` —— 引擎侧加载状态机（懒加载 + CAS 抢占，
+    **每个被注入进程各一次**）。不在 `DllMain` 里做文件 I/O（loader lock）。
+  · 规则引擎接进**生产决策路径**三处：`registry_guard.cpp` 的 `Evaluate`（值面 / 枚举面）
+    与 `NtQueryValueKey_Hook` 落地、`clipboard_guard.cpp` 的 `RejectOrSpoof`。
+  · ★ **规则是叠加不是替代**：命中 ⇒ 按规则处置；未命中 ⇒ **原样走内置判据**
+    （v71 清零 / v72 隐藏 / v70 空串，一字不改）。
+  · ★ **总闸优先**：规则的每一面都受 ini 开关管辖（`spoof_reg` / `spoof_clipboard` /
+    `spoof_reg_enum`，默认**全关**）—— 连「拒绝」也挂开关。理由是要能用**同一句话**
+    解释："规则的这一面要生效，先开对应开关"。页面上把这三个开关**显示出来**
+    （读的是引擎真正读到的那份 `Policy`，不是界面再解析一遍 ini）。
+  · ★ 枚举面的「拒绝」**降级为「隐藏」**（列表操作没法拒单项），且**留痕**不静默。
+  · ★ 不动 ABI：规则文件走文件系统，不进 `Policy` / 共享内存 ⇒ `AbiVersion` 仍 **26**。
+  · ⚠️ **改完规则要重启引擎才生效**（每个被注入进程各读一次）—— 页面上写清楚了。
+- **发布闸门补 v78 节**（`check_dist_sync.sh`）：断言 dist 的 `R3 Shield Core.exe` 含宽串
+  `R3SHIELDCORE_PREVIEW_ADV`，并且 **exe 与引擎 dll 都含**宽串 `r3shieldcore-rules.txt`
+  —— 直接验"两侧同源"（只查一侧的话，"界面存到 A、引擎读 B"查不出来）。
+
+### 修复 — v78 引入的 5 个真缺陷（单测/截图才看得出）
+
+- **两个同名不同物的 `R3ShieldCoreRules`**：`rules_codec.h`（中文 DSL 规则脚本引擎）与
+  `R3ShieldCoreLib/r3shieldcore_rules.h`（编译期定长高危规则表）**声明了同一个命名空间**。
+  引擎侧一接入，两者必然出现在同一个 TU（`registry_guard.cpp` 两个头都要 include）
+  ⇒ 命名空间合并，此前靠"恰好不重名"侥幸编过。**已把 codec 改名**为 `R3ShieldCoreRuleScript`
+  （`using` 别名留在引擎侧），并在头部写清"别改回去"。
+- **header-only 静态状态的链接性问题**：`static std::vector<Rule> g_rules;` 是内部链接
+  ⇒ **每个 TU 一份表**。引擎侧 `registry_guard.cpp` 与 `clipboard_guard.cpp` 各含一次
+  ⇒ 两张互不相干的表，谁都不报错。改用 `inline`（C++17）⇒ 整个模块一份。
+- **`FormatLabel` 的隐形陷阱**：文本/位图两类返回的是**静态字符串**，压根不往传入的 buf
+  里写 ⇒ 必须用**返回值**。用 buf 会匹配到空串，规则"永远不命中"，而界面上完全看不出来。
+- **哨兵值与合法值撞车**（铁律 110）：`Act::ReplaceText == 0`，用 0 当"没命中"的哨兵
+  ⇒ 断言恒真。改用 **-1**。
+- **`GuardStub::ResetPolicy()` 是 `ZeroMemory`，而 `Mode::Log == 0`** ⇒ 单测全部悄悄跑在
+  Log 模式（只记录），"规则「拒绝」⇒ Block" 变成 Record。**失败信息完全指向错误方向**
+  （看起来像"规则没接上"）。修法：显式 `SetMode(Block)`。
+- 另外两个**只有截图看得出**的界面缺陷（自绘界面里不会报任何错）：
+  · 摘要行与下面的说明行**叠字**（说明行写的是 `PanelTop - 22`，而 `PanelTop` 只比
+    摘要行低 26px）⇒ 抽 `NoteTop` 字段，面板整体下移 20px。
+  · 底部说明写死 `Left + AdvButtonWidth*3 + 32`，而编辑态有 **6 个**按钮
+    ⇒ 说明文字**压在**「重置为示例规则 / 清空规则表」上面。
+  · 闸门选项框 22px + 单行 + `DT_END_ELLIPSIS` 把括号里的状态码截掉
+    （`A. STATUS_OBJECT_NAME_NOT_FOUND (0...`）—— 而那半截正是区分对错的地方。
+  · 「规则行」标签被原生 `EDIT` 盖住（父窗口有 `WS_CLIPCHILDREN`，父窗口画的进不到
+    控件区域里）⇒ 编辑框左缘让出 `AdvEditLabelWidth`。
+
+### 变更 — `--gui-preview` 支持预置「高级」页状态（v78）
+
+- 「高级」页有**三个互斥的界面状态**，一个页签名看不全 ⇒ 新增环境变量
+  `R3SHIELDCORE_PREVIEW_ADV=why|editor`（只在 `--gui-preview` 里生效）把另外两屏
+  也变成可截的；`R3SHIELDCORE_PREVIEW_RULES=<路径>` 把规则文件重定向到临时文件
+  （自动核对要确定性，且**不碰**用户的真实规则文件）。
+- `tools/test_gui_preview.sh` 默认改为跑**三屏 + 负对照**，规格写成 `页签:状态`
+  （`advanced` / `advanced:why` / `advanced:editor`），截图文件名带上状态，否则三屏互相覆盖。
+- 实测：**advanced 6/0 + advanced:why 5/0 + advanced:editor 7/0 + ark 负对照 4/0 = PASS**。
+
+### 新增 — 引擎侧规则接线的单测（`tools/v78_guard_ut.cpp`）
+
+- `build_guard_ut.sh` 新增 `-DCLIPGUARD_GUARD_UT` 编 `clipboard_guard.cpp`，
+  链接加 `user32.lib gdi32.lib`。单测从 5 个扩到 6 个。
+- `v78_guard_ut` **60 passed / 0 failed**（x64 + x86），5 组、每面都配**负对照**：
+  加载（注释/空行跳过、坏行计数）｜值面（没规则不替换 / 命中替换 / 名字不匹配不生效 /
+  「拒绝」⇒ Block / 「放行」压住内置替换 / 总闸关着不生效）｜枚举面（藏与不藏、「放行」压住）｜
+  剪贴板面（内置替换基线 / 规则命中 / 「拒绝」/「放行」/ 位图 + 「替换为 文本」⇒ 回落拒绝）｜
+  一次加载三面规则各自命中。
+- 规则一律写进**临时目录**（`GetTempPathW` + pid），绝不碰 `%ProgramData%\R3 Shield Core\`。
+- 现有 v72/v73/v28/v29/uacwhitelist 五个单测**无回归**（84 passed 各自维持）。
+
 ### 新增 — 主程序 GUI 第 6 个页签「高级」：规则引擎 + 生产同源 codec 并排看字节（v77）
 
 - 主程序新增第 6 个页签**「高级」**（`概览 / 事件日志 / 进程 / 配置 / ARK / 高级`）。

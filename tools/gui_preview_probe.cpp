@@ -15,8 +15,11 @@
 //      而"截到一张空窗口"与"页面没画"在图上分不开，只有日志能分开。
 //
 // 用法:
-//   gui_preview_probe.exe <exePath> <tab> <outBmpPath>
-//     tab = overview | log | process | config | ark | advanced
+//   gui_preview_probe.exe <exePath> <tab> <outBmpPath> [advMode]
+//     tab     = overview | log | process | config | ark | advanced
+//     advMode = quiz(默认) | why | editor —— 只在 tab=advanced 时有意义
+//               「高级」页有**三个互斥的界面状态**（闸门未过 / 刚全对 /
+//               已解锁的编辑台），一个页签名看不全，靠它把三屏都截出来。
 //
 // 退出码: 0 = 全部判据通过；1 = 有判据失败；2 = 窗口没起来。
 
@@ -128,10 +131,34 @@ namespace
 		return wide.find(needle) != std::wstring::npos;
 	}
 
-	int Run(const std::wstring& exePath, const std::wstring& tab, const std::wstring& outBmp)
+	int Run(const std::wstring& exePath, const std::wstring& tab,
+		const std::wstring& outBmp, const std::wstring& advMode)
 	{
 		// ---- 环境变量：让 exe 起来就停在指定页签 ----
 		SetEnvironmentVariableW(L"R3SHIELDCORE_START_TAB", tab.c_str());
+
+		// ★ v78：「高级」页有**三个互斥的界面状态**（闸门未过 / 刚全对 / 已解锁），
+		//   光靠"停在 advanced 页签"只能截到第一屏。第 4 个参数把另外两屏
+		//   也变成可截的 —— 否则"新加的编辑台长什么样"仍然只能靠人眼
+		//   （铁律 24/28）。
+		//     空串 / "quiz" -> 默认（闸门屏）
+		//     "why"         -> 解析屏
+		//     "editor"      -> 编辑台
+		if (!advMode.empty() && advMode != L"quiz") {
+			SetEnvironmentVariableW(L"R3SHIELDCORE_PREVIEW_ADV", advMode.c_str());
+		}
+		else {
+			SetEnvironmentVariableW(L"R3SHIELDCORE_PREVIEW_ADV", nullptr);
+		}
+
+		// ---- 规则文件重定向到一个**临时文件**（先删掉，保证"来源=示例"）----
+		//
+		// ★ 为什么不直接用真实路径：那样这条判据会取决于这台机器的
+		//   `%ProgramData%\R3 Shield Core\` 里有没有规则文件、有几条 ——
+		//   换台机器就随机红。而且自动核对不该去读（更不该写）用户的真规则。
+		const std::wstring previewRules = ExeDirectory(exePath) + L"\\r3shieldcore-rules-preview.txt";
+		DeleteFileW(previewRules.c_str());
+		SetEnvironmentVariableW(L"R3SHIELDCORE_PREVIEW_RULES", previewRules.c_str());
 
 		// ---- 先删掉上一次的日志：否则断言可能被**上一轮**的行满足（假绿） ----
 		const std::wstring logPath = ExeDirectory(exePath) + L"\\r3shieldcore-console.log";
@@ -239,7 +266,11 @@ namespace
 		Check(ratio > 3.0, "画面上有内容（非白像素 > 3%）");
 		if (tab == L"advanced") {
 			// 紫色是 Spoof 的语义色：判定/改后两列都用它，出现即说明对照区画出来了。
-			Check(purple > 0, "画面上有 Spoof 紫像素（改前/改后对照区渲染出来了）");
+			// ⚠️ 这一条只在**编辑台**那一屏成立 —— 闸门屏/解析屏根本没有对照区，
+			//    所以它必须跟着状态走，否则"闸门屏没有紫色"会被当成失败。
+			if (advMode == L"editor") {
+				Check(purple > 0, "画面上有 Spoof 紫像素（改前/改后对照区渲染出来了）");
+			}
 		}
 
 		// ★ 先把被测进程结束掉，**再**读它的日志。
@@ -254,11 +285,31 @@ namespace
 		Sleep(200);
 
 		if (tab == L"advanced") {
-			// ★ 关键判据：应用自己的日志。它证明"高级页真被画到了、且规则表非空"。
+			// ★ 关键判据：应用自己的日志。它证明"高级页真被画到了"。
 			const bool painted = LogContains(logPath, L"[adv] 页面已绘制");
 			Check(painted, "日志里有「[adv] 页面已绘制」（这一页真的画到了）");
-			Check(LogContains(logPath, L"规则=3"),
-				"日志里报「规则=3」（首次进入自动铺了三条示例规则）");
+
+			// ★ v78：日志里那一行同时报了**闸门**和**编辑框**两个状态 ——
+			//   用它把"三屏画的是哪一屏"钉死。
+			//   ⚠️ 为什么要分开断言"闸门"和"编辑框"：它们是**两个**开关
+			//      （`g_advQuizPassed` / `g_advWhyDismissed`），只报一个的话
+			//      "闸门过了但解析屏没点掉"这种中间态就看不出来。
+			if (advMode == L"editor") {
+				Check(LogContains(logPath, L"闸门=1 编辑框=1"),
+					"日志报「闸门=1 编辑框=1」（截到的是**已解锁的编辑台**）");
+				Check(LogContains(logPath, L"[adv] 初始规则=3 来源=示例"),
+					"日志报「初始规则=3 来源=示例」（首次进入走了铺示例那条分支）");
+			}
+			else if (advMode == L"why") {
+				Check(LogContains(logPath, L"闸门=1 编辑框=0"),
+					"日志报「闸门=1 编辑框=0」（截到的是**刚全对的解析屏**）");
+			}
+			else {
+				Check(LogContains(logPath, L"闸门=0 编辑框=0"),
+					"日志报「闸门=0 编辑框=0」（截到的是**未过闸门的三道题**）");
+				Check(LogContains(logPath, L"[adv] 初始规则=3 来源=示例"),
+					"日志报「初始规则=3 来源=示例」（首次进入走了铺示例那条分支）");
+			}
 		}
 		else {
 			// ★ 负对照（铁律 128/110）：**不是** advanced 页签时，这一页不该被画到。
@@ -274,11 +325,13 @@ namespace
 int wmain(int argc, wchar_t** argv)
 {
 	if (argc < 4) {
-		printf("用法: gui_preview_probe.exe <exePath> <tab> <outBmpPath>\n");
-		printf("      tab = overview | log | process | config | ark | advanced\n");
+		printf("用法: gui_preview_probe.exe <exePath> <tab> <outBmpPath> [advMode]\n");
+		printf("      tab     = overview | log | process | config | ark | advanced\n");
+		printf("      advMode = quiz(默认) | why | editor   —— 只在 tab=advanced 时有意义\n");
 		return 2;
 	}
-	const int rc = Run(argv[1], argv[2], argv[3]);
+	const std::wstring advMode = (argc >= 5) ? argv[4] : L"";
+	const int rc = Run(argv[1], argv[2], argv[3], advMode);
 	printf("\n[gui-preview-probe] 通过 %d / 失败 %d\n", g_pass, g_fail);
 	return rc;
 }

@@ -8,6 +8,14 @@
 #include "host_hijack_guard.h"
 #include "logger.h"
 
+// ★ v78：规则脚本（用户在主程序「高级」页里写的**中文规则**）。
+//   ⚠️ 这里 include 的是 `shared/r3shieldcore/rules_codec.h`（命名空间
+//      `R3ShieldCoreRuleScript`）—— **不是**上面那个 `r3shieldcore_rules.h`
+//      （命名空间 `R3ShieldCoreRules`，编译期高危规则表）。两者同名不同物，
+//      名字必须分得开，理由见 rules_codec.h 头部。
+#include <r3shieldcore/spoof_apply_codec.h>
+#include "rules_script_runtime.h"
+
 //
 // 数字签名校验（ComputeBypass 的第二条件）。
 //
@@ -186,6 +194,87 @@ namespace
 	{
 		R3ShieldCore::Policy* policy = R3ShieldCoreChannel::Policy();
 		return policy && (policy->Flags2 & R3ShieldCore::FlagSpoofRegistryEnum) != 0;
+	}
+
+	// ==================================================================
+	// ★ v78：规则脚本（用户在主程序「高级」页写的**中文规则**）
+	// ==================================================================
+	//
+	// 与 v71/v72 的内置判据（`protect_reg=` 触发面）是**叠加**关系，不是替代：
+	//   · 规则**命中** ⇒ 按规则处置（替换为文本 / 全XX / 空、拒绝、放行）；
+	//   · 规则**没命中** ⇒ **原样走内置判据**（v71 清零 / v72 隐藏，一字不改）。
+	//   ⇒ "加了规则"是**叠加**，不会把原来的保护弄丢（这条是设计底线）。
+	//
+	// ⚠️ 规则生效仍受 ini 开关管辖（`spoof_reg` / `spoof_reg_enum`）——
+	//    开关是**总闸**。理由：五个替换开关"默认关"是刻意的（铁律 199 同族，
+	//    每一个替换面都要能**单独关掉**）。规则再多，总闸关着就不该动数据。
+	//    ⇒ 界面上必须把这件事说清楚（见「高级」页的提示行），否则用户会
+	//      以为"我写了规则却没生效 = 功能坏了"。
+	namespace RScript = R3ShieldCoreRuleScript;
+	namespace RApply = R3ShieldCoreSpoofApply;
+
+	// 首次用到规则时把规则文件读进来（**每个被注入进程各一次**）。
+	//
+	// ★ 为什么加载**不放在 DllMain**：那里做文件 I/O 会撞 loader lock。
+	// ★ 为什么走 `EnsureLoadedSafe`：`Evaluate` 是 `noexcept`，而读文件 + 解析
+	//   规则会分配内存 —— 真抛出来就是 `std::terminate`，把被注入进程整个带走。
+	//   规则读不进来最多是"没有规则"，绝不能是"宿主崩了"。
+	//
+	// 返回 true ⇒ **本次调用真的执行了加载**（据此打**一次**日志）。
+	bool EnsureRulesLoaded() noexcept
+	{
+		if (!R3ShieldCoreRuleScriptRuntime::EnsureLoadedSafe()) {
+			return false;
+		}
+		// ⚠️ 这条日志里的 ASCII 子串 `rules_script` 是 v78 的**代次标记**
+		//    （`check_dist_sync.sh` 用 `strings -el` 找它；纯中文标记永远查不到）。
+		LOG(L"RegistryGuard: 规则脚本加载完毕（rules_script，路径 %s，%d 条有效 / %d 条无效）",
+			R3ShieldCoreRuleScriptRuntime::Path(),
+			static_cast<int>(R3ShieldCoreRuleScriptRuntime::OkCount()),
+			static_cast<int>(R3ShieldCoreRuleScriptRuntime::BadCount()));
+		return true;
+	}
+
+	// 值面的规则求值。抽出来是为了**决策层与 detour 层问的是同一件事**
+	// （铁律 22：别让"决定替换"和"实际写什么"用两套判据）。
+	RScript::Verdict EvalRegValueRule(const R3ShieldCore::Event& event) noexcept
+	{
+		try {
+			return RScript::Eval(RScript::Face::RegValue,
+				event.KeyPath, event.ValueName, nullptr);
+		}
+		catch (...) {
+			return RScript::Verdict{};
+		}
+	}
+
+	// ---- 给 detour 用的两个**薄壳** ----
+	//
+	// ★ 为什么不能直接在 detour 里写 `const RScript::Verdict v = EvalRegValueRule(event);`：
+	//   `Verdict` 含 `std::wstring`（需要对象展开），而两个读 detour 里有
+	//   `__try`（SEH）⇒ MSVC 直接报 **C2712**（"无法在要求对象展开的函数中
+	//   使用 __try"）。把求值放进**普通函数**，detour 只拿纯枚举/布尔回去。
+	//
+	// 把规则落到数据区上，返回**实际做了什么**（纯枚举）。
+	RApply::Effect ApplyRegValueRule(const R3ShieldCore::Event& event,
+		BYTE* base, size_t bufferLength, size_t offset, size_t length) noexcept
+	{
+		const RScript::Verdict v = EvalRegValueRule(event);
+		return RApply::ApplyRegValue(v, v.hit, base, bufferLength, offset, length, 0);
+	}
+
+	// 规则是否明确要求「拒绝」这一次值读取（纯布尔）。
+	//
+	// ⚠️ 也走**总闸**（`spoof_reg`）—— 与决策层同一口径。不这么做的话，
+	//   `block_all` 模式（它抢在 `!blockable` 之前返回 Block）下会出现
+	//   "开关关着、规则却把读拒了"，两处行为对不上。
+	bool RuleSaysBlockValue(const R3ShieldCore::Event& event) noexcept
+	{
+		if (!SpoofRegEnabled()) {
+			return false;
+		}
+		const RScript::Verdict v = EvalRegValueRule(event);
+		return v.hit && v.act == RScript::Act::Block;
 	}
 
 	Action ExceptionAction(R3ShieldCore::Event& event) noexcept
@@ -1068,6 +1157,13 @@ namespace
 	{
 		ZeroMemory(&event, sizeof(event));
 
+		// ★ v78：首次进到这里时把规则脚本读进来（每个被注入进程各一次）。
+		//   放在**最前面**（而不是只在替换分支里）：`block_all` 分支抢在
+		//   `!blockable` 之前执行，若只在替换分支加载，`block_all` 模式下
+		//   规则永远加载不上 —— 而下面的读 detour 恰恰要用规则表判断
+		//   "这次 Block 是规则要求的还是全拦给的"。
+		EnsureRulesLoaded();
+
 		event.Op = static_cast<ULONG>(op);
 		event.DesiredAccess = desiredAccess;
 		event.TargetKind = static_cast<ULONG>(R3ShieldCore::IsHiveOp(static_cast<ULONG>(op))
@@ -1147,6 +1243,51 @@ namespace
 		}
 
 		if (!blockable) {
+			// ★ v78：**先问规则脚本**。
+			//
+			// 位置在**内置判据之前**：内置的 `protect_reg=` 触发面是
+			// "用户没写规则时的默认行为"，规则是"用户**显式**写的" ⇒ 显式优先。
+			//
+			// ⚠️ 只对 `QueryValueKey` 求值。枚举面在**重映射那一步**逐个子项
+			//    求值（决策层拿不到子项名字），见 `ProtectedChildPredicate`。
+			//
+			// ⚠️ `Replace*` 类动作要求该 InformationClass **有数据区**
+			//    （与 v71 同一口径）：没有数据区的 class（`KeyValueBasicInformation`）
+			//    压根没有东西可换 —— 在这里返回 `Spoof` 只会让日志里出现
+			//    "说要替换却没东西可换"（铁律 97 反面）。这种情况**落到下面**
+			//    按普通读处理。
+			// ⚠️ 整块都受**总闸** `spoof_reg` 管辖（与下面 v71 的内置判据同一
+			//    条开关）：关着 ⇒ 这一面的规则（含「拒绝」「放行」）一律不生效。
+			//    为什么连"拒绝"也要挂开关：三个面的规则必须能用**同一句话**
+			//    解释清楚 —— "规则的这一面要生效，先开对应开关"。若"拒绝"
+			//    绕过开关，用户会遇到"我把替换关了，但读还是被拒"这种
+			//    说不清的状态（铁律 199 同族：每个面都要能单独关掉）。
+			bool rulePass = false;
+			if (op == R3ShieldCore::Op::QueryValueKey && SpoofRegEnabled()) {
+				const RScript::Verdict v = EvalRegValueRule(event);
+				if (v.hit) {
+					if (v.act == RScript::Act::Block) {
+						// 与其它"本应拒绝"同构：log 模式只记录，不真拒。
+						if (mode == static_cast<ULONG>(R3ShieldCore::Mode::Log)) {
+							event.Decision = static_cast<ULONG>(R3ShieldCore::Decision::WouldBlock);
+							return Action::Record;
+						}
+						event.Decision = static_cast<ULONG>(R3ShieldCore::Decision::Blocked);
+						event.Flags |= R3ShieldCore::FlagEventBlocked;
+						return Action::Block;
+					}
+					if (v.act == RScript::Act::Pass) {
+						// 显式放行 ⇒ 跳过下面的内置替换判据（否则"放行"会被
+						// `protect_reg=` 推翻，规则等于白写）。
+						rulePass = true;
+					}
+					else if (R3ShieldCoreRegistrySpoof::HasDataRegion(spoofInfoClass)) {
+						event.Decision = static_cast<ULONG>(R3ShieldCore::Decision::Spoofed);
+						return Action::Spoof;
+					}
+				}
+			}
+
 			// ★ v71：读操作的**替换**面。
 			//
 			// 触发条件（四条全中才替换，缺一条就落到下面的"只记录/静默"）：
@@ -1163,7 +1304,8 @@ namespace
 			//    结构内容，detour 里才做（`LocateDataRegion` 会拒掉 0 长度）。
 			//    所以决策可能是 Spoof、而实际没清零 —— 那种情况 detour 层
 			//    **不置** `FlagEvent2Spoofed` 并留日志（铁律 97）。
-			if (op == R3ShieldCore::Op::QueryValueKey
+			if (!rulePass
+				&& op == R3ShieldCore::Op::QueryValueKey
 				&& SpoofRegEnabled()
 				&& R3ShieldCoreRegistrySpoof::HasDataRegion(spoofInfoClass)
 				&& R3ShieldCoreRules::IsProtectedRegistryPathForSpoof(event.KeyPath)) {
@@ -1178,7 +1320,8 @@ namespace
 			//   ② 是**枚举类**操作（`EnumerateKey` / `EnumerateValueKey`）——
 			//      值读取（`QueryValueKey`）走的是 v71 的"清零"，不是隐藏；
 			//   ③ 被枚举的键**可能与 `protect_reg=` 相关**
-			//      （`CouldHaveProtectedChildRegistry`，**保守上界**）。
+			//      （`CouldHaveProtectedChildRegistry`，**保守上界**），
+			//      **或**用户写了「注册表枚举」面的规则（v78）。
 			//
 			// ★ 这里判的是"**这个键值不值得扫一遍**"，**不是**"有没有项要藏"——
 			//   后者要看**真调之后每一项的名字**，detour 里才做。
@@ -1193,7 +1336,8 @@ namespace
 			if ((op == R3ShieldCore::Op::EnumerateKey
 					|| op == R3ShieldCore::Op::EnumerateValueKey)
 				&& SpoofRegEnumEnabled()
-				&& R3ShieldCoreRules::CouldHaveProtectedChildRegistry(event.KeyPath)) {
+				&& (R3ShieldCoreRules::CouldHaveProtectedChildRegistry(event.KeyPath)
+					|| RScript::HasFace(RScript::Face::RegEnum))) {
 				event.Decision = static_cast<ULONG>(R3ShieldCore::Decision::Spoofed);
 				return Action::Spoof;
 			}
@@ -2287,7 +2431,13 @@ namespace
 		NTSTATUS status = pOriginalNtQueryValueKey(KeyHandle, ValueName, KeyValueInformationClass,
 			KeyValueInformation, Length, ResultLength);
 
-		// ★ v71：替换 —— 真调已把真实值写进调用者的缓冲区，现在把**数据区**清零。
+		// ★ v71：替换 —— 真调已把真实值写进调用者的缓冲区，现在把**数据区**改掉。
+		//
+		// ★ v78：改成走共享 codec `ApplyRegValue` —— 规则命中就按规则落值
+		//   （文本 / 全XX / 空），没命中就**回落**内置行为（整段清零，
+		//   与 v71 逐字一致：`fallbackFill = 0`）。
+		//   ⚠️ 判据由 `EvalRegValueRule` 给出 —— 与决策层是**同一个函数**
+		//   （铁律 22），不是"照着重写一遍"。
 		//
 		// ⚠️ **长度字段一个都不改**：`DataLength` / `DataOffset` / `*ResultLength` /
 		//    `Type` / `NameLength` 全部保持原值。理由见 registry_spoof_codec.h
@@ -2299,9 +2449,20 @@ namespace
 			R3ShieldCoreRegistrySpoof::DataRegion region = {};
 
 			if (R3ShieldCoreRegistrySpoof::LocateDataRegion(KeyValueInformationClass,
-					KeyValueInformation, Length, resultLength, region)
-				&& R3ShieldCoreRegistrySpoof::ZeroDataRegion(KeyValueInformation, Length, region)) {
-				event.Flags2 |= R3ShieldCore::FlagEvent2Spoofed;
+					KeyValueInformation, Length, resultLength, region)) {
+				const RApply::Effect effect = ApplyRegValueRule(event,
+					static_cast<BYTE*>(KeyValueInformation), Length,
+					region.offset, region.length);
+
+				if (effect != RApply::Effect::Nothing) {
+					event.Flags2 |= R3ShieldCore::FlagEvent2Spoofed;
+				}
+				else {
+					// 规则命中但**越界 / 长度为 0** ⇒ 一个字节都没动。
+					// **如实记录，不置 FlagEvent2Spoofed**（铁律 97）。
+					LOG(L"RegistryGuard: 注册表值替换未生效（spoof_reg，规则命中但数据区为空或越界，class=%u len=%u region=%u+%u），本次返回真实值",
+						KeyValueInformationClass, Length, region.offset, region.length);
+				}
 			}
 			else {
 				// 替换没做成：class 没有数据区 / 数据长度为 0 / 长度字段自相矛盾
@@ -2313,6 +2474,22 @@ namespace
 				//    ASCII 可打印字符，纯中文标记永远查不到）。别删。
 				LOG(L"RegistryGuard: 注册表值替换未生效（spoof_reg，class=%u len=%u result=%u），本次返回真实值",
 					KeyValueInformationClass, Length, resultLength);
+			}
+		}
+		// ★ v78：读 hook 拿到 `Action::Block` 只有两个来源 ——
+		//   ① `block_all` 分支（**早于** `!blockable`，全拦模式下所有读都是 Block）；
+		//   ② 规则脚本明确要求「拒绝」。
+		//
+		//   两者必须分开：①必须保持"读**永不拦**"（拦了全系统读注册表都会失败，
+		//   等于把机器弄瘫 —— v71 起就是这个口径）；②必须**真拒**，
+		//   否则用户写了「拒绝」却什么也没发生（铁律 97 反面）。
+		//   ⇒ 用**规则表本身**区分，不新增标志位、不动 ABI。
+		else if (action == Action::Block) {
+			if (RuleSaysBlockValue(event)) {
+				event.Status = static_cast<ULONG>(STATUS_ACCESS_DENIED);
+				Publish(event);
+				InterlockedDecrement(&g_activeHooks);
+				return STATUS_ACCESS_DENIED;
 			}
 		}
 
@@ -2373,10 +2550,55 @@ namespace
 		}
 	};
 
+	// 「这一项要不要从列表里藏掉？」
+	//
+	// ★ v78：判据从"只有内置"扩成"**规则优先、内置兜底**"：
+	//     · 规则命中「隐藏」  ⇒ 藏；
+	//     · 规则命中「放行」  ⇒ **不藏**（显式放行要能推翻内置判据，
+	//                            否则"放行"这条规则等于白写）；
+	//     · 规则命中「拒绝」  ⇒ **按「隐藏」落地**。理由：枚举是**列表**操作，
+	//                            没法"拒绝列表里的第 3 项"—— 只能让调用方
+	//                            看不见它。这是一次**有意的降级**，所以必须
+	//                            留痕（见下面的日志），不能静默当成隐藏。
+	//     · 规则没命中        ⇒ 回落内置 `IsProtectedRegistryPathForSpoof`。
+	//
+	// ⚠️ 规则按**子项名**匹配（`当 注册表枚举 的 子键名 含 "Secret" 时 隐藏`），
+	//    而本谓词拿到的是**完整子路径** ⇒ 这里取最后一段。
+	//    `keyPath`（父键）也带上：规则的 `的 键路径` 字段匹配的是它 ——
+	//    与界面/控制台里 `Eval(Face::RegEnum, keyPath, childName, nullptr)`
+	//    的参数顺序**完全一致**（铁律 22）。
 	struct ProtectedChildPredicate
 	{
+		const WCHAR* keyPath;
+
 		bool operator()(const WCHAR* childPath) const noexcept
 		{
+			if (!childPath) return false;
+
+			const WCHAR* name = wcsrchr(childPath, L'\\');
+			name = name ? (name + 1) : childPath;
+
+			RScript::Verdict v = {};
+			try {
+				v = RScript::Eval(RScript::Face::RegEnum, keyPath, name, nullptr);
+			}
+			catch (...) {
+				v = RScript::Verdict{};
+			}
+
+			if (v.hit) {
+				if (v.act == RScript::Act::Pass) {
+					return false;
+				}
+				if (v.act == RScript::Act::Block) {
+					// ⚠️ ASCII 子串 `rules_script` 是 v78 代次标记的一部分，别删。
+					LOG(L"RegistryGuard: 枚举面的「拒绝」按「隐藏」落地（rules_script 规则 #%d，子项 %s）",
+						v.index, name);
+					return true;
+				}
+				return true;   // Hide
+			}
+
 			return R3ShieldCoreRules::IsProtectedRegistryPathForSpoof(childPath);
 		}
 	};
@@ -2386,7 +2608,7 @@ namespace
 		ULONG& outOriginalIndex, ULONG& outHiddenCount) noexcept
 	{
 		EnumProbeCall call{ valueEnum, keyHandle };
-		ProtectedChildPredicate isHidden;
+		ProtectedChildPredicate isHidden{ keyPath };
 
 		LONG probeStatus = 0;
 		const bool ok = R3ShieldCoreRegistryEnum::RemapEnumerationIndexImpl(
@@ -3180,6 +3402,99 @@ namespace RegistryGuardTest
 			event, blockable);
 
 		return event;
+	}
+
+	// ------------------------------------------------------------------
+	// ★ v78：把 `Action` 也带出来
+	// ------------------------------------------------------------------
+	//
+	// 为什么 `EvaluateKey` 不够：它只回 `Event`，而 v78 要断言的核心是
+	// **"规则把这次读变成了什么处置"** —— `Spoof` / `Block` / `Record` / `Pass`
+	// 是**返回码**，不在 Event 里。只断言 `event.Decision` 的话，
+	// "规则命中并替换" 与 "规则没命中、但内置判据替换了" 会给出**同一个**
+	// `Decision`（都是 Spoofed）⇒ 断言恒真、测不出"规则根本没接上"。
+	// （铁律 97 / 110 说的那类空真判据。）
+	struct KeyEvalResult
+	{
+		R3ShieldCore::Event event;
+		int action;      // R3ShieldCore::Action 的值
+	};
+
+	KeyEvalResult EvaluateKeyEx(PCWSTR keyPath, PCWSTR valueName, ULONG op, ULONG mode,
+		bool blockable, ULONG spoofInfoClass) noexcept
+	{
+		RG_UNICODE_STRING key = {};
+		if (keyPath) {
+			key.Length = static_cast<USHORT>(wcslen(keyPath) * sizeof(WCHAR));
+			key.MaximumLength = static_cast<USHORT>(key.Length + sizeof(WCHAR));
+			key.Buffer = const_cast<PWSTR>(keyPath);
+		}
+
+		RG_UNICODE_STRING val = {};
+		if (valueName) {
+			val.Length = static_cast<USHORT>(wcslen(valueName) * sizeof(WCHAR));
+			val.MaximumLength = static_cast<USHORT>(val.Length + sizeof(WCHAR));
+			val.Buffer = const_cast<PWSTR>(valueName);
+		}
+
+		KeyEvalResult out = {};
+		out.action = static_cast<int>(Evaluate(static_cast<R3ShieldCore::Op>(op), nullptr,
+			keyPath ? &key : nullptr, valueName ? &val : nullptr, 0,
+			out.event, blockable, spoofInfoClass));
+		return out;
+	}
+
+	// ------------------------------------------------------------------
+	// ★ v78：枚举面的判据 —— 「这一项要不要藏掉」
+	// ------------------------------------------------------------------
+	//
+	// 直接驱动**生产用的那个谓词**（不是照着写一遍）—— 铁律 22/195。
+	bool EnumChildHidden(PCWSTR keyPath, PCWSTR childPath) noexcept
+	{
+		ProtectedChildPredicate isHidden{ keyPath };
+		return isHidden(childPath);
+	}
+
+	// ------------------------------------------------------------------
+	// ★ v78：把「值面规则」真的落到一块合成数据区上
+	// ------------------------------------------------------------------
+	//
+	// 返回 `R3ShieldCoreSpoofApply::Effect` 的值；`outBytes` 收下改后的字节。
+	// 这条路径与 `NtQueryValueKey_Hook` 里那句**同一个函数**
+	// （`ApplyRegValueRule`）⇒ 单测证明的就是生产会做的事。
+	int ApplyValueRuleForTest(PCWSTR keyPath, PCWSTR valueName,
+		BYTE* data, size_t dataLength, BYTE* outBytes, size_t outLength) noexcept
+	{
+		R3ShieldCore::Event event = {};
+		wcsncpy_s(event.KeyPath, keyPath ? keyPath : L"", _TRUNCATE);
+		event.KeyPathLength = static_cast<ULONG>(wcslen(event.KeyPath));
+		wcsncpy_s(event.ValueName, valueName ? valueName : L"", _TRUNCATE);
+		event.ValueNameLength = static_cast<ULONG>(wcslen(event.ValueName));
+
+		const RApply::Effect effect = ApplyRegValueRule(event, data, dataLength, 0, dataLength);
+		if (outBytes && outLength && data) {
+			const size_t n = (outLength < dataLength) ? outLength : dataLength;
+			memcpy(outBytes, data, n);
+		}
+		return static_cast<int>(effect);
+	}
+
+	// 规则文件加载（指向临时文件 —— 绝不动真实安装路径）。
+	bool LoadRulesFromFile(PCWSTR path) noexcept
+	{
+		return R3ShieldCoreRuleScriptRuntime::ForceLoadFrom(path);
+	}
+
+	// 直接清空规则表（单测之间互不污染）。
+	void ClearRulesForTest() noexcept
+	{
+		RScript::Clear();
+	}
+
+	// 规则条数（诊断）。
+	int RuleCountForTest() noexcept
+	{
+		return RScript::Count();
 	}
 }
 #endif // REGUARD_GUARD_UT

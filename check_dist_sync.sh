@@ -945,9 +945,101 @@ else
     fi
 fi
 
+# ======================================================================
+# v78 代次标记（「高级」页可编辑 + 规则文件路径两侧同源）
+# ======================================================================
+#
+# ★ 为什么需要这节：v78 改的是**两个发布物** ——
+#   · 主程序 `R3 Shield Core.exe` 里多了一个原生 EDIT 子控件、三道题的闸门、
+#     以及"保存到规则文件"的动作；
+#   · 引擎 `r3shieldcore-lib.dll` 里多了**启动时读规则文件**的逻辑。
+#   ⇒ 两样都必须有标记，否则"改了源码没重编"照样全绿（铁律 142）。
+#
+# ★ 判据：
+#   ① ★ **前提检查**（铁律 117）：标记必须先在源码里存在，否则"查不到"
+#      会被误当成"没重编"，而真因是"标记被改名 / 删了"。
+#        a) `r3shieldcore_gui.cpp` 含 `R3SHIELDCORE_PREVIEW_ADV`
+#           —— 预览模式给「高级」页预置界面状态的环境变量（v78 新增）。
+#        b) `shared/r3shieldcore/rules_file.h` 存在且含 `r3shieldcore-rules.txt`
+#           —— 规则文件名的**唯一一份**定义。
+#   ② 主程序 exe 含**宽**串 `R3SHIELDCORE_PREVIEW_ADV`
+#      —— 证明「高级」页的新代码真的编进了 exe。
+#   ③ ★★ **两侧同源**：主程序 exe 与引擎 dll **都**含宽串
+#      `r3shieldcore-rules.txt`。
+#      这一条是本节的重点：界面**写**这个文件、引擎**读**它，两边必须指向
+#      同一个名字。只查一侧的话，"界面存到 A、引擎读 B"这种
+#      **界面显示已保存、引擎一条都不生效**的故障查不出来（铁律 195/127）。
+#      ⚠️ `kFileName` 是 `L"..."` 宽字面量 ⇒ 必须用 `strings -el`（16 位），
+#         `-a` 看的是 8 位世界，查不到（铁律 193）。
+echo ""
+echo "=== v78 代次标记（「高级」页可编辑 + 规则文件路径两侧同源）==="
+
+V78_MARK="R3SHIELDCORE_PREVIEW_ADV"
+V78_RULES="r3shieldcore-rules.txt"
+V78_SRC="$PROJECT_ROOT/R3ShieldCore/R3ShieldCore/r3shieldcore_gui.cpp"
+V78_RULES_HDR="$PROJECT_ROOT/R3ShieldCore/shared/r3shieldcore/rules_file.h"
+V78_EXE="$DIST_DIR/R3 ShieldCore.exe"
+
+# ① 前提检查
+if [ ! -f "$V78_SRC" ]; then
+    echo "[FAIL] 源码不存在: $V78_SRC（v78 判据失去前提）"
+    fail=1
+elif ! grep -qwF "$V78_MARK" "$V78_SRC" 2>/dev/null; then
+    echo "[FAIL] $V78_SRC 里没有 '$V78_MARK' —— 「高级」页的预览状态开关被删了"
+    fail=1
+fi
+if [ ! -f "$V78_RULES_HDR" ]; then
+    echo "[FAIL] 缺失: $V78_RULES_HDR（规则文件名的唯一一份定义 —— 两侧同源的前提）"
+    fail=1
+elif ! grep -qF "$V78_RULES" "$V78_RULES_HDR" 2>/dev/null; then
+    echo "[FAIL] $V78_RULES_HDR 里没有 '$V78_RULES' —— 文件名标记不见了"
+    fail=1
+fi
+
+# ②③ dist 的两个发布物
+if [ ! -f "$V78_EXE" ]; then
+    echo "[FAIL] 缺失: $V78_EXE"
+    fail=1
+else
+    if strings -el "$V78_EXE" | grep -qwF "$V78_MARK"; then
+        echo "[ OK ] EXE 含 v78 宽串标记 '$V78_MARK'（「高级」页可编辑已编入）"
+    else
+        echo "[FAIL] EXE 缺 v78 宽串标记 '$V78_MARK'（用 strings -el 查）"
+        echo "       ⇒ exe 没重编，或标记被改名 / 改成了窄串"
+        fail=1
+    fi
+fi
+
+# ★ 两侧同源：exe（写）与 dll（读）都要带规则文件名。
+v78_src_exe=0
+v78_src_dll=0
+if [ -f "$V78_EXE" ] && strings -el "$V78_EXE" | grep -qF "$V78_RULES"; then
+    v78_src_exe=1
+fi
+for arch in 64 32; do
+    dll="$DIST_DIR/$arch/r3shieldcore-lib.dll"
+    if [ -f "$dll" ] && strings -el "$dll" | grep -qF "$V78_RULES"; then
+        v78_src_dll=1
+    fi
+done
+if [ "$v78_src_exe" -eq 1 ]; then
+    echo "[ OK ] EXE 含宽串 '$V78_RULES'（界面**写**的那个文件名）"
+else
+    echo "[FAIL] EXE 缺宽串 '$V78_RULES' ⇒ 界面侧没有把 rules_file.h 编进去"
+    echo "       （用 strings -el 查；写成 -a 永远查不到，铁律 193）"
+    fail=1
+fi
+if [ "$v78_src_dll" -eq 1 ]; then
+    echo "[ OK ] 引擎 DLL 含宽串 '$V78_RULES'（引擎**读**的那个文件名 —— 两侧同源）"
+else
+    echo "[FAIL] 64/32 的 r3shieldcore-lib.dll 都缺宽串 '$V78_RULES'"
+    echo "       ⇒ 引擎侧没有接入规则文件读取（v78 的引擎那一半没编进去）"
+    fail=1
+fi
+
 echo ""
 if [ "$fail" -eq 0 ]; then
-    echo "结果: PASS —— dist 与构建产物一致，双架构同代次，且带 v66/v67/v69/v70/v71/v72/v73/v74/v75/v77 标记。"
+    echo "结果: PASS —— dist 与构建产物一致，双架构同代次，且带 v66/v67/v69/v70/v71/v72/v73/v74/v75/v77/v78 标记。"
     exit 0
 fi
 echo "结果: FAIL —— 发布目录与构建产物不同步，**不要打包**。"
