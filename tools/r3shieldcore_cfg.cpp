@@ -76,6 +76,9 @@
 // ★ v83：液态玻璃材质（背景模糊 + 圆角 SDF + 折射/色散/rim/噪点/投影）。
 //   与主程序**同一份**实现 —— 铁律 127（各写一份 ⇒ 材质参数慢慢分叉且不报错）。
 #include <r3shieldcore/ui_material.h>
+// ★ v84：OpenGL 玻璃后端 + 风格契约（与主程序同一份）。
+#include <r3shieldcore/ui_gl.h>
+#include <r3shieldcore/ui_style.h>
 #include "registry_spoof_codec.h"
 #include "clipboard_spoof_codec.h"
 
@@ -781,6 +784,38 @@ float CfgDpiScale(HWND hwnd) {
 	}
 	return static_cast<float>(dpi) / 96.0f;
 }
+
+// ★ v84：界面风格（从 ui_style.h 的契约读；主程序切了这里跟着变）
+R3ShieldCoreUi::Style g_uiStyle = R3ShieldCoreUi::Style::Glass;
+
+// ★ v84：OpenGL 后端（Init 失败就一直是 CPU 合成）
+R3ShieldCoreUi::GlGlass g_cfgGl;
+
+// 面板表 -> GL 入参（与主程序同一套桥接；两边产出的缓冲格式完全一致）
+void CfgGlComposeBridge(void* ctx, const R3ShieldCoreUi::Backdrop& bd,
+	const R3ShieldCoreUi::PanelRec* panels, int count,
+	int headerBand, float headerVeil,
+	int w, int h, float dpi, BYTE* out) {
+	auto* gl = static_cast<R3ShieldCoreUi::GlGlass*>(ctx);
+	R3ShieldCoreUi::GlGlass::PanelDraw list[96];
+	const int n = count < 96 ? count : 96;
+	for (int i = 0; i < n; ++i) {
+		list[i].x0 = panels[i].x0;
+		list[i].y0 = panels[i].y0;
+		list[i].x1 = panels[i].x1;
+		list[i].y1 = panels[i].y1;
+		list[i].radius = panels[i].radius;
+		list[i].tint = panels[i].tint;
+		list[i].kind = panels[i].kind;
+	}
+	if (!gl->Render(bd.full.bits, bd.full.w, bd.full.h, list, n,
+		headerBand, headerVeil, w, h, dpi, out)) {
+		g_glass.glCompose = nullptr;
+		R3ShieldCoreUi::PaintBackdropBase(out, w, h, bd,
+			R3ShieldCoreUi::DefaultTheme(), R3ShieldCoreUi::DefaultTheme().veil);
+		printf("[glass] 警告：GL 合成本帧失败，已退回 CPU 合成（后续不再尝试 GL）\n");
+	}
+}
 const int kRowH       = 30;   // 按钮 / 复选框行高（主窗口动作按钮同档）
 
 HFONT g_fontTitle = nullptr;  // -17 FW_SEMIBOLD  标题
@@ -1068,15 +1103,31 @@ void DrawActionButton(HDC dc, const RECT& rect, PCWSTR text, bool primary,
 	COLORREF textColor = kTextSecondary;
 	ButtonColors(primary, danger, state, &background, &border, &textColor);
 
-	HBRUSH brush = CreateSolidBrush(background);
-	HPEN pen = CreatePen(PS_SOLID, 1, border);
-	HGDIOBJ oldBrush = SelectObject(dc, brush);
-	HGDIOBJ oldPen = SelectObject(dc, pen);
-	RoundRect(dc, rect.left, rect.top, rect.right, rect.bottom, 8, 8);
-	SelectObject(dc, oldBrush);
-	SelectObject(dc, oldPen);
-	DeleteObject(brush);
-	DeleteObject(pen);
+	// ★ v84：按钮 = 一小块玻璃片（与主程序同一套语言）。
+	//   语义（主按钮 / 危险）留在**文字色 + 下划线**上：玻璃是半透明的，
+	//   整块铺语义色就退化成实色贴纸，材质感全丢。
+	if (g_glass.active) {
+		float tint = 0.30f;
+		if (state == BtnState::Hover) { tint = 0.40f; }
+		if (state == BtnState::Pressed) { tint = 0.48f; }
+		if (!primary) { tint -= 0.04f; }
+		g_glass.AddPanel(rect.left, rect.top, rect.right, rect.bottom,
+			(rect.bottom - rect.top) * 0.5f, tint, 1);
+		RECT underline = { rect.left + 10, rect.bottom - 3, rect.right - 10, rect.bottom - 2 };
+		HBRUSH ub = CreateSolidBrush(danger ? kBlocked : (primary ? kAccent : kBorder));
+		FillRect(dc, &underline, ub);
+		DeleteObject(ub);
+	} else {
+		HBRUSH brush = CreateSolidBrush(background);
+		HPEN pen = CreatePen(PS_SOLID, 1, border);
+		HGDIOBJ oldBrush = SelectObject(dc, brush);
+		HGDIOBJ oldPen = SelectObject(dc, pen);
+		RoundRect(dc, rect.left, rect.top, rect.right, rect.bottom, 8, 8);
+		SelectObject(dc, oldBrush);
+		SelectObject(dc, oldPen);
+		DeleteObject(brush);
+		DeleteObject(pen);
+	}
 
 	RECT textRect = rect;
 	if (state == BtnState::Pressed) { OffsetRect(&textRect, 0, 1); }
@@ -4412,9 +4463,19 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 		GetClientRect(hwnd, &rc);
 
 		// ★ v83：先准备玻璃层（背景 + 面板）。
+		// ★ v84：经典模式下不铺玻璃层（active=false ⇒ 走原来的实色绘制）。
 		g_glass.headerBand = kContentTop;
-		g_glass.headerVeil = 0.30f;
-		const bool glassOn = g_glass.Begin(hwnd, rc.right, rc.bottom,
+		g_glass.headerVeil = 0.20f;
+		const bool glassWanted = (g_uiStyle == R3ShieldCoreUi::Style::Glass);
+		if (!glassWanted) {
+			g_glass.active = false;
+		} else if (g_cfgGl.Ready()) {
+			g_glass.glCompose = CfgGlComposeBridge;
+			g_glass.glCtx = &g_cfgGl;
+		} else {
+			g_glass.glCompose = nullptr;
+		}
+		const bool glassOn = glassWanted && g_glass.Begin(hwnd, rc.right, rc.bottom,
 			CfgDpiScale(hwnd),
 			g_glassWantBackdrop || (GetTickCount64() - g_glassMovedAt) < 1200);
 		g_glassWantBackdrop = false;
@@ -4963,6 +5024,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 		KillTimer(hwnd, 1);
 		// ★ v83：玻璃缓存（背景 + 面板层，两块整幅 DIB）必须显式放掉。
 		g_glass.Shutdown();
+		g_cfgGl.Shutdown();
 		// ★ 摘图标要在关文件**之前或之后都行**，但必须做：图标消息投给这个 hwnd，
 		//   窗口没了还留着图标 = 通知区里一个"点了没反应"的僵尸（铁律 103）。
 		g_tray.icon.Remove();
@@ -5333,6 +5395,18 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) {
 	if (!g_main) {
 		MessageBoxW(nullptr, L"窗口创建失败。", L"R3 ShieldCore 配置与日志", MB_ICONERROR);
 		return 1;
+	}
+
+	// ★ v84：界面风格 + GL 后端（必须在首帧之前定下来，否则会先按默认风格闪一帧）
+	g_uiStyle = R3ShieldCoreUi::LoadStyle();
+	// ★ 这行让 `kStyleMarker`（宽串）进二进制 —— 不引用它，链接器会把常量丢掉，
+	//   发布闸门 v84 节就查不到"风格切换真的编进去了"（v83 在 cfg 上踩过同样的坑）。
+	printf("[ui] 界面风格=%ls 标记=%ls\n",
+		R3ShieldCoreUi::StyleName(g_uiStyle), R3ShieldCoreUi::kStyleMarker);
+	if (g_uiStyle == R3ShieldCoreUi::Style::Glass && g_cfgGl.Init()) {
+		printf("[glass] OpenGL 后端就绪：%s 标记=%ls\n",
+			g_cfgGl.info[0] ? g_cfgGl.info : "(unknown)",
+			R3ShieldCoreUi::kGlMarker);
 	}
 
 	// ★ v83：外框圆角（"背景透明圆角"）。优先 DWM 抗锯齿圆角，

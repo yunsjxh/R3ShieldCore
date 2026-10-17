@@ -65,9 +65,9 @@ struct GlassTheme {
     float smallRadius        = 10.0f;
 
     // 白 tint 强度（与着色器 uTint 同义）
-    float tintIdle           = 0.150f;
-    float tintHover          = 0.210f;
-    float tintActive         = 0.260f;
+    float tintIdle           = 0.300f;
+    float tintHover          = 0.360f;
+    float tintActive         = 0.420f;
 
     // 折射
     float bendPx             = 14.0f;   // 边缘最大偏移（全分辨率像素）
@@ -87,15 +87,15 @@ struct GlassTheme {
     float specTopStrength    = 0.16f;
 
     // 噪点幅度（0..1，乘到 ±127.5）
-    float noiseAmp           = 0.038f;
+    float noiseAmp           = 0.020f;
 
     // 投影
     float shadowOffsetY      = 5.0f;
     float shadowRadius       = 24.0f;
-    float shadowAlpha        = 0.18f;
+    float shadowAlpha        = 0.22f;
 
     // 背景"薄纱"：整幅背景压一层白，保证深色文字可读（0 = 完全不加）
-    float veil               = 0.22f;
+    float veil               = 0.00f;
     // 背景冷色化：往这个色偏一点，让桌面壁纸不至于是花花绿绿的照片
     BYTE  veilTintB          = 252;
     BYTE  veilTintG          = 250;
@@ -379,10 +379,28 @@ inline const wchar_t* BackdropSourceName(int source)
 {
     switch (source) {
     case 1:  return L"屏幕捕获";
-    case 2:  return L"兜底渐变";
+    case 2:  return L"内置背景";
     case 3:  return L"已关闭";
     default: return L"无";
     }
+}
+
+// 背景源：0=自动（抓到太素就换内置）1=只用屏幕 2=只用内置
+//   ★ 自动是默认：既保留"真透视"（后面有内容时），又不会在纯白文档前变成一张白纸。
+inline int BackdropMode()
+{
+    static int mode = -1;
+    if (mode >= 0) {
+        return mode;
+    }
+    mode = 0;
+    wchar_t v[16] = {};
+    const DWORD n = GetEnvironmentVariableW(L"R3SHIELDCORE_GLASS_BG", v, 16);
+    if (n > 0 && n < 16 && v[0]) {
+        if (_wcsicmp(v, L"desktop") == 0 || _wcsicmp(v, L"screen") == 0) { mode = 1; }
+        else if (_wcsicmp(v, L"builtin") == 0 || _wcsicmp(v, L"designed") == 0) { mode = 2; }
+    }
+    return mode;
 }
 
 // 2x2 平均降采样（比 StretchBlt 可控，且不需要 HALFTONE 模式）
@@ -475,6 +493,89 @@ inline void BuildFallbackFull(Backdrop& bd)
             row[x * 4 + 3] = 255;
         }
     }
+}
+
+// 内置背景：**设计好的柔和网格渐变**（浅色但有色相结构）
+//
+// ★★ 为什么需要它（这是"看起来丑"的根因，不是技术问题）：
+//   玻璃的价值全在"背景里有东西可折射"。用户机器上窗口后面往往是**纯白的
+//   文档/浏览器**，抓下来一片白 ⇒ 玻璃=白，面板=白卡片，整体就是"灰白平面"。
+//   参考项目之所以好看，是因为它底下压了一张彩色照片。
+//   ⇒ 抓到的背景**太素**时自动换成这块设计好的网格渐变：
+//     浅色（保证面板外的深色文字可读）+ 有色相（玻璃才有折射/色散可看）。
+inline void BuildDesignedFull(Backdrop& bd)
+{
+    if (!bd.full.Create(nullptr, bd.w, bd.h)) {
+        return;
+    }
+    struct Blob { float x, y, r; float cr, cg, cb; float a; };
+    // ★★ 配色取向：**冷调浅蓝画布** + 很淡的色团。
+    //   为什么要冷调、要淡：面板是"白色半透明玻璃"，只有画布明显**比它深一点、
+    //   冷一点**，面板才会"浮"起来。第一版用了饱和度高的暖色团，结果整屏发闷、
+    //   面板和背景糊在一起（用户直接说"丑死了"）—— 配色比技术更决定观感。
+    const Blob blobs[] = {
+        { 0.08f, 0.02f, 0.72f, 205, 224, 247, 0.62f },   // 天蓝
+        { 0.95f, 0.00f, 0.58f, 219, 213, 244, 0.52f },   // 淡紫
+        { 0.88f, 1.00f, 0.66f, 201, 234, 226, 0.55f },   // 薄荷
+        { 0.00f, 0.92f, 0.58f, 246, 231, 217, 0.34f },   // 一点点暖（避免整体发青）
+    };
+    for (int y = 0; y < bd.h; ++y) {
+        const float fy = (float)y / (float)(bd.h > 1 ? bd.h - 1 : 1);
+        BYTE* row = bd.full.bits + (size_t)y * bd.full.stride;
+        for (int x = 0; x < bd.w; ++x) {
+            const float fx = (float)x / (float)(bd.w > 1 ? bd.w - 1 : 1);
+            // 底：冷调浅蓝灰，向下压暗一档（给纵向层次；也让面板能"亮"出来）
+            float r = 233.0f - 10.0f * fy;
+            float g = 239.0f - 9.0f * fy;
+            float b = 249.0f - 6.0f * fy;
+            for (const Blob& blob : blobs) {
+                const float dx = fx - blob.x;
+                const float dy = (fy - blob.y) * 0.86f;   // 略压扁，更像相机里的光
+                float d = sqrtf(dx * dx + dy * dy) / blob.r;
+                if (d >= 1.0f) {
+                    continue;
+                }
+                const float w = (1.0f - d * d) * (1.0f - d * d) * blob.a;
+                r += (blob.cr - r) * w;
+                g += (blob.cg - g) * w;
+                b += (blob.cb - b) * w;
+            }
+            // 一道很淡的斜向高光带，打破"平涂感"
+            const float beam = Clampf(1.0f - fabsf((fx - 0.30f) * 0.8f + (fy - 0.15f) * 0.6f) * 1.8f, 0.0f, 1.0f);
+            r += beam * 9.0f; g += beam * 8.0f; b += beam * 6.0f;
+            // 轻 vignette：四角压 5%，让中间"厚"一点（画布有厚度，玻璃才有对比）
+            const float vx = (fx - 0.5f) * 2.0f, vy = (fy - 0.5f) * 2.0f;
+            const float vig = 1.0f - 0.05f * (vx * vx + vy * vy);
+            row[x * 4 + 0] = (BYTE)Clampf(b * vig, 0.0f, 255.0f);
+            row[x * 4 + 1] = (BYTE)Clampf(g * vig, 0.0f, 255.0f);
+            row[x * 4 + 2] = (BYTE)Clampf(r * vig, 0.0f, 255.0f);
+            row[x * 4 + 3] = 255;
+        }
+    }
+}
+
+// 背景"有没有东西可折射"：色相幅度（max-min 通道）的平均值。
+// ★ 阈值 10 是实测定的：纯白文档 ≈ 0~2；浅色壁纸 ≥ 25；设计渐变 ≈ 18~30。
+inline int Colorfulness(const Dib32& img)
+{
+    if (!img.bits || img.w <= 0 || img.h <= 0) {
+        return 0;
+    }
+    const int stepY = img.h > 48 ? img.h / 48 : 1;
+    const int stepX = img.w > 48 ? img.w / 48 : 1;
+    long long sum = 0;
+    int n = 0;
+    for (int y = 0; y < img.h; y += stepY) {
+        const BYTE* row = img.bits + (size_t)y * img.stride;
+        for (int x = 0; x < img.w; x += stepX) {
+            const BYTE* p = row + x * 4;
+            const int mx = (p[0] > p[1] ? (p[0] > p[2] ? p[0] : p[2]) : (p[1] > p[2] ? p[1] : p[2]));
+            const int mn = (p[0] < p[1] ? (p[0] < p[2] ? p[0] : p[2]) : (p[1] < p[2] ? p[1] : p[2]));
+            sum += (mx - mn);
+            ++n;
+        }
+    }
+    return n > 0 ? (int)(sum / n) : 0;
 }
 
 // 从 full 生成 a/b 两级模糊（半分辨率）
@@ -1043,6 +1144,18 @@ struct GlassSurface {
     bool      backdropDirty = true;
     ULONGLONG backdropAt    = 0;
     bool      active        = false;
+    // ★★ GL 合成挂载点：不为空时，玻璃层交给 GPU 画（见 ui_gl.h）。
+    //   约定：把 **背景 + 顶栏薄纱 + 所有面板** 画进 `out`（top-down BGRA，w*h*4）。
+    //   这样 `ui_material.h` 不需要 #include 任何 GL 头（CPU 后端仍然独立可用）。
+    using GlComposeFn = void (*)(void* ctx, const Backdrop& bd,
+                                 const PanelRec* panels, int count,
+                                 int headerBand, float headerVeil,
+                                 int w, int h, float dpi, BYTE* out);
+    GlComposeFn glCompose = nullptr;
+    void*       glCtx = nullptr;
+    // 实际用的后端（0=CPU 1=GL），给日志/判据看
+    int         backend = 0;
+
     // 顶部"另一块玻璃片"的薄纱高度（逻辑 px，0=不要）。
     // 由调用方在 Begin 之前设 —— 各页共用同一段顶栏，但高度由调用方决定。
     int      headerBand = 0;
@@ -1112,21 +1225,28 @@ struct GlassSurface {
         backdrop.w = w;
         backdrop.h = h;
 
-        bool captured = false;
-        if (hwnd && IsWindow(hwnd)) {
+        const int bgMode = BackdropMode();
+        bool useCaptured = false;
+        if (bgMode != 2 && hwnd && IsWindow(hwnd)) {
             POINT origin = { 0, 0 };
             ClientToScreen(hwnd, &origin);
-            captured = CaptureRegion(hwnd, origin.x, origin.y, w, h, backdrop.full);
-            if (captured && LooksBlank(backdrop.full)) {
+            useCaptured = CaptureRegion(hwnd, origin.x, origin.y, w, h, backdrop.full);
+            if (useCaptured && LooksBlank(backdrop.full)) {
                 // 全黑/纯色 = 抓失败了（受保护内容、RDP、显卡驱动）
-                captured = false;
+                useCaptured = false;
+            }
+            // ★★ 自动模式的关键一步：抓到了，但**太素**（窗口后面是白文档）
+            //   ⇒ 玻璃没有可折射的内容，效果等于"白玻璃压白背景"= 一张白纸。
+            //   这种情况换成内置的设计背景，视觉上才成立。
+            if (useCaptured && bgMode == 0 && Colorfulness(backdrop.full) < 10) {
+                useCaptured = false;
             }
         }
-        if (!captured) {
-            BuildFallbackFull(backdrop);
-            backdrop.source = 2;
-        } else {
+        if (useCaptured) {
             backdrop.source = 1;
+        } else {
+            BuildDesignedFull(backdrop);
+            backdrop.source = 2;
         }
         BuildBlurLevels(backdrop);
         backdropAt = GetTickCount64();
@@ -1141,6 +1261,14 @@ struct GlassSurface {
         if (!layer.bits) {
             return;
         }
+        if (glCompose) {
+            glCompose(glCtx, backdrop, used, usedCount,
+                      headerBand, headerVeil, w, h, dpi, layer.bits);
+            backend = 1;
+            layerDirty = false;
+            return;
+        }
+        backend = 0;
         PaintBackdropBase(layer.bits, w, h, backdrop, DefaultTheme(), DefaultTheme().veil);
         // 顶栏：压一层更亮的薄纱，读成"另一块玻璃片"（原来是 GradientFill 干的）。
         // ★ 放在**玻璃层里**而不是画内容时叠一次：内容是每帧重画的，

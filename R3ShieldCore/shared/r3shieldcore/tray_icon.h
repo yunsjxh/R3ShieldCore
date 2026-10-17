@@ -75,6 +75,7 @@ enum class TrayMenuAction : UINT {
 	None = 0,
 	ShowWindow,
 	ToggleEngine,     // 仅主程序用：退出/启动引擎
+	ToggleUi,         // 仅主程序用：界面风格（液态玻璃 ⇄ 经典）
 	Exit,
 };
 
@@ -84,12 +85,14 @@ constexpr UINT kCmdBase        = 0x7E00;
 constexpr UINT kCmdShowWindow  = kCmdBase + 1;
 constexpr UINT kCmdToggleEngine= kCmdBase + 2;
 constexpr UINT kCmdExit        = kCmdBase + 3;
+constexpr UINT kCmdToggleUi    = kCmdBase + 4;
 
 //  命令 id -> 语义。**取反必须是 None**（下面 TrayMenuFromCommand 也查它）。
 inline TrayMenuAction TrayMenuFromCommand(UINT cmd) {
 	switch (cmd) {
 	case kCmdShowWindow:   return TrayMenuAction::ShowWindow;
 	case kCmdToggleEngine: return TrayMenuAction::ToggleEngine;
+	case kCmdToggleUi:     return TrayMenuAction::ToggleUi;
 	case kCmdExit:         return TrayMenuAction::Exit;
 	default:               return TrayMenuAction::None;
 	}
@@ -100,6 +103,7 @@ inline UINT CommandFromTrayMenu(TrayMenuAction a) {
 	switch (a) {
 	case TrayMenuAction::ShowWindow:   return kCmdShowWindow;
 	case TrayMenuAction::ToggleEngine: return kCmdToggleEngine;
+	case TrayMenuAction::ToggleUi:     return kCmdToggleUi;
 	case TrayMenuAction::Exit:         return kCmdExit;
 	default:                           return 0;
 	}
@@ -254,7 +258,8 @@ private:
 //
 //   `extraItems` 里可以塞调用方自己的项（主程序用「退出引擎」）。
 inline TrayMenuAction ShowTrayMenu(HWND owner, const std::wstring& showLabel,
-	bool withToggleEngine, const std::wstring& toggleEngineLabel) {
+	bool withToggleEngine, const std::wstring& toggleEngineLabel,
+	const std::wstring& uiLabel = std::wstring()) {
 	HMENU menu = ::CreatePopupMenu();
 	if (!menu) {
 		return TrayMenuAction::None;
@@ -262,6 +267,9 @@ inline TrayMenuAction ShowTrayMenu(HWND owner, const std::wstring& showLabel,
 	::AppendMenuW(menu, MF_STRING, kCmdShowWindow, showLabel.c_str());
 	if (withToggleEngine && !toggleEngineLabel.empty()) {
 		::AppendMenuW(menu, MF_STRING, kCmdToggleEngine, toggleEngineLabel.c_str());
+	}
+	if (!uiLabel.empty()) {
+		::AppendMenuW(menu, MF_STRING, kCmdToggleUi, uiLabel.c_str());
 	}
 	::AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
 	::AppendMenuW(menu, MF_STRING, kCmdExit, L"退出");

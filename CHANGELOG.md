@@ -174,6 +174,60 @@
   —— 这是把「画错了」与「屏幕没抓到」分开的唯一手段（本轮两次都是靠它定位）。
 - ★ ABI 仍 **26**；引擎 / 注入 / 共享内存 / ini **零改动**。
 
+### 新增 — 界面**两套可切换**（OpenGL 液态玻璃 / 经典）；修「丑」的根因（v84）
+
+用户反馈（原话）：「那就做两个可切换的界面版本，一个是用 OpenGL，另一个是原来的界面，
+继续，你现在这个丑死了」。三件事一起做了。
+
+**① OpenGL 后端（真着色器）** `shared/r3shieldcore/ui_gl.h`
+- 直接把参考项目 `LiquidGlassNative` 的 `GLASS_FS` 搬到 GPU：真高斯模糊（可分离 9 抽头）、
+  真 `fwidth` 抗锯齿、真 `pow(1-t, 2.2)` 衰减、真色散。
+- ★★ **零额外依赖**：不引 GLFW/GLEW/glm。窗口与上下文用 **WGL** 自己建
+  （`opengl32.dll` 是系统 DLL，不随包分发任何东西），函数入口用 `wglGetProcAddress`
+  自己取（只取用到的 30 个）。⇒ 发布包**一个新增文件都没有**。
+- 链路：上传背景 → 1/2 降采样 + 高斯 → 1/4 → FBO 合成（底图 + 顶栏薄纱 + 逐面板）
+  → `glReadPixels` 回读（行序上下翻转）→ 同一块 32bpp DIB → GDI 照旧画内容。
+- ★ 每面板一次 draw（viewport + scissor 限制在包围盒内），不是"一次画完所有面板"——
+  着色器里循环 96 个面板会让每个像素跑 96 遍 SDF。
+- ★★ **失败必回落**：只有 GL 1.1（RDP / 虚拟显卡 / 老驱动）⇒ `wglCreateContextAttribsARB`
+  拿到空 ⇒ `Init()` 返回 false ⇒ 自动用 CPU 合成（v83 那套）。两条路产出同格式缓冲，
+  上层完全无感。GL 中途失败（设备丢失）也会**当场**退回 CPU 并把钩子摘掉。
+
+**② 两套界面可切换** `shared/r3shieldcore/ui_style.h`（契约唯一来源，铁律 127）
+- `Style::Glass`（液态玻璃）/ `Style::Classic`（v82 那套完全不透明的平面界面）。
+- 取值：`R3SHIELDCORE_UI=glass|classic` → 否则 `%ProgramData%\R3 Shield Core\r3shieldcore-ui.ini`
+  的 `[ui] style` → 否则默认 Glass。
+- 切换入口：**托盘右键「界面：…」**（标签写目标："界面：经典" = 点我切到经典）。
+  切换后落盘 + 清玻璃缓存 + 重绘。两个 exe 读同一份设置 ⇒ 不会一个玻璃一个经典。
+- `tray_icon.h` 加 `TrayMenuAction::ToggleUi` / `kCmdToggleUi`（不写裸数字）。
+
+**③ 修「丑」的根因：背景里没有东西可折射**
+- ★★ 这是关键的一条：玻璃的价值全在"背景有内容可折射"。抓屏抓到的是**纯白文档/浏览器**
+  ⇒ 玻璃=白、面板=白卡片，整体就是一张白纸。**这和技术路线无关**，换 GL 也一样白。
+- 新增**内置设计背景**（`BuildDesignedFull`）：冷调浅蓝画布 + 四个很淡的色团
+  （天蓝/淡紫/薄荷/微暖）+ 斜向高光带 + 轻 vignette。
+- ★ 自动判定（默认）：抓到的图算**色相幅度**（`Colorfulness`，max-min 通道均值），
+  低于 10（白文档 ≈ 0~2）就换成内置背景；有色内容照旧真透视。
+  可用 `R3SHIELDCORE_GLASS_BG=desktop|builtin` 强制。
+- ★ 配色返工一次：第一版用了饱和度高的暖色团，整屏发闷、面板和背景糊在一起
+  （就是"丑死了"的那一版）。改成**冷调、更深一点的画布** + 面板 tint 抬到 0.30，
+  面板才"浮"起来。**配色比技术更决定观感。**
+
+**其它**
+- `R3SHIELDCORE_GLASS=off` 仍然是一键回退（完全不透明）。
+- `R3SHIELDCORE_GLASS_DUMP=1` 每帧导 BMP 的诊断保留（本轮仍靠它定位）。
+- 面板/页签/按钮的语义色（拦截红 / 替换紫 / 危险）仍只落在**文字与下划线**上。
+
+**核对**
+- `test_gui_preview.sh` **11 屏全绿**（GL 后端：日志实测 `OpenGL 后端就绪：3.3.0 Core Profile`）。
+- 经典模式单独跑一遍也全绿（`R3SHIELDCORE_UI=classic`，界面与 v82 逐像素同级）。
+- `build_cfgtool.sh x64` 25/0；`deploy_dist.sh` 闸门 **PASS**（v66…v84）。
+- `check_dist_sync.sh` 新增 **v84 节**：`ui_gl.h` 关键实现（`wglCreateContextAttribsARB` /
+  `sdRoundBox` / `glReadPixels`）+ 两侧都调 `Init()` + 两侧 exe 含宽串
+  `R3ShieldCoreGL.v84` 与 `R3ShieldCoreUiStyle.v84`。
+- ★ 踩坑：产物名是 **`R3 ShieldCore.exe`**（Shield 与 Core 之间**没有**空格）——
+  我按 `R3 Shield Core.exe` 调探针，`CreateProcess` 恒定 `err=2`，排查了很久（铁律 243）。
+
 ### 变更 — cfg 日志页：**删掉「控制台日志」**，「事件日志」改为**向服务端取**（v81）
 
 用户要求（原话）：「下拉框的事件日志就是从服务端取……控制台日志没用了，应该删掉」。
