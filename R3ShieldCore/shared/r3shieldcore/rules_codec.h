@@ -205,6 +205,24 @@ static bool WordIn(const Tok& t, std::initializer_list<const WCHAR*> names)
 	return false;
 }
 
+// 「这个词是不是字段名」—— **唯一一处**判据。
+//
+// ★ 为什么单独抽出来（v79）：这个集合有两个读者 ——
+//     · `Parse`：决定"这里到底是字段、还是已经进到算子了"；
+//     · `NextStepHint`：给界面算"下一步该写什么"。
+//   写两遍必然漂（铁律 127）：漂了之后，用户在提示的引导下敲了一个
+//   合法别名，`Parse` 却认不出来 —— 表现是"提示说这么写，写完又报错"，
+//   最难查的一类不一致。
+//   ⚠️ 新增字段别名：**先加进这里**，再去 `Parse` 的映射里补一行
+//      （两处在同一文件、紧挨着）。
+static bool IsFieldWord(const std::wstring& s)
+{
+	return s == L"值名" || s == L"名字" || s == L"名称" || s == L"name"
+	    || s == L"键路径" || s == L"路径" || s == L"path"
+	    || s == L"子键名" || s == L"子键" || s == L"child"
+	    || s == L"格式" || s == L"format";
+}
+
 // ---------------------------------------------------------------- 匹配
 static bool EndsWithW(const WCHAR* s, const WCHAR* suf)
 {
@@ -260,10 +278,7 @@ static bool Parse(const WCHAR* line, Rule& r, std::wstring& err)
 
 	// --- 字段（可省；省了就用该面的默认字段）---
 	r.field = (r.face == Face::Clip) ? Field::Format : Field::Name;
-	if (i < t.size() && WordIn(t[i], { L"值名", L"名字", L"名称", L"name",
-	                                   L"键路径", L"路径", L"path",
-	                                   L"子键名", L"子键", L"child",
-	                                   L"格式", L"format" })) {
+	if (i < t.size() && t[i].kind == TokKind::Word && IsFieldWord(t[i].text)) {
 		if (WordIn(t[i], { L"值名", L"名字", L"名称", L"name" })) r.field = Field::Name;
 		else if (WordIn(t[i], { L"键路径", L"路径", L"path" }))   r.field = Field::Path;
 		else if (WordIn(t[i], { L"子键名", L"子键", L"child" }))  r.field = Field::Name;
@@ -462,6 +477,74 @@ static void ListAll(std::vector<std::wstring>& out)
 	std::lock_guard<std::mutex> lk(g_mtx);
 	out.clear();
 	for (const Rule& r : g_rules) out.push_back(Describe(r));
+}
+
+// ---------------------------------------------------------------- 输入提示
+// 「这一行写到哪一段了、下一段该写什么」—— 给界面的**实时提示**用。
+//
+// ★ 它**只用于提示，不参与判定**。
+//   一行规则到底能不能用，永远由 `Parse` 说了算（`Add` 也是先 `Parse`）。
+//   所以这里即便说错了，最多是"提示不准" —— 不会让一条合法规则被拒，
+//   也不会让一条非法规则混进表里。这是它敢做"轻量扫描"而不是
+//   "把 Parse 抄一遍"的前提。
+//
+// ★ 为什么要它：DSL 是中文的，用户**改到一半**（把 `含` 改成 `匹配`、
+//   再补一个 `/正则/`）时界面上没有任何反馈，只能点一次「加入」才知道
+//   错在哪 —— 而"点了才知道错"正是最劝退的交互。
+//
+// ★ 返回空串 = "按语法看已经写完了"（至于它到底能不能用，看 `Parse`）。
+//   界面据此分两种话术：写完了还报错 ⇒ 让用户看错误信息；
+//   没写完 ⇒ 直接告诉下一段该写什么。
+static std::wstring NextStepHint(const WCHAR* line)
+{
+	std::vector<Tok> t;
+	std::wstring terr;
+	if (!Tokenize(line, t, terr)) {
+		return L"先补全：" + terr;      // 引号 / 斜杠没闭合
+	}
+
+	size_t i = 0;
+	if (i >= t.size()) {
+		return L"每条规则都以「当」开头";
+	}
+	if (!(t[i].kind == TokKind::Word && t[i].text == L"当")) {
+		return L"开头要写「当」";
+	}
+	++i;                                                        // 当
+
+	if (i >= t.size()) {
+		return L"写面：注册表值 / 注册表枚举 / 剪贴板";
+	}
+	++i;                                                        // 面
+
+	if (i < t.size() && t[i].kind == TokKind::Word && t[i].text == L"的") {
+		++i;                                                    // 可选「的」
+	}
+	if (i < t.size() && t[i].kind == TokKind::Word && IsFieldWord(t[i].text)) {
+		++i;                                                    // 可选字段
+	}
+	if (i >= t.size()) {
+		return L"写算子：等于 / 含 / 匹配 / 开头 / 结尾";
+	}
+	++i;                                                        // 算子
+
+	if (i >= t.size()) {
+		return L"写模式：\"文本\" 或 /正则/";
+	}
+	++i;                                                        // 模式
+
+	if (i >= t.size()) {
+		return L"写「时」";
+	}
+	if (!(t[i].kind == TokKind::Word && t[i].text == L"时")) {
+		return L"模式后面要写「时」";
+	}
+	++i;                                                        // 时
+
+	if (i >= t.size()) {
+		return L"写动作：替换为 … / 隐藏 / 拒绝 / 放行";
+	}
+	return L"";                                                 // 写完了
 }
 
 // 存盘：UTF-8（带 BOM，记事本友好），一行一条 —— 存出来的东西能直接 `rule load` 回来

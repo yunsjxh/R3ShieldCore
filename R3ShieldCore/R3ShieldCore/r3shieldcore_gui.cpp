@@ -13,35 +13,17 @@
 #include <vector>
 
 // ---------------------------------------------------------------------
-// ★ v77：主程序「高级」页签 —— 与「替换 API 结果」控制台**同一份**逻辑。
+// ★ v80：「高级」页签的编辑台搬到了 `r3shieldcore-cfg.exe`。
 //
-//   铁律 195（同一份逻辑不抄第二遍）：这一页显示的「改前 / 改后」字节，
-//   必须是引擎真跑时会写进去的那些字节，所以四件东西全部**直接复用**：
-//     · rules_codec.h        —— 中文规则引擎（含正则）
-//     · spoof_apply_codec.h  —— 判定 -> 字节怎么落地
-//     · registry_spoof_codec.h   —— **生产同源**的数据区定位
-//     · clipboard_spoof_codec.h  —— **生产同源**的替代物构造
+//   主程序这一页现在只剩一个"把 cfg 叫到前台"的按钮，所以原来为编辑台
+//   引入的那一堆头（rules_codec / spoof_apply_codec / registry_spoof_codec /
+//   clipboard_spoof_codec / rules_file / advanced_quiz / md_inline）**全部
+//   不再需要** —— 它们跟着编辑台一起搬去 cfg 了。
 //
-//   ⚠️ 后两个住在 `R3ShieldCoreLib/`，所以构建脚本要把那个目录放进搜索路径
-//      （见 build.sh 的 build_demo：`-I R3ShieldCoreLib`）。漏了会 C1083。
+//   这里只需要**一个**头：启动 / 激活的契约（窗口类名 / 激活消息 / 页号 /
+//   exe 名）。契约只定义一处，两边都 #include 它（铁律 127）。
 // ---------------------------------------------------------------------
-#include <r3shieldcore/rules_codec.h>
-#include <r3shieldcore/spoof_apply_codec.h>
-#include "registry_spoof_codec.h"
-#include "clipboard_spoof_codec.h"
-
-// ★ v78：两样东西也必须**共用同一份**，不能在这一页里再抄一遍。
-//
-//   · `rules_file.h` —— 规则文件**放在哪**。
-//     界面要**写**它、引擎（每个被注入进程）要**读**它，两边必须指向
-//     同一个文件。抄两份的后果是"界面显示已保存、引擎一条都不生效"，
-//     而且两边都不报错（铁律 195/127）。
-//
-//   · `advanced_quiz.h` —— 三道闸门题。
-//     命令行控制台（tools/spoof_console.cpp）与这一页共用同一套题；
-//     抄两份的话会出现"控制台过了、界面过不了"这种谁也看不出原因的分歧。
-#include <r3shieldcore/rules_file.h>
-#include <r3shieldcore/advanced_quiz.h>
+#include <r3shieldcore/cfg_launch.h>
 
 //
 // 界面布局
@@ -242,6 +224,9 @@ namespace
 	HFONT g_monoFont = nullptr;
 	HFONT g_logFont = nullptr;   // 日志行用更小的等宽字体，一屏塞得下更多
 	HFONT g_tabFont = nullptr;
+	// ★ v79：Markdown 的 `**加粗**` 要真加粗 —— 与 g_labelFont 同字号同字面，
+	//   只差字重，所以同一行里混排时基线不会跳。
+	HFONT g_boldFont = nullptr;
 
 	R3ShieldCoreGui::Options g_options = {};
 
@@ -310,10 +295,27 @@ namespace
 	std::vector<R3ShieldCoreArk::ActionRecord> g_arkActions;
 	ULONG g_arkActionsSerial = 0;
 
-	// ★ v77：「高级」页签的两个按钮（自绘，与 ARK 那套一样单独一份状态）。
-	//   同样**不**并进 HeaderAction —— 它们的位置随客户区大小变、且只在这一页存在。
-	int g_advHoverAction = -1;
-	int g_advPressedAction = -1;
+	// ★ v80：「高级」页签只剩一个按钮（把 cfg 叫到前台）。状态与 ARK 那套一样
+	//   单独一份 —— 它的位置随客户区大小变、且只在这一页存在。
+	//
+	//   `g_advLaunchError` 存**上次跳转失败的原因**。为什么不弹 MessageBox：
+	//   弹窗把"为什么点了没反应"变成一个必须点掉的框，而用户此刻可能正在
+	//   做别的事；画在页内更安静，而且 `--gui-preview` 的截图能拍到它
+	//   （可核对，铁律 24/28）。
+	int g_advLaunchHover = -1;
+	int g_advLaunchPressed = -1;
+	std::wstring g_advLaunchError;
+
+	// ★ v80：**仅预览模式**用的开关 —— 建窗后自动"点一下"跳转按钮。
+	//
+	//   为什么需要：用户要的核心行为是"点主程序的「高级」→ 跳到 cfg 的
+	//   高级页"。这条链路的每一环（窗口类名 / 激活消息 / 页号 / exe 名）
+	//   都可能静默对不上 —— 而"点了没反应"和"页面画错了"在截图上分不开。
+	//   没有这个开关，就只能靠人眼点一下（铁律 24/28）。
+	//
+	//   ⚠️ 只在 `--gui-preview` 下由环境变量置起（见 RunPreview）；
+	//      生产路径读不到它 ⇒ 不会有人被"自动点击"。
+	bool g_previewJumpClick = false;
 
 	// 当前显示用的模式。**不能直接读 g_options.Mode** ——
 	// 运行期切模式时引擎线程会改它，而 g_options 是普通结构体
@@ -1686,13 +1688,13 @@ namespace
 			// v21 起全拦模式的进程创建 / 远程线程 / 跨进程内存改为**弹窗询问**，
 			// 文案必须跟着改 —— 再说"一律拒绝"就是骗用户了。
 			swprintf_s(text,
-				L"⚠ 完全拦截：其余一律拒绝；进程创建 / 远程线程 / 跨进程内存改为弹窗   ·   询问 %u 允许 %u 拒绝 %u   ·   丢弃 %u 条",
+				L"⚠ 完全拦截：其余一律拒绝；进程创建 / 远程线程 / 跨进程内存改为弹窗   ·   询问 %u 允许 %u 拒绝 %u   ·   丢弃 %u 条",  // gbk-ok：本行只经 GDI DrawTextW 绘制，从不经 WideCharToMultiByte(CP_ACP)
 				prompt.Shown, prompt.Allowed, prompt.Denied, snapshot.DroppedEvents);
 		}
 		else if (mode == R3ShieldCore::Mode::BlockAllSafe) {
 			// 与 BlockAll 的唯一区别：可信来源的进程创建直接放行（不弹窗）。
 			swprintf_s(text,
-				L"⚠ 完全拦截·安全：可信来源的进程创建直接放行；其余一律拒绝，远程线程 / 跨进程内存弹窗   ·   询问 %u 允许 %u 拒绝 %u   ·   丢弃 %u 条",
+				L"⚠ 完全拦截·安全：可信来源的进程创建直接放行；其余一律拒绝，远程线程 / 跨进程内存弹窗   ·   询问 %u 允许 %u 拒绝 %u   ·   丢弃 %u 条",  // gbk-ok：本行只经 GDI DrawTextW 绘制，从不经 WideCharToMultiByte(CP_ACP)
 				prompt.Shown, prompt.Allowed, prompt.Denied, snapshot.DroppedEvents);
 		}
 		else if (mode == R3ShieldCore::Mode::Ask) {
@@ -1755,7 +1757,7 @@ namespace
 			WCHAR watchText[512] = {};
 			if (watch.HighRiskFound > 0) {
 				swprintf_s(watchText,
-					L"⚠ 高危进程  %u 个   ·   最近 %s (pid %u)   ·   %s",
+					L"⚠ 高危进程  %u 个   ·   最近 %s (pid %u)   ·   %s",  // gbk-ok：本行只经 GDI DrawTextW 绘制，从不经 WideCharToMultiByte(CP_ACP)
 					watch.HighRiskFound,
 					watch.LatestName.empty() ? L"(未知)" : watch.LatestName.c_str(),
 					watch.LatestPid,
@@ -2355,7 +2357,7 @@ namespace
 				}
 				if (stat.SnapshotFailures != 0) {
 					WCHAR extra[96] = {};
-					swprintf_s(extra, L"  ·  ⚠ 枚举失败 %u 次（err=%lu）",
+					swprintf_s(extra, L"  ·  ⚠ 枚举失败 %u 次（err=%lu）",  // gbk-ok：本行只经 GDI DrawTextW 绘制，从不经 WideCharToMultiByte(CP_ACP)
 						stat.SnapshotFailures, stat.LastError);
 					summary += extra;
 				}
@@ -2884,1460 +2886,161 @@ namespace
 	}
 
 	// =================================================================
-	// ★ v77/v78：「高级」页签 —— 规则脚本的**编辑台 + 预览台**
+	// ★ v80：「高级」页签 —— 编辑台搬去了 r3shieldcore-cfg.exe，这里只留入口
 	// =================================================================
 	//
-	// 这一页回答两个问题：
-	//   ① **我写的规则，会把 API 的返回值改成什么？**（v77 起的改前/改后对照）
-	//   ② **怎么把规则写出来、存下去，让引擎真的用上？**（v78 起的编辑 + 落盘）
+	// 原来这一页是一个 1770 行的编辑台：规则表 + 原生 EDIT + 模板芯片 +
+	// 「改前 / 改后」字节对照。v80 把它**整块搬到 cfg 工具**（第 3 个页签）。
 	//
-	// ★ 三个界面状态（同一页，互斥）
-	//   ① 闸门未过  —— 整块内容区换成**三道 Win32 题**（编辑区锁住）。
-	//   ② 刚全对    —— 展示三道题的解析 + 「开始编辑」。
-	//   ③ 已解锁    —— 左：规则表 + 编辑区；右：改前/改后字节对照。
+	// 为什么搬（不是嫌它长，是**操作节奏不同**）：
+	//   · 「配置」页是"看一眼、勾一下"，几秒钟的事；
+	//   · 「高级」页是"坐下来写规则"，要打字、要对照、要反复试。
+	//   两种节奏挤在一个窗口里，写规则时每敲一个字主程序都要重绘整屏。
 	//
-	// ★★ 三道题与命令行控制台是**同一套题**（`shared/r3shieldcore/advanced_quiz.h`）
-	//   抄两份必然漂（铁律 127）：漂了之后"控制台过了、界面过不了"，
-	//   而两边都不会报错。
+	// 现在的分工：
+	//   · cfg 侧（r3shieldcore-cfg.exe 第 3 页签）：完整编辑台，
+	//     与生产**同一份** codec（`spoof_apply_codec.h` 等，铁律 195）。
+	//   · 主程序侧（这一页）：一个按钮 —— 点一下把 cfg 叫到前台并切到
+	//     「高级」页；cfg 已经在跑就**激活**，不重复开。
+	//   · 主程序启动时顺手把 cfg 拉起来（最小化，不抢焦点）。
 	//
-	// ★★ 规则文件在哪、谁读它（**这一页最容易让人误解的地方**）
-	//   · 路径：`%ProgramData%\R3 Shield Core\r3shieldcore-rules.txt`
-	//     （目录不存在则回退到本程序所在目录）—— 与 `r3shieldcore.ini` 同目录。
-	//   · 引擎侧（`r3shieldcore-lib.dll`，跑在**每个被注入进程**里）**启动时
-	//     各读一次**。⇒ **存完规则要重启引擎才生效**，页面上必须写清。
-	//   · 路径解析是**同一份**代码（`shared/r3shieldcore/rules_file.h`）——
-	//     界面存到 A、引擎读 B 是最难查的一类"存了没用"。
+	// ★ 为什么按钮不自己写 `CreateProcessW` + 字面量窗口名（铁律 127）：
+	//   窗口类名 / 激活消息名 / 页号 / exe 名**只定义一处** —— 共享头
+	//   `cfg_launch.h`。这里再抄一份的话，cfg 哪天改了 exe 名，主程序会
+	//   "启动成功但窗口永远不出现"：`CreateProcessW` 返回真，没有任何地方
+	//   会报错，而用户看到的就是"点了没反应"。
 	//
-	// ★★ 规则的**总闸**仍是 ini 的三个开关（`spoof_reg` / `spoof_clipboard` /
-	//   `spoof_reg_enum`，默认**关**）。开关关着 ⇒ 规则一律不生效。
-	//   页面必须把这件事**显示出来**（读的是引擎真正读到的那份配置）——
-	//   否则用户写完规则没反应，界面上看不出任何原因（铁律 97）。
-	//
-	// ★ 它**不注入、不跑引擎、不碰真实 API**（铁律 175 因此不适用）：
-	//   注册表样例是**本进程栈上的合成缓冲区**，剪贴板样例是**本进程自己
-	//   GlobalAlloc 出来的** HGLOBAL。所以开发机上可以放心跑，配合
-	//   `--gui-preview` 就能建窗截图核对。
-	//
-	// ★ 「改后」是怎么算出来的（每一步都走**生产路径**，不是"照着生产写的"）
-	//   注册表值  ：`RSpoof::LocateDataRegion` 定位 -> `RApply::ApplyRegValue` 落值
-	//   剪贴板    ：`RClip::FormatLabel` 出格式名 -> 命中规则走
-	//               `RApply::BuildClipText`；没命中回落**生产** `RClip::BuildFake`
-	//   注册表枚举：`RRule::Eval` 逐个子键问规则，命中「隐藏」的从列表去掉
-	//               ⚠️ 未命中**一律保留** —— 这一页**不**模拟 `protect_reg` 判据
-	//                  （那是引擎侧配置，界面拿不到；硬编一个假判据才是骗人）。
-	//   ⚠️ 这一页只证明"规则 -> 字节"这一步；**引擎真的照做**由
-	//      `tools/v78_guard_ut.cpp` 直接驱动生产的 `Evaluate` 证明。
+	// ★ 这一页**不注入、不挂钩、不依赖引擎在跑** —— 它只是个启动器。
+	//   所以本机（铁律 175：开发机禁止跑引擎）可以安全地打开它看。
+	// -----------------------------------------------------------------
 
-	namespace RRule = R3ShieldCoreRuleScript;
-	namespace RApply = R3ShieldCoreSpoofApply;
-	namespace RClip = R3ShieldCoreClipboardSpoof;
-	namespace RSpoof = R3ShieldCoreRegistrySpoof;
-
-	// ================================================================
-	// 闸门状态（v78）
-	// ================================================================
-	bool g_advQuizPassed = false;      // 三道题全对
-	bool g_advWhyDismissed = false;    // 解析看完、开始编辑
-	int  g_advPick[3] = { -1, -1, -1 }; // 每题选了什么（0..3 = A..D，-1 = 没选）
-	int  g_advWrongMask = 0;           // 上次提交时哪几题错（bit i 置 1）
-	bool g_advSubmitted = false;       // 提交过至少一次
-	int  g_advAttempts = 0;            // 提交次数（诊断用）
-
-	// ================================================================
-	// 编辑状态（v78）
-	// ================================================================
-	HWND g_advEdit = nullptr;          // 原生 EDIT 子控件（中文输入必须靠它）
-	int  g_advSelected = -1;           // 规则表里选中的序号（-1 = 没选）
-	int  g_advHoverChip = -1;          // 悬停的模板按钮
-	int  g_advPressedChip = -1;        // 按下的模板按钮
-	std::wstring g_advStatus;          // 编辑区下方那行状态（保存/载入结果）
-	WCHAR g_advPath[MAX_PATH] = L"";   // 规则文件路径（解析一次后缓存）
-
-	// ★ v78：**仅预览模式**用的规则文件路径重定向（空 = 不重定向）。
+	// 跳转页的几何 —— 只在 `AdvLaunchButtonRect` 里算一次，
+	// 绘制 / 命中两处共用（铁律 182：坐标只在创建点出现一次）。
 	//
-	//   只有 `RunPreview`（`--gui-preview`）会填它，生产路径永远是空的 ——
-	//   所以引擎读的、界面写的仍然是 `rules_file.h` 解析出来的那**同一个**
-	//   真实路径（铁律 195 没有被破坏）。
-	//
-	//   为什么需要它：自动核对要的是**确定性**。不重定向的话，探针读到的
-	//   规则条数取决于这台机器上 `%ProgramData%\R3 Shield Core\` 里
-	//   有没有那个文件、里面有几条 —— 于是"规则=3"这条判据在别人机器上
-	//   会随机红，而真正要验证的（页面画出来没有）反而被淹没。
-	//   顺带一个好处：自动核对**完全不碰**用户的真实规则文件。
-	WCHAR g_previewRulesPath[MAX_PATH] = L"";
+	// ★★ v80 修缺陷：原来按钮 top 是**拍脑袋**的 `TabBarTop + TabBarHeight + 104`，
+	//   而第二行说明文字的盒子是 `+94 .. +142` ⇒ **按钮整个压在文字上**；
+	//   按钮下方那行提示又落在第三行说明文字上（`+154..+178` vs `+158..+178`）。
+	//   两处重叠都**只有截图看得出** —— 画按钮/画文字的代码各自都明明白白
+	//   （铁律 237 同族：自绘界面里"重叠"不会报错，只会盖住）。
+	//   ⇒ 改成"从面板顶按行距**推导**"，并把面板顶抽成函数（面板矩形 / 文字起点 /
+	//     按钮几何三处共用同一个来源，铁律 127）。
+	constexpr int AdvPanelTopInset = 16;        // 面板顶距页签栏底
+	constexpr int AdvTextFirstLineOffset = 46;  // 面板顶 → 第一行文字盒顶
+	constexpr int AdvTextLineStep = 32;         // 第一行 → 第二行
+	constexpr int AdvTextSecondBoxHeight = 48;  // 第二行（可换行，留两行高）
+	constexpr int AdvTextThirdLineStep = 60;    // 第二行盒顶 → 第三行
+	constexpr int AdvTextThirdBoxHeight = 24;
+	constexpr int AdvButtonTopGap = 16;         // 第三行盒底 → 按钮顶
 
-	// ---------------- 按钮 ----------------
-	//
-	// ★ 一次把**所有**按钮列出来，再按界面状态决定"这一屏显示哪几个" ——
-	//   不这么做的话，"按钮位置"会在三个状态里各写一份布局（铁律 127）。
-	enum AdvButton
+	constexpr int AdvPanelTop() { return TabBarTop + TabBarHeight + AdvPanelTopInset; }
+
+	// 按钮顶 = 面板顶 + 三行文字占的高度 + 间距（**推导**出来的，不是拍脑袋的）
+	constexpr int AdvButtonTopOffset = AdvTextFirstLineOffset + AdvTextLineStep
+		+ AdvTextSecondBoxHeight + AdvTextThirdLineStep + AdvTextThirdBoxHeight
+		+ AdvButtonTopGap;
+
+	constexpr int AdvLaunchButtonWidth = 240;
+	constexpr int AdvLaunchButtonHeight = 40;
+
+	RECT AdvLaunchButtonRect(const RECT& client)
 	{
-		AdvButtonNone = -1,
-		AdvButtonQuizSubmit = 0,   // ① 提交答案
-		AdvButtonQuizReset = 1,    // ① 清空作答
-		AdvButtonWhyDone = 2,      // ② 开始编辑
-		AdvButtonApply = 3,        // ③ 把编辑框内容加为新规则 / 更新选中那条
-		AdvButtonDelete = 4,       // ③ 删除选中
-		AdvButtonSave = 5,         // ③ 保存到规则文件
-		AdvButtonLoad = 6,         // ③ 从规则文件载入
-		AdvButtonSeed = 7,         // ③ 重置为示例规则
-		AdvButtonClear = 8,        // ③ 清空规则表
-		AdvButtonAll = 9,
-	};
-
-	// 当前状态该显示哪些按钮。
-	bool AdvButtonVisible(int index)
-	{
-		if (!g_advQuizPassed) {
-			return index == AdvButtonQuizSubmit || index == AdvButtonQuizReset;
-		}
-		if (!g_advWhyDismissed) {
-			return index == AdvButtonWhyDone;
-		}
-		return index == AdvButtonApply || index == AdvButtonDelete
-			|| index == AdvButtonSave || index == AdvButtonLoad
-			|| index == AdvButtonSeed || index == AdvButtonClear;
+		const int centerX = (client.left + client.right) / 2;
+		const int top = AdvPanelTop() + AdvButtonTopOffset;
+		RECT rect = { centerX - AdvLaunchButtonWidth / 2, top,
+			centerX + AdvLaunchButtonWidth / 2, top + AdvLaunchButtonHeight };
+		return rect;
 	}
 
-	PCWSTR AdvButtonLabel(int index)
+	bool HitTestAdvLaunch(POINT point, const RECT& client)
 	{
-		switch (index) {
-		case AdvButtonQuizSubmit: return L"提交答案";
-		case AdvButtonQuizReset:  return L"清空作答";
-		case AdvButtonWhyDone:    return L"开始编辑规则";
-		case AdvButtonApply:      return L"加入 / 更新规则";
-		case AdvButtonDelete:     return L"删除选中";
-		case AdvButtonSave:       return L"保存到规则文件";
-		case AdvButtonLoad:       return L"从规则文件载入";
-		case AdvButtonSeed:       return L"重置为示例规则";
-		case AdvButtonClear:      return L"清空规则表";
-		default: return L"";
-		}
+		const RECT rect = AdvLaunchButtonRect(client);
+		return point.x >= rect.left && point.x < rect.right
+			&& point.y >= rect.top && point.y < rect.bottom;
 	}
 
-	// ---------------- 模板（结构化点选搭骨架） ----------------
-	//
-	// ★ 点「面」＝插入一整条骨架；点「算子」「动作」＝在光标处插入该词。
-	//   骨架用**中文 DSL 原文**（不是直接拼 Rule 结构体）—— 必须走用户手敲
-	//   那条**同一条解析路径**（铁律 22）。
-	PCWSTR kAdvFaceChips[3] = {
-		L"当 注册表值 的 值名 含 \"\" 时 替换为 \"\"",
-		L"当 注册表枚举 的 子键名 含 \"\" 时 隐藏",
-		L"当 剪贴板 的 格式 等于 文本 时 替换为 \"\"",
-	};
-	PCWSTR kAdvFaceChipLabel[3] = { L"注册表值", L"注册表枚举", L"剪贴板" };
-
-	PCWSTR kAdvOpChips[5] = { L"等于", L"含", L"匹配 /正则/", L"开头", L"结尾" };
-	PCWSTR kAdvOpChipText[5] = { L"等于", L"含", L"匹配 //", L"开头", L"结尾" };
-
-	PCWSTR kAdvActChips[6] = { L"替换为 \"\"", L"替换为 空", L"替换为 全零",
-		L"隐藏", L"拒绝", L"放行" };
-
-	constexpr int kAdvChipRowA = 3;    // 面
-	constexpr int kAdvChipRowB = 5;    // 算子
-	constexpr int kAdvChipRowC = 6;    // 动作
-	constexpr int kAdvChipCount = kAdvChipRowA + kAdvChipRowB + kAdvChipRowC;
-
-	PCWSTR AdvChipLabel(int index)
+	// 真正去叫 cfg。失败**不弹窗** —— 把原因记在 `g_advLaunchError` 里，
+	// 由 DrawAdvancedPage 画在按钮下方（理由见该变量的声明处）。
+	void AdvLaunchCfg(HWND hwnd)
 	{
-		if (index < kAdvChipRowA) {
-			return kAdvFaceChipLabel[index];
-		}
-		index -= kAdvChipRowA;
-		if (index < kAdvChipRowB) {
-			return kAdvOpChips[index];
-		}
-		return kAdvActChips[index - kAdvChipRowB];
-	}
+		R3ShieldCoreCfg::LaunchOptions options;
+		options.page = R3ShieldCoreCfg::kPageAdvanced;
+		options.quiet = false;   // 用户主动点的 ⇒ 叫到前台并切到「高级」页
 
-	// 芯片宽度：首次调用测一次，之后查表。
-	//
-	// ★ 为什么不在布局函数里测：布局函数会被**命中测试**调用（没有 DC），
-	//   在那里量文字要么传 DC 要么再建一个 —— 两条路都会让"画"和"点"
-	//   用上不同的宽度。缓存一次，两边读同一张表。
-	int AdvChipWidth(int index)
-	{
-		static int widths[kAdvChipCount] = {};
-		static bool ready = false;
-		if (!ready) {
-			HDC dc = GetDC(nullptr);
-			HGDIOBJ old = SelectObject(dc, g_labelFont);
-			for (int i = 0; i < kAdvChipCount; i++) {
-				RECT r = { 0, 0, 0, 0 };
-				DrawTextW(dc, AdvChipLabel(i), -1, &r, DT_CALCRECT | DT_SINGLELINE);
-				widths[i] = (r.right - r.left) + 20;   // 左右各 10px 内边距
-				if (widths[i] < 52) {
-					widths[i] = 52;
-				}
-			}
-			SelectObject(dc, old);
-			ReleaseDC(nullptr, dc);
-			ready = true;
-		}
-		return widths[index];
-	}
-
-	// ---------------- 布局（绘制与命中共用一份，避免"画在这儿点在那儿"） ----------------
-	constexpr int AdvButtonHeight = 28;
-	constexpr int AdvButtonWidth = 140;
-	constexpr int AdvLineHeight = 21;
-	constexpr int AdvMaxHexBytes = 16;   // 每行最多显示多少字节（超了打 "..."）
-	constexpr int AdvTableRowHeight = 19;
-	constexpr int AdvChipHeight = 22;
-	constexpr int AdvChipGap = 4;
-	constexpr int AdvEditHeight = 26;
-
-	struct AdvLayout
-	{
-		int Left = 0, Right = 0;
-		int SummaryTop = 0;
-		// ★ 摘要行下面那一行说明（"编辑区已锁定…" / "全对 —— 闸门打开…"）。
-		//   单独一个字段而不是"PanelTop - 22"：那样写的话，一旦有人调
-		//   PanelTop 的偏移，说明行会**无声地叠到摘要行上** ——
-		//   自绘界面里两张文字叠在一起没有任何报错，只有截图看得出来
-		//   （实测过一次：两行字糊成一团）。
-		int NoteTop = 0;
-		int PanelTop = 0, PanelBottom = 0;
-		int RulesLeft = 0, RulesRight = 0;
-		int DiffLeft = 0, DiffRight = 0;
-		int ButtonTop = 0;
-		RECT Buttons[AdvButtonAll] = {};
-
-		// 编辑区（只在"已解锁"状态用得上）
-		int TableTop = 0, TableBottom = 0;
-		int ChipTop = 0;
-		RECT ChipRow[3][6] = {};
-		int EditTop = 0, EditBottom = 0;
-		int StatusTop = 0;
-
-		// 闸门（只在"未过 / 刚全对"状态用得上）
-		int QuizColTop = 0, QuizColWidth = 0;
-		int QuizOptTop = 0;
-	};
-
-	AdvLayout AdvLayoutFor(const RECT& client)
-	{
-		AdvLayout layout = {};
-		layout.Left = Padding;
-		layout.Right = client.right - Padding;
-		layout.SummaryTop = TabBarTop + TabBarHeight + 12;
-		// 摘要行 22px + 说明行 18px + 间距 ⇒ 面板从摘要行下方 46px 起。
-		// 之前是 26px，导致说明行（画在 PanelTop-22）正好压在摘要行上。
-		layout.NoteTop = layout.SummaryTop + 24;
-		layout.PanelTop = layout.NoteTop + 22;
-
-		// 底部按钮条固定贴底（在询问统计栏之上）—— 与其它页同一套算法，
-		// 窗口被拉矮时按钮不会跑到可视区外。
-		layout.ButtonTop = client.bottom - PromptSummaryHeight() - 12 - AdvButtonHeight;
-		layout.PanelBottom = layout.ButtonTop - 34;   // 再往上留一行状态文字
-
-		const int gap = 14;
-		const int contentWidth = layout.Right - layout.Left - gap;
-		const int rulesWidth = contentWidth * 52 / 100;
-		layout.RulesLeft = layout.Left;
-		layout.RulesRight = layout.Left + rulesWidth;
-		layout.DiffLeft = layout.RulesRight + gap;
-		layout.DiffRight = layout.Right;
-
-		// 按钮：只给**当前状态该显示**的那些分配位置，从左往右排。
-		int x = layout.Left;
-		for (int i = 0; i < AdvButtonAll; i++) {
-			if (!AdvButtonVisible(i)) {
-				continue;
-			}
-			layout.Buttons[i] = { x, layout.ButtonTop, x + AdvButtonWidth,
-				layout.ButtonTop + AdvButtonHeight };
-			x += AdvButtonWidth + 8;
-		}
-
-		// ---- 编辑区（左栏内）----
-		layout.TableTop = layout.PanelTop + 46;
-		layout.TableBottom = layout.TableTop + 6 * AdvTableRowHeight + 4;
-		layout.ChipTop = layout.TableBottom + 10;
-		for (int row = 0; row < 3; row++) {
-			const int count = (row == 0) ? kAdvChipRowA : (row == 1 ? kAdvChipRowB : kAdvChipRowC);
-			int cx = layout.RulesLeft + 16;
-			const int cy = layout.ChipTop + row * (AdvChipHeight + AdvChipGap);
-			for (int i = 0; i < count; i++) {
-				const int global = (row == 0) ? i
-					: (row == 1 ? kAdvChipRowA + i : kAdvChipRowA + kAdvChipRowB + i);
-				const int w = AdvChipWidth(global);
-				layout.ChipRow[row][i] = { cx, cy, cx + w, cy + AdvChipHeight };
-				cx += w + AdvChipGap;
-			}
-		}
-		layout.EditTop = layout.ChipTop + 3 * (AdvChipHeight + AdvChipGap) + 8;
-		layout.EditBottom = layout.EditTop + AdvEditHeight;
-		layout.StatusTop = layout.EditBottom + 8;
-
-		// ---- 闸门（整块内容区，三列）----
-		layout.QuizColTop = layout.PanelTop + 40;
-		const int quizGap = 12;
-		layout.QuizColWidth = (layout.Right - layout.Left - quizGap * 2) / 3;
-		layout.QuizOptTop = layout.QuizColTop + 26 + 96;   // 标题 + 题干框
-
-		return layout;
-	}
-
-	// 闸门第 col 列第 opt 个选项的矩形（0..3 = A..D）。
-	//
-	// ★ 高度给 **48**（三行文字）而不是 22：选项原文里带着**对齐用的连续空格**
-	//   （与控制台共用同一份文本，不能改），而这一页每列只有 ~300px 宽 ——
-	//   一行放不下。22px + 单行 + `DT_END_ELLIPSIS` 会把括号里的关键部分
-	//   截掉（实测截成 `A. STATUS_OBJECT_NAME_NOT_FOUND (0...`），
-	//   而**被截掉的那半截往往正是区分对错的地方**。
-	//   ⚠️ 高度是**定值**不是"按内容算"：命中测试要用同一个矩形，
-	//      变高的行会让"画在这儿、点在那儿"。
-	constexpr int AdvQuizOptHeight = 48;
-	constexpr int AdvQuizOptStep = AdvQuizOptHeight + 4;
-
-	RECT AdvQuizOptionRect(const AdvLayout& layout, int col, int opt)
-	{
-		const int left = layout.Left + col * (layout.QuizColWidth + 12);
-		const int top = layout.QuizOptTop + opt * AdvQuizOptStep;
-		return { left + 8, top, left + layout.QuizColWidth - 8, top + AdvQuizOptHeight };
-	}
-
-	int HitTestAdvButton(POINT point, const RECT& client)
-	{
-		if (g_activeTab != 5) {
-			return AdvButtonNone;
-		}
-		const AdvLayout layout = AdvLayoutFor(client);
-		for (int i = 0; i < AdvButtonAll; i++) {
-			if (!AdvButtonVisible(i)) {
-				continue;
-			}
-			if (PtInRect(&layout.Buttons[i], point)) {
-				return i;
-			}
-		}
-		return AdvButtonNone;
-	}
-
-	int HitTestAdvChip(POINT point, const RECT& client)
-	{
-		if (g_activeTab != 5 || !g_advQuizPassed || !g_advWhyDismissed) {
-			return -1;
-		}
-		const AdvLayout layout = AdvLayoutFor(client);
-		for (int row = 0; row < 3; row++) {
-			const int count = (row == 0) ? kAdvChipRowA : (row == 1 ? kAdvChipRowB : kAdvChipRowC);
-			for (int i = 0; i < count; i++) {
-				if (PtInRect(&layout.ChipRow[row][i], point)) {
-					return (row == 0) ? i
-						: (row == 1 ? kAdvChipRowA + i : kAdvChipRowA + kAdvChipRowB + i);
-				}
-			}
-		}
-		return -1;
-	}
-
-	// 闸门选项的命中（未过闸门时才有效）。
-	// 返回 列号（0..2）；`optOut` 收选项号（0..3）。没命中返回 -1。
-	int HitTestAdvQuizOption(POINT point, const RECT& client, int* optOut)
-	{
-		if (g_activeTab != 5 || g_advQuizPassed) {
-			return -1;
-		}
-		const AdvLayout layout = AdvLayoutFor(client);
-		for (int col = 0; col < R3ShieldCoreQuiz::Count(); col++) {
-			for (int opt = 0; opt < 4; opt++) {
-				RECT r = AdvQuizOptionRect(layout, col, opt);
-				if (PtInRect(&r, point)) {
-					if (optOut) {
-						*optOut = opt;
-					}
-					return col;
-				}
-			}
-		}
-		return -1;
-	}
-
-	// 规则表某一行的命中（已解锁状态才有效）。
-	//
-	// ★ 行数上限必须与 `AdvDrawEditor` 里画的那 6 行**同一个数** ——
-	//   画 6 行、这里判 8 行的话，点"第 7 行"（画面上是空白）会选中一条
-	//   看不见的规则；反过来则是"看得见却点不中"。所以两边都读
-	//   `AdvTableRowHeight` 与同一个 maxRows。
-	int HitTestAdvTableRow(POINT point, const RECT& client)
-	{
-		if (g_activeTab != 5 || !g_advQuizPassed || !g_advWhyDismissed) {
-			return -1;
-		}
-		const int total = RRule::Count();
-		if (total <= 0) {
-			return -1;
-		}
-		const int maxRows = 6;
-		const int rows = (total < maxRows) ? total : maxRows;
-		const AdvLayout layout = AdvLayoutFor(client);
-		const int bottom = layout.TableTop + rows * AdvTableRowHeight;
-		if (point.x < layout.RulesLeft + 8 || point.x > layout.RulesRight - 8) {
-			return -1;
-		}
-		if (point.y < layout.TableTop || point.y >= bottom) {
-			return -1;
-		}
-		return (point.y - layout.TableTop) / AdvTableRowHeight;
-	}
-
-	// ---------------- EDIT 子控件（v78） ----------------
-	//
-	// ★ 为什么非要用**原生** EDIT：这一页是纯自绘窗口（一个子控件都没有），
-	//   而中文规则必须能敲中文 ⇒ 需要 **IME**。自绘 + 自己处理
-	//   `WM_IME_*` 等于重写一个输入框，代价和风险都不划算。
-	//
-	// ★ 与双缓冲的冲突（铁律 181）：主窗口整块 `BitBlt` 会**盖掉**子控件。
-	//   解法是给主窗口加 `WS_CLIPCHILDREN` —— 父窗口的绘制区里"子控件占的
-	//   那块"被裁掉，`BitBlt` 就不会画到 EDIT 上。这是必须的前提，不是优化。
-	//   ⚠️ 加了之后**父窗口不能再指望自己画子控件底下的像素** ⇒ EDIT 自己
-	//      带 `WS_BORDER` 且用 `WM_CTLCOLOREDIT` 给它白底（见 WndProc）。
-	//
-	// ★ 位置只在 `AdvLayoutFor` 里算一次（铁律 182：坐标只在创建点出现一次
-	//   的控件 = 定时炸弹）。本函数只负责"把算出来的位置应用上去"。
-	void AdvCreateEdit(HWND parent)
-	{
-		if (g_advEdit) {
-			return;
-		}
-		g_advEdit = CreateWindowExW(
-			0, L"EDIT", L"",
-			WS_CHILD | ES_AUTOHSCROLL | WS_BORDER | WS_TABSTOP,
-			0, 0, 10, 10, parent, nullptr, g_instance, nullptr);
-		if (g_advEdit && g_monoFont) {
-			SendMessageW(g_advEdit, WM_SETFONT,
-				reinterpret_cast<WPARAM>(g_monoFont), TRUE);
-		}
-	}
-
-	// 「编辑框这一刻该不该显示」—— **唯一一处**判据。
-	//
-	// ★ 为什么要抽出来：这个条件有两个读者 —— `AdvSyncEdit`（真的去
-	//   ShowWindow/SW_HIDE）和 `DrawAdvancedPage` 的核对日志（报给探针看）。
-	//   写两遍必然漂（铁律 127）：漂了之后日志说"编辑框=1"、屏幕上却没有，
-	//   于是探针判据变成**恒真**，而它本来是"编辑台画出来了"的唯一证据。
-	bool AdvEditShouldShow()
-	{
-		return g_advEdit != nullptr
-			&& g_activeTab == 5
-			&& g_advQuizPassed
-			&& g_advWhyDismissed;
-	}
-
-	// 编辑框左边留给「规则行」标签的宽度。
-	//
-	// ★ 为什么要有这一段：原生 EDIT 会**盖住**它底下的像素（父窗口加了
-	//   `WS_CLIPCHILDREN`，父窗口画的东西进不到控件区域里）。所以标签不能
-	//   和编辑框重叠 —— 重叠的表现是"标签根本没画"，而代码里明明有那一句
-	//   `DrawTextSimple`，读代码永远查不出来（实测：截图里找不到"规则行"）。
-	constexpr int AdvEditLabelWidth = 56;
-
-	void AdvSyncEdit(HWND hwnd, const RECT& client)
-	{
-		if (!g_advEdit) {
-			return;
-		}
-		if (!AdvEditShouldShow()) {
-			if (IsWindowVisible(g_advEdit)) {
-				ShowWindow(g_advEdit, SW_HIDE);
-			}
-			return;
-		}
-
-		const AdvLayout layout = AdvLayoutFor(client);
-		const int editLeft = layout.RulesLeft + 16 + AdvEditLabelWidth;
-		const int w = layout.RulesRight - 16 - editLeft;
-		const int h = layout.EditBottom - layout.EditTop;
-		if (w <= 0 || h <= 0) {
-			return;
-		}
-
-		RECT want = { editLeft, layout.EditTop, editLeft + w, layout.EditTop + h };
-		RECT have = {};
-		GetWindowRect(g_advEdit, &have);
-		MapWindowPoints(nullptr, hwnd, reinterpret_cast<POINT*>(&have), 2);
-
-		if (!IsWindowVisible(g_advEdit)
-			|| have.left != want.left || have.top != want.top
-			|| (have.right - have.left) != w || (have.bottom - have.top) != h) {
-			SetWindowPos(g_advEdit, nullptr, want.left, want.top, w, h,
-				SWP_NOZORDER | SWP_NOACTIVATE);
-			ShowWindow(g_advEdit, SW_SHOWNA);
-		}
-	}
-
-	// 取编辑框内容（没控件时返回空串）。
-	std::wstring AdvEditText()
-	{
-		if (!g_advEdit) {
-			return L"";
-		}
-		const int len = GetWindowTextLengthW(g_advEdit);
-		if (len <= 0) {
-			return L"";
-		}
-		std::wstring s(static_cast<size_t>(len) + 1, L'\0');
-		GetWindowTextW(g_advEdit, &s[0], len + 1);
-		s.resize(static_cast<size_t>(len));
-		return s;
-	}
-
-	void AdvSetEditText(const std::wstring& text)
-	{
-		if (g_advEdit) {
-			SetWindowTextW(g_advEdit, text.c_str());
-		}
-	}
-
-	// 在光标处插入一段文本（模板按钮用）。
-	void AdvInsertEditText(const std::wstring& insert)
-	{
-		if (!g_advEdit) {
-			return;
-		}
-		SendMessageW(g_advEdit, EM_REPLACESEL, TRUE,
-			reinterpret_cast<LPARAM>(insert.c_str()));
-		SetFocus(g_advEdit);
-	}
-
-	// ---------------- 示例规则 ----------------
-	//
-	// ★ 三条覆盖三个面 × 三种动作：
-	//   #0 注册表值  ：正则匹配 -> 替换为文本（真会写进数据区）
-	//   #1 剪贴板    ：等于    -> 替换为文本
-	//   #2 注册表枚举：含      -> 隐藏（从列表里去掉）
-	PCWSTR kAdvDemoRules[] = {
-		L"当 注册表值 的 值名 匹配 /Pass.*/ 时 替换为 \"***\"",
-		L"当 剪贴板 的 格式 等于 文本 时 替换为 \"[已替换]\"",
-		L"当 注册表枚举 的 子键名 含 \"Secret\" 时 隐藏",
-	};
-
-	void AdvLoadDemoRules()
-	{
-		RRule::Clear();
-		for (PCWSTR line : kAdvDemoRules) {
-			std::wstring err;
-			RRule::Add(line, err, nullptr);
-		}
-		g_advSelected = -1;
-	}
-
-	// 规则文件的路径（解析一次后缓存）。
-	const WCHAR* AdvRulesPath()
-	{
-		if (g_advPath[0] == L'\0') {
-			// 预览模式的重定向优先（生产路径下 `g_previewRulesPath` 恒为空，
-			// 见它的声明处 —— 这不是"另一条路径解析"，只是一个测试替身）。
-			if (g_previewRulesPath[0] != L'\0') {
-				wcsncpy_s(g_advPath, g_previewRulesPath, _TRUNCATE);
-				return g_advPath;
-			}
-			if (!R3ShieldCoreRulesFile::ResolveRulesPath(nullptr, g_advPath, _countof(g_advPath))) {
-				wcsncpy_s(g_advPath, L"(解析规则文件路径失败)", _TRUNCATE);
-			}
-		}
-		return g_advPath;
-	}
-
-	// 首次进这一页：先试着从规则文件读；读不到再铺示例规则。
-	//
-	// ★ 顺序很重要：直接铺示例会把用户存过的规则**顶掉**（他下次一看
-	//   "我写的规则没了"）。先读文件才是对的。
-	// ★ 读不到也要**说清楚**（不能静默铺示例 —— 那与"用户存过但读失败"
-	//   长得一模一样，铁律 97）。
-	void AdvInitialLoad()
-	{
-		int ok = 0;
-		int bad = 0;
-		std::wstring firstErr;
-		const WCHAR* path = AdvRulesPath();
-		// ★ 来源要**显式打出来**：`来源=文件` / `来源=示例`。
-		//   只打条数的话，"从文件读到 3 条"和"文件没有、铺了 3 条示例"
-		//   在日志里长得一模一样 —— 而这两件事的后续行为完全不同
-		//   （前者用户点「保存」会覆盖他自己的规则，后者是新建）。
-		const WCHAR* source = L"示例";
-		if (RRule::LoadFile(path, &ok, &bad, firstErr)) {
-			source = L"文件";
-			WCHAR buf[512] = {};
-			swprintf_s(buf, L"已从规则文件载入 %d 条（无效 %d 条）：%s", ok, bad, path);
-			g_advStatus = buf;
+		std::wstring error;
+		if (R3ShieldCoreCfg::LaunchOrActivate(options, &error)) {
+			g_advLaunchError.clear();
 		}
 		else {
-			AdvLoadDemoRules();
-			WCHAR buf[512] = {};
-			swprintf_s(buf, L"还没有规则文件，已铺 3 条示例（保存后写入 %s）", path);
-			g_advStatus = buf;
+			g_advLaunchError = error;
 		}
-		printf("[adv] 初始规则=%d 来源=%ls 路径=%ls\n", RRule::Count(), source, path);
-		fflush(stdout);
+		InvalidateRect(hwnd, nullptr, FALSE);
 	}
 
-	// ---------------- 动作 ----------------
-	void AdvQuizSubmit()
-	{
-		g_advSubmitted = true;
-		g_advAttempts++;
-		int wrongMask = 0;
-		int wrong = 0;
-		const R3ShieldCoreQuiz::Question* q = R3ShieldCoreQuiz::Questions();
-		for (int i = 0; i < R3ShieldCoreQuiz::Count(); i++) {
-			const bool ok = (g_advPick[i] >= 0)
-				&& (static_cast<WCHAR>(L'A' + g_advPick[i]) == q[i].answer);
-			if (!ok) {
-				wrongMask |= (1 << i);
-				wrong++;
-			}
-		}
-		g_advWrongMask = wrongMask;
-
-		if (wrong == 0) {
-			g_advQuizPassed = true;
-			g_advWhyDismissed = false;
-		}
-		// ★ 只报"哪几题错"，**不报答案** —— 报了答案这道闸门就白设了。
-		printf("[adv] 闸门提交 第%d次 错%d题 通过=%d\n", g_advAttempts, wrong,
-			g_advQuizPassed ? 1 : 0);
-		fflush(stdout);
-	}
-
-	void AdvQuizReset()
-	{
-		g_advPick[0] = g_advPick[1] = g_advPick[2] = -1;
-		g_advWrongMask = 0;
-		g_advSubmitted = false;
-	}
-
-	// 把编辑框里那行加入规则表（选中了就是**更新**）。
-	void AdvApplyRule()
-	{
-		const std::wstring line = AdvEditText();
-		if (line.empty()) {
-			g_advStatus = L"编辑框是空的 —— 先点上面的模板按钮搭一条骨架。";
-			return;
-		}
-		if (g_advSelected >= 0 && g_advSelected < RRule::Count()) {
-			if (!RRule::RemoveAt(g_advSelected)) {
-				g_advStatus = L"更新失败：选中的规则已经不在表里了。";
-				return;
-			}
-		}
-		std::wstring err;
-		int index = -1;
-		if (!RRule::Add(line.c_str(), err, &index)) {
-			g_advStatus = L"这一行解析不了：" + err;
-			return;
-		}
-		g_advSelected = index;
-		WCHAR buf[256] = {};
-		swprintf_s(buf, L"已写入第 %d 条规则（共 %d 条）。记得点「保存到规则文件」。",
-			index, RRule::Count());
-		g_advStatus = buf;
-	}
-
-	void AdvDeleteSelected()
-	{
-		if (g_advSelected < 0 || g_advSelected >= RRule::Count()) {
-			g_advStatus = L"先在左边规则表里点一行。";
-			return;
-		}
-		const int removed = g_advSelected;
-		RRule::RemoveAt(removed);
-		g_advSelected = -1;
-		AdvSetEditText(L"");
-		WCHAR buf[160] = {};
-		swprintf_s(buf, L"已删除第 %d 条（还剩 %d 条）。", removed, RRule::Count());
-		g_advStatus = buf;
-	}
-
-	void AdvSaveRules()
-	{
-		const WCHAR* path = AdvRulesPath();
-		R3ShieldCoreRulesFile::EnsureParentDirectory(path);
-		int count = 0;
-		if (!RRule::SaveFile(path, &count)) {
-			g_advStatus = std::wstring(L"保存失败（写不进去）：") + path;
-			return;
-		}
-		WCHAR buf[600] = {};
-		swprintf_s(buf, L"已保存 %d 条到 %s —— 引擎在**下次启动**时读取（每个被注入进程各读一次）。",
-			count, path);
-		g_advStatus = buf;
-		printf("[adv] 已保存规则 %d 条 路径=%ls\n", count, path);
-		fflush(stdout);
-	}
-
-	void AdvLoadRules()
-	{
-		const WCHAR* path = AdvRulesPath();
-		int ok = 0;
-		int bad = 0;
-		std::wstring firstErr;
-		if (!RRule::LoadFile(path, &ok, &bad, firstErr)) {
-			g_advStatus = std::wstring(L"载入失败（文件打不开）：") + path;
-			return;
-		}
-		g_advSelected = -1;
-		AdvSetEditText(L"");
-		WCHAR buf[600] = {};
-		if (bad > 0) {
-			swprintf_s(buf, L"已载入 %d 条（**%d 条解析失败**，第一条：%s）", ok, bad, firstErr.c_str());
-		}
-		else {
-			swprintf_s(buf, L"已载入 %d 条（全部解析成功）：%s", ok, path);
-		}
-		g_advStatus = buf;
-	}
-
-	void PerformAdvAction(int index)
-	{
-		switch (index) {
-		case AdvButtonQuizSubmit: AdvQuizSubmit(); break;
-		case AdvButtonQuizReset:  AdvQuizReset(); break;
-		case AdvButtonWhyDone:    g_advWhyDismissed = true; break;
-		case AdvButtonApply:      AdvApplyRule(); break;
-		case AdvButtonDelete:     AdvDeleteSelected(); break;
-		case AdvButtonSave:       AdvSaveRules(); break;
-		case AdvButtonLoad:       AdvLoadRules(); break;
-		case AdvButtonSeed:
-			AdvLoadDemoRules();
-			g_advStatus = L"已重置为 3 条示例规则。";
-			break;
-		case AdvButtonClear:
-			RRule::Clear();
-			g_advSelected = -1;
-			AdvSetEditText(L"");
-			g_advStatus = L"规则表已清空（文件里的没动 —— 要清文件得点「保存到规则文件」）。";
-			break;
-		default: break;
-		}
-		printf("[adv] 动作 #%d 规则=%d\n", index, RRule::Count());
-		fflush(stdout);
-	}
-
-	// 点规则表某一行：载入编辑框。
-	void AdvSelectRule(int index)
-	{
-		if (index < 0 || index >= RRule::Count()) {
-			return;
-		}
-		g_advSelected = index;
-		std::wstring desc;
-		if (RRule::DescribeAt(index, desc)) {
-			AdvSetEditText(desc);
-		}
-		if (g_advEdit) {
-			SetFocus(g_advEdit);
-		}
-	}
-
-	// 点模板按钮。
-	void AdvClickChip(int index)
-	{
-		if (index < 0 || index >= kAdvChipCount) {
-			return;
-		}
-		if (index < kAdvChipRowA) {
-			// 「面」= 整条骨架（替换掉编辑框内容 —— 骨架是"起手式"，
-			// 追加会越积越长，反而更难改）。
-			AdvSetEditText(kAdvFaceChips[index]);
-		}
-		else if (index < kAdvChipRowA + kAdvChipRowB) {
-			AdvInsertEditText(kAdvOpChipText[index - kAdvChipRowA]);
-		}
-		else {
-			AdvInsertEditText(kAdvActChips[index - kAdvChipRowA - kAdvChipRowB]);
-		}
-		if (g_advEdit) {
-			SetFocus(g_advEdit);
-		}
-	}
-
-	// ---------------- 显示辅助 ----------------
-	std::wstring AdvHex(const BYTE* data, size_t length)
-	{
-		if (!data || length == 0) {
-			return L"(空)";
-		}
-		std::wstring out;
-		WCHAR cell[8] = {};
-		const size_t n = (length < AdvMaxHexBytes) ? length : AdvMaxHexBytes;
-		for (size_t i = 0; i < n; i++) {
-			swprintf_s(cell, L"%02X ", data[i]);
-			out += cell;
-		}
-		if (n < length) {
-			out += L"...";
-		}
-		return out;
-	}
-
-	// 判定 -> 一句话。复用规则引擎自己的 Describe，别在这里再拼一遍语法
-	// （拼两遍必然与解析器漂移 —— 那正是 v74 收敛 Action 枚举要防的事）。
-	std::wstring AdvVerdictText(const RRule::Verdict& v)
-	{
-		if (!v.hit) {
-			return L"未命中规则 · 回落内置默认行为";
-		}
-		std::wstring desc;
-		if (!RRule::DescribeAt(v.index, desc)) {
-			return L"命中规则";
-		}
-		WCHAR head[32] = {};
-		swprintf_s(head, L"命中 #%d · ", v.index);
-		return std::wstring(head) + desc;
-	}
-
-	// 造一个"真实剪贴板文本"（UTF-16 带结尾 NUL）—— 只为喂给**生产**
-	// `RClip::BuildFake`，让"回落"那一格走的是真生产路径而不是模仿。
-	HGLOBAL AdvBuildRealUnicodeText(const WCHAR* text)
-	{
-		const size_t chars = text ? wcslen(text) : 0;
-		HGLOBAL h = GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT,
-			(chars + 1) * sizeof(WCHAR));
-		if (!h) {
-			return nullptr;
-		}
-		void* p = GlobalLock(h);
-		if (!p) {
-			GlobalFree(h);
-			return nullptr;
-		}
-		if (chars) {
-			memcpy(p, text, chars * sizeof(WCHAR));
-		}
-		GlobalUnlock(h);
-		return h;
-	}
-
-	void AdvDrawButton(HDC dc, const RECT& rect, PCWSTR label, bool hovered, bool pressed)
-	{
-		COLORREF fill = ColorHeaderBackground;
-		COLORREF border = ColorBorder;
-		COLORREF text = ColorTextPrimary;
-		if (pressed) {
-			fill = RGB(200, 222, 244);
-			border = ColorAccent;
-			text = ColorAccent;
-		}
-		else if (hovered) {
-			fill = ColorTabHoverBg;
-			border = ColorTabHoverBorder;
-			text = ColorAccent;
-		}
-
-		HBRUSH brush = CreateSolidBrush(fill);
-		HPEN pen = CreatePen(PS_SOLID, 1, border);
-		HGDIOBJ oldBrush = SelectObject(dc, brush);
-		HGDIOBJ oldPen = SelectObject(dc, pen);
-		RoundRect(dc, rect.left, rect.top, rect.right, rect.bottom, 6, 6);
-		SelectObject(dc, oldBrush);
-		SelectObject(dc, oldPen);
-		DeleteObject(brush);
-		DeleteObject(pen);
-
-		DrawTextSimple(dc, label, rect, g_labelFont, text,
-			DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-	}
-
-	// 模板按钮（比普通按钮矮、圆角小）。
-	void AdvDrawChip(HDC dc, const RECT& rect, PCWSTR label, bool hovered)
-	{
-		COLORREF fill = ColorTabHoverBg;
-		COLORREF border = ColorTabHoverBorder;
-		if (hovered) {
-			fill = RGB(214, 232, 250);
-			border = ColorAccent;
-		}
-		HBRUSH brush = CreateSolidBrush(fill);
-		HPEN pen = CreatePen(PS_SOLID, 1, border);
-		HGDIOBJ oldBrush = SelectObject(dc, brush);
-		HGDIOBJ oldPen = SelectObject(dc, pen);
-		RoundRect(dc, rect.left, rect.top, rect.right, rect.bottom, 5, 5);
-		SelectObject(dc, oldBrush);
-		SelectObject(dc, oldPen);
-		DeleteObject(brush);
-		DeleteObject(pen);
-		DrawTextSimple(dc, label, rect, g_labelFont, ColorAccent,
-			DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
-	}
-
-	// 一行「标签 : 值」
-	void AdvRow(HDC dc, int left, int right, int y, PCWSTR label,
-		const std::wstring& value, COLORREF color)
-	{
-		DrawTextSimple(dc, label, { left, y, left + 48, y + 18 },
-			g_labelFont, ColorTextSecondary, DT_LEFT | DT_SINGLELINE);
-		DrawTextSimple(dc, value.c_str(), { left + 48, y, right, y + 18 },
-			g_monoFont, color, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS);
-	}
-
-	// 把开关状态画成一行（"总闸"）—— 用户"写了规则没生效"时第一个要看的东西。
-	void AdvDrawGates(HDC dc, int left, int right, int y)
-	{
-		WCHAR buf[256] = {};
-		swprintf_s(buf, L"总闸（ini）：spoof_reg=%s  spoof_clipboard=%s  spoof_reg_enum=%s",
-			g_options.SpoofReg ? L"开" : L"关",
-			g_options.SpoofClipboard ? L"开" : L"关",
-			g_options.SpoofRegEnum ? L"开" : L"关");
-		const bool anyOn = g_options.SpoofReg || g_options.SpoofClipboard
-			|| g_options.SpoofRegEnum;
-		DrawTextSimple(dc, buf, { left, y, right, y + 18 },
-			g_labelFont, anyOn ? ColorTextPrimary : ColorBlocked,
-			DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS);
-	}
-
-	// 把连续空格折成一个、并去掉首尾空格。
-	//
-	// ★ 只用于**显示**：闸门题的选项原文为了在控制台里对齐括号，塞了一串
-	//   空格；在这一页 ~300px 宽的列里那串空格会把文字挤出可视高度。
-	//   折叠是"换一种排法"，不改共享文本（`advanced_quiz.h` 一字不动）。
-	//   折叠之后 `A. STATUS_INVALID_HANDLE (0xC0000008)` 这种刚好两行。
-	std::wstring AdvCollapseSpaces(const WCHAR* s)
-	{
-		std::wstring out;
-		if (!s) {
-			return out;
-		}
-		bool prevSpace = false;
-		for (const WCHAR* p = s; *p; ++p) {
-			const bool isSpace = (*p == L' ' || *p == L'\t');
-			if (isSpace) {
-				if (!prevSpace && !out.empty()) {
-					out.push_back(L' ');
-				}
-				prevSpace = true;
-			}
-			else {
-				out.push_back(*p);
-				prevSpace = false;
-			}
-		}
-		while (!out.empty() && out.back() == L' ') {
-			out.pop_back();
-		}
-		return out;
-	}
-
-	// ---------------- 闸门：未通过 ----------------
-	void AdvDrawQuiz(HDC dc, const AdvLayout& layout)
-	{
-		const R3ShieldCoreQuiz::Question* q = R3ShieldCoreQuiz::Questions();
-
-		// 顶部一句说明（"为什么锁着"）。
-		DrawTextSimple(dc,
-			L"编辑区已锁定 —— 答对下面三道 Win32 题解锁（题目都是这个项目真踩过的坑，全对才开门）。",
-			{ layout.Left, layout.NoteTop, layout.Right, layout.NoteTop + 18 },
-			g_labelFont, ColorTextSecondary, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS);
-
-		for (int col = 0; col < R3ShieldCoreQuiz::Count(); col++) {
-			const int left = layout.Left + col * (layout.QuizColWidth + 12);
-			const int right = left + layout.QuizColWidth;
-			RECT panel = { left, layout.PanelTop, right, layout.PanelBottom };
-			DrawPanel(dc, panel, L"");
-
-			WCHAR title[32] = {};
-			swprintf_s(title, L"第 %d 题", col + 1);
-			DrawTextSimple(dc, title, { left + 10, layout.QuizColTop, right - 10, layout.QuizColTop + 20 },
-				g_labelFont, ColorAccent, DT_LEFT | DT_SINGLELINE);
-
-			// 题干（原样，含换行 —— 与控制台**同一份**文本）。
-			DrawTextSimple(dc, q[col].text,
-				{ left + 10, layout.QuizColTop + 22, right - 10, layout.QuizColTop + 22 + 92 },
-				g_labelFont, ColorTextPrimary, DT_LEFT | DT_WORDBREAK | DT_END_ELLIPSIS);
-
-			for (int opt = 0; opt < 4; opt++) {
-				const RECT r = AdvQuizOptionRect(layout, col, opt);
-				const bool picked = (g_advPick[col] == opt);
-				const bool wrong = g_advSubmitted && (g_advWrongMask & (1 << col))
-					&& (g_advPick[col] == opt);
-
-				COLORREF fill = picked ? ColorTabHoverBg : ColorHeaderBackground;
-				COLORREF border = picked ? ColorAccent : ColorBorder;
-				if (wrong) {
-					fill = RGB(253, 233, 233);
-					border = ColorBlocked;
-				}
-				HBRUSH brush = CreateSolidBrush(fill);
-				HPEN pen = CreatePen(PS_SOLID, 1, border);
-				HGDIOBJ ob = SelectObject(dc, brush);
-				HGDIOBJ op = SelectObject(dc, pen);
-				RoundRect(dc, r.left, r.top, r.right, r.bottom, 4, 4);
-				SelectObject(dc, ob);
-				SelectObject(dc, op);
-				DeleteObject(brush);
-				DeleteObject(pen);
-
-				WCHAR line[512] = {};
-				swprintf_s(line, L"%lc. %ls", static_cast<WCHAR>(L'A' + opt), q[col].opt[opt]);
-				// ★ 三行 + 自动换行 + **折叠连续空格**，不要 `DT_END_ELLIPSIS`：
-				//   选项原文里带对齐用的连续空格（为了在**控制台**里把括号对齐），
-				//   在这一页 ~300px 宽的列里那串空格会把文字挤到第三行之外，
-				//   省略号再把括号里的状态码截掉 —— 而那半截往往正是区分对错的地方。
-				//   折叠只影响**显示**，不动共享的题目文本（铁律 195）。
-				DrawTextSimple(dc, AdvCollapseSpaces(line).c_str(),
-					{ r.left + 8, r.top + 3, r.right - 6, r.bottom - 3 },
-					g_labelFont, wrong ? ColorBlocked : ColorTextPrimary,
-					DT_LEFT | DT_TOP | DT_WORDBREAK);
-			}
-
-			// 这一列的结果（只报对错，不报答案）。
-			if (g_advSubmitted) {
-				const bool ok = (g_advWrongMask & (1 << col)) == 0;
-				const int resultTop = layout.QuizOptTop + 4 * AdvQuizOptStep + 2;
-				DrawTextSimple(dc, ok ? L"这一题：对" : L"这一题：错（可重选）",
-					{ left + 10, resultTop, right - 10, resultTop + 18 },
-					g_labelFont, ok ? ColorAccent : ColorBlocked,
-					DT_LEFT | DT_SINGLELINE);
-			}
-		}
-
-		// 底部状态行（"错了几题"）。
-		std::wstring status;
-		if (!g_advSubmitted) {
-			status = L"三道题都选好之后点「提交答案」。";
-		}
-		else if (g_advQuizPassed) {
-			status = L"全对 —— 闸门打开。";
-		}
-		else {
-			int wrong = 0;
-			for (int i = 0; i < 3; i++) {
-				if (g_advWrongMask & (1 << i)) {
-					wrong++;
-				}
-			}
-			WCHAR buf[160] = {};
-			swprintf_s(buf, L"错 %d 题（红色那几题），改完再提交。", wrong);
-			status = buf;
-		}
-		DrawTextSimple(dc, status.c_str(),
-			{ layout.Left, layout.ButtonTop - 26, layout.Right, layout.ButtonTop - 6 },
-			g_labelFont, g_advQuizPassed ? ColorAccent : ColorTextSecondary,
-			DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS);
-	}
-
-	// ---------------- 闸门：刚全对，展示解析 ----------------
-	void AdvDrawWhy(HDC dc, const AdvLayout& layout)
-	{
-		const R3ShieldCoreQuiz::Question* q = R3ShieldCoreQuiz::Questions();
-
-		DrawTextSimple(dc, L"全对 —— 闸门打开。下面把三道题的答案讲清楚（看懂了再点「开始编辑规则」）。",
-			{ layout.Left, layout.NoteTop, layout.Right, layout.NoteTop + 18 },
-			g_labelFont, ColorAccent, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS);
-
-		for (int col = 0; col < R3ShieldCoreQuiz::Count(); col++) {
-			const int left = layout.Left + col * (layout.QuizColWidth + 12);
-			const int right = left + layout.QuizColWidth;
-			DrawPanel(dc, { left, layout.PanelTop, right, layout.PanelBottom }, L"");
-
-			WCHAR title[64] = {};
-			swprintf_s(title, L"第 %d 题 · 正确答案 %lc", col + 1, q[col].answer);
-			DrawTextSimple(dc, title,
-				{ left + 10, layout.QuizColTop, right - 10, layout.QuizColTop + 20 },
-				g_labelFont, ColorAccent, DT_LEFT | DT_SINGLELINE);
-
-			DrawTextSimple(dc, q[col].why,
-				{ left + 10, layout.QuizColTop + 26, right - 10, layout.PanelBottom - 10 },
-				g_labelFont, ColorTextPrimary, DT_LEFT | DT_WORDBREAK | DT_END_ELLIPSIS);
-		}
-	}
-
-	// ---------------- 已解锁：规则表 + 编辑区（左） ----------------
-	void AdvDrawEditor(HDC dc, const AdvLayout& layout)
-	{
-		RECT rulesPanel = { layout.RulesLeft, layout.PanelTop, layout.RulesRight, layout.PanelBottom };
-		DrawPanel(dc, rulesPanel, L"规则表（点一行载入编辑框）");
-
-		std::vector<std::wstring> all;
-		RRule::ListAll(all);
-
-		int y = layout.TableTop;
-		if (all.empty()) {
-			DrawTextSimple(dc, L"（还没有规则 —— 点下面的模板按钮搭一条，或「重置为示例规则」）",
-				{ rulesPanel.left + 16, y, rulesPanel.right - 16, y + 20 },
-				g_labelFont, ColorTextSecondary, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS);
-		}
-		else {
-			const int maxRows = 6;
-			for (size_t i = 0; i < all.size() && static_cast<int>(i) < maxRows; i++) {
-				const bool selected = (static_cast<int>(i) == g_advSelected);
-				if (selected) {
-					RECT hl = { rulesPanel.left + 8, y - 1, rulesPanel.right - 8, y + AdvTableRowHeight - 1 };
-					HBRUSH b = CreateSolidBrush(ColorTabHoverBg);
-					FillRect(dc, &hl, b);
-					DeleteObject(b);
-				}
-				WCHAR index[16] = {};
-				swprintf_s(index, L"#%u", static_cast<unsigned>(i));
-				DrawTextSimple(dc, index, { rulesPanel.left + 16, y, rulesPanel.left + 46, y + 17 },
-					g_monoFont, ColorAccent, DT_LEFT | DT_SINGLELINE);
-				DrawTextSimple(dc, all[i].c_str(),
-					{ rulesPanel.left + 50, y, rulesPanel.right - 16, y + 17 },
-					g_monoFont, ColorTextPrimary, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS);
-				y += AdvTableRowHeight;
-			}
-			if (static_cast<int>(all.size()) > 6) {
-				WCHAR more[64] = {};
-				swprintf_s(more, L"… 还有 %d 条（编辑区仍然能改它们）",
-					static_cast<int>(all.size()) - 6);
-				DrawTextSimple(dc, more, { rulesPanel.left + 16, y, rulesPanel.right - 16, y + 17 },
-					g_labelFont, ColorTextSecondary, DT_LEFT | DT_SINGLELINE);
-			}
-		}
-
-		// 模板按钮（三行）。
-		for (int row = 0; row < 3; row++) {
-			const int count = (row == 0) ? kAdvChipRowA : (row == 1 ? kAdvChipRowB : kAdvChipRowC);
-			for (int i = 0; i < count; i++) {
-				const int global = (row == 0) ? i
-					: (row == 1 ? kAdvChipRowA + i : kAdvChipRowA + kAdvChipRowB + i);
-				AdvDrawChip(dc, layout.ChipRow[row][i], AdvChipLabel(global),
-					g_advHoverChip == global || g_advPressedChip == global);
-			}
-		}
-		// 编辑框的框线由原生 EDIT 自己画（`WS_BORDER`）；这里只画个标签。
-		// ⚠️ 宽度必须 ≤ `AdvEditLabelWidth` —— 超了就会被 EDIT 盖掉一截
-		//   （EDIT 的左缘 = RulesLeft + 16 + AdvEditLabelWidth，见 AdvSyncEdit）。
-		DrawTextSimple(dc, L"规则行",
-			{ rulesPanel.left + 16, layout.EditTop,
-			  rulesPanel.left + 16 + AdvEditLabelWidth - 8, layout.EditBottom },
-			g_labelFont, ColorTextSecondary, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-		// ⚠️ 原生 EDIT 会盖住 [RulesLeft+16, RulesRight-16] 这一段 ——
-		//   主窗口有 `WS_CLIPCHILDREN`，所以这里画的任何东西都不会渗进 EDIT 里。
-
-		if (!g_advStatus.empty()) {
-			DrawTextSimple(dc, g_advStatus.c_str(),
-				{ rulesPanel.left + 16, layout.StatusTop, rulesPanel.right - 16, layout.StatusTop + 18 },
-				g_labelFont, ColorTextSecondary, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS);
-		}
-
-		// 语法速查 + 规则文件路径 + 总闸。
-		{
-			const int sy = layout.PanelBottom - 76;
-			DrawTextSimple(dc, L"语法：当 <面> [的 <字段>] <算子> <模式> 时 <动作>",
-				{ rulesPanel.left + 16, sy, rulesPanel.right - 16, sy + 18 },
-				g_labelFont, ColorTextSecondary, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS);
-			DrawTextSimple(dc, L"面 = 注册表值 / 注册表枚举 / 剪贴板；算子 = 等于 / 含 / 匹配(/正则/) / 开头 / 结尾",
-				{ rulesPanel.left + 16, sy + 19, rulesPanel.right - 16, sy + 37 },
-				g_labelFont, ColorTextSecondary, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS);
-			DrawTextSimple(dc, L"动作 = 替换为 \"文本\"|全零|全FF|空 · 隐藏 · 拒绝 · 放行",
-				{ rulesPanel.left + 16, sy + 38, rulesPanel.right - 16, sy + 56 },
-				g_labelFont, ColorTextSecondary, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS);
-			AdvDrawGates(dc, rulesPanel.left + 16, rulesPanel.right - 16, sy + 57);
-		}
-	}
-
-	// ---------------- 已解锁：改前 / 改后 字节对照（右） ----------------
-	void AdvDrawPreview(HDC dc, const AdvLayout& layout)
-	{
-		RECT diffPanel = { layout.DiffLeft, layout.PanelTop, layout.DiffRight, layout.PanelBottom };
-		DrawPanel(dc, diffPanel, L"改前 / 改后 字节对照（生产同源 codec）");
-
-		int dy = layout.PanelTop + 46;
-		const int dleft = diffPanel.left + 16;
-		const int dright = diffPanel.right - 16;
-
-		// ---- 样例 1：注册表值（REG_SZ）----
-		{
-			const WCHAR* keyPath = L"HKEY_CURRENT_USER\\Software\\R3ShieldCoreDemo\\Vault";
-			const WCHAR* valueName = L"Password";
-			const WCHAR* secret = L"hunter2";
-
-			// 合成一个 class 2 的 KEY_VALUE_PARTIAL_INFORMATION：
-			//   +0 TitleIndex   +4 Type   +8 DataLength   +12 Data[]
-			const size_t secretBytes = (wcslen(secret) + 1) * sizeof(WCHAR);
-			BYTE buffer[12 + 64] = {};
-			ULONG type = 1 /*REG_SZ*/;
-			ULONG dataLength = static_cast<ULONG>(secretBytes);
-			memcpy(buffer + 4, &type, sizeof(type));
-			memcpy(buffer + 8, &dataLength, sizeof(dataLength));
-			memcpy(buffer + 12, secret, secretBytes);
-			const ULONG total = static_cast<ULONG>(12 + secretBytes);
-
-			RSpoof::DataRegion region = {};
-			const bool located = RSpoof::LocateDataRegion(2, buffer, sizeof(buffer), total, region);
-			const size_t regionOffset = located ? region.offset : 12;
-			const size_t regionLength = located ? region.length : secretBytes;
-
-			BYTE before[64] = {};
-			memcpy(before, buffer + regionOffset, regionLength);
-
-			const RRule::Verdict v = RRule::Eval(RRule::Face::RegValue, keyPath, valueName, nullptr);
-			const RApply::Effect effect = RApply::ApplyRegValue(v, v.hit, buffer,
-				sizeof(buffer), regionOffset, regionLength, 0);
-
-			DrawTextSimple(dc, L"① 注册表值 · Password（REG_SZ）",
-				{ dleft, dy, dright, dy + 18 }, g_labelFont, ColorTextPrimary,
-				DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS);
-			dy += AdvLineHeight;
-			AdvRow(dc, dleft, dright, dy, L"判定", AdvVerdictText(v),
-				v.hit ? ColorSpoofed : ColorTextSecondary);
-			dy += AdvLineHeight;
-			AdvRow(dc, dleft, dright, dy, L"改前", AdvHex(before, regionLength), ColorTextPrimary);
-			dy += AdvLineHeight;
-
-			std::wstring afterText;
-			COLORREF afterColor = ColorSpoofed;
-			if (effect == RApply::Effect::Rejected) {
-				afterText = L"（拒绝 —— 调用方拿到 STATUS_ACCESS_DENIED）";
-				afterColor = ColorBlocked;
-			}
-			else if (effect == RApply::Effect::PassThrough) {
-				afterText = AdvHex(before, regionLength) + L"   （规则要求放行，原样返回）";
-				afterColor = ColorTextSecondary;
-			}
-			else {
-				afterText = AdvHex(buffer + regionOffset, regionLength);
-				afterText += L"   （";
-				afterText += RApply::EffectName(effect);
-				afterText += L"）";
-			}
-			AdvRow(dc, dleft, dright, dy, L"改后", afterText, afterColor);
-			dy += AdvLineHeight + 10;
-		}
-
-		// ---- 样例 2：剪贴板（CF_UNICODETEXT）----
-		{
-			const UINT format = 13 /*CF_UNICODETEXT*/;
-			const WCHAR* realText = L"账号=admin 口令=hunter2";
-			const size_t realLength = (wcslen(realText) + 1) * sizeof(WCHAR);
-
-			HGLOBAL real = AdvBuildRealUnicodeText(realText);
-			const BYTE* realBytes = real
-				? static_cast<const BYTE*>(GlobalLock(real)) : nullptr;
-
-			// ★ 必须**先**把「改前」的字节抓成字符串，再解锁 / 释放。
-			//   否则后面显示用的是已经还回去的内存（use-after-free）。
-			//   实测症状很隐蔽：程序**不崩**，只是"改前"那一行变成两个指针值
-			//   （`70 2D 61 E5 5B 02 00 00 ...`），而不是真实的 UTF-16 文本 ——
-			//   自绘界面里没有任何东西会报错，只有截图能看出来。
-			const std::wstring beforeHex = AdvHex(realBytes, realLength);
-
-			WCHAR fmtBuffer[32] = {};
-			const WCHAR* fmtLabel = RClip::FormatLabel(format, fmtBuffer, _countof(fmtBuffer));
-			const RRule::Verdict v = RRule::Eval(RRule::Face::Clip, nullptr, nullptr, fmtLabel);
-
-			HGLOBAL fake = nullptr;
-			std::wstring afterText;
-			COLORREF afterColor = ColorSpoofed;
-			const WCHAR* afterWhat = L"";
-
-			if (v.hit && v.act == RRule::Act::Block) {
-				afterText = L"（拒绝 —— 调用方拿到 NULL + err=5）";
-				afterColor = ColorBlocked;
-			}
-			else if (v.hit && v.act == RRule::Act::Pass) {
-				afterText = beforeHex + L"   （规则要求放行，原样返回）";
-				afterColor = ColorTextSecondary;
-			}
-			else if (v.hit) {
-				const WCHAR* text = (v.act == RRule::Act::ReplaceText) ? v.text.c_str() : L"";
-				fake = RApply::BuildClipText(format, text);
-				afterWhat = (v.act == RRule::Act::ReplaceText)
-					? L"写入了规则指定的文本" : L"内容变空串";
-			}
-			else {
-				// ★ 回落 = **生产**路径：文本类 -> 空串（BuildEmptyText）
-				fake = RClip::BuildFake(format, real);
-				afterWhat = L"生产回落：文本内容变空串";
-				afterColor = ColorTextSecondary;
-			}
-
-			if (fake) {
-				const BYTE* fakeBytes = static_cast<const BYTE*>(GlobalLock(fake));
-				const size_t fakeLength = static_cast<size_t>(GlobalSize(fake));
-				afterText = AdvHex(fakeBytes, fakeLength);
-				afterText += L"   （";
-				afterText += afterWhat;
-				afterText += L"）";
-				GlobalUnlock(fake);
-				RClip::FreeFake(format, fake);
-			}
-
-			if (realBytes) {
-				GlobalUnlock(real);
-			}
-			if (real) {
-				GlobalFree(real);
-			}
-
-			DrawTextSimple(dc, L"② 剪贴板 · CF_UNICODETEXT（文本）",
-				{ dleft, dy, dright, dy + 18 }, g_labelFont, ColorTextPrimary,
-				DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS);
-			dy += AdvLineHeight;
-			AdvRow(dc, dleft, dright, dy, L"判定", AdvVerdictText(v),
-				v.hit ? ColorSpoofed : ColorTextSecondary);
-			dy += AdvLineHeight;
-			AdvRow(dc, dleft, dright, dy, L"改前", beforeHex, ColorTextPrimary);
-			dy += AdvLineHeight;
-			AdvRow(dc, dleft, dright, dy, L"改后", afterText, afterColor);
-			dy += AdvLineHeight + 10;
-		}
-
-		// ---- 样例 3：注册表枚举（隐藏）----
-		{
-			const WCHAR* keyPath = L"HKEY_CURRENT_USER\\Software\\R3ShieldCoreDemo\\Vault";
-			PCWSTR children[] = { L"SecretKey", L"PublicKey", L"SecretToken", L"Password" };
-			const int childCount = static_cast<int>(_countof(children));
-
-			std::wstring beforeList;
-			std::wstring afterList;
-			std::wstring hitText;
-			int hidden = 0;
-			for (int i = 0; i < childCount; i++) {
-				if (!beforeList.empty()) {
-					beforeList += L" · ";
-				}
-				beforeList += children[i];
-
-				const RRule::Verdict v = RRule::Eval(RRule::Face::RegEnum, keyPath, children[i], nullptr);
-				if (v.hit && v.act == RRule::Act::Hide) {
-					hidden++;
-					if (hitText.empty()) {
-						hitText = AdvVerdictText(v);
-					}
-					continue;
-				}
-				if (!afterList.empty()) {
-					afterList += L" · ";
-				}
-				afterList += children[i];
-			}
-			if (afterList.empty()) {
-				afterList = L"（全被隐藏）";
-			}
-
-			DrawTextSimple(dc, L"③ 注册表枚举 · 子键列表（隐藏）",
-				{ dleft, dy, dright, dy + 18 }, g_labelFont, ColorTextPrimary,
-				DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS);
-			dy += AdvLineHeight;
-			AdvRow(dc, dleft, dright, dy, L"判定",
-				hidden ? hitText : std::wstring(L"未命中规则 · 一项都不隐藏"),
-				hidden ? ColorSpoofed : ColorTextSecondary);
-			dy += AdvLineHeight;
-			// ★ 不带"共 N 项"后缀：这一行本来就长（4 个名字），加了会被
-			//   DT_END_ELLIPSIS 截掉尾巴，反而看不出藏的是谁。条数由「改后」那行说。
-			AdvRow(dc, dleft, dright, dy, L"改前", beforeList, ColorTextPrimary);
-			dy += AdvLineHeight;
-			AdvRow(dc, dleft, dright, dy, L"改后",
-				afterList + L"   （隐藏 " + std::to_wstring(hidden) + L" 项）",
-				hidden ? ColorSpoofed : ColorTextSecondary);
-			dy += AdvLineHeight + 10;
-		}
-
-		// 一句诚实标注：这一页**不**模拟引擎侧的 protect_reg 判据。
-		DrawTextSimple(dc, L"注：枚举面未命中即「保留」（不模拟 protect_reg 判据）。",
-			{ dleft, layout.PanelBottom - 24, dright, layout.PanelBottom - 6 },
-			g_labelFont, ColorTextSecondary, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS);
-	}
-
-	// ---------------- 页面主入口 ----------------
 	void DrawAdvancedPage(HDC dc, const RECT& client)
 	{
-		// ★ 首次进这一页：先从规则文件读，读不到再铺示例 —— 只做一次。
-		{
-			static bool seeded = false;
-			if (!seeded) {
-				seeded = true;
-				AdvInitialLoad();
-			}
-		}
+		// ★ 版式：文字在上、按钮在下。三行文字的高度与行距是**常量**，
+		//   按钮几何用同一组常量推导（`AdvButtonTopOffset`）——
+		//   这样"改文案把行数改了"时按钮会跟着走，不会再压住文字。
+		const RECT panel = { Padding, AdvPanelTop(),
+			client.right - Padding, client.bottom - Padding };
+		DrawPanel(dc, panel, L"高级规则编辑台");
 
-		const AdvLayout layout = AdvLayoutFor(client);
+		const int left = panel.left + 20;
+		const int right = panel.right - 20;
+		int y = AdvPanelTop() + AdvTextFirstLineOffset;
 
-		// ★ 证明"这一页真的被画到了"（与 ARK 页同一套路，铁律 97）。
-		//   为什么值得单开一行日志：`--gui-preview` 的核对完全建立在
-		//   "窗口画出来了"这件事上，而"页面没被画到"与"画了但内容不对"
-		//   在一张截图上长得一模一样 —— 截到空窗口时分不清是哪种。
-		{
-			static bool paintedOnce = false;
-			if (!paintedOnce) {
-				paintedOnce = true;
-				// ★ v78：`闸门=` 与 `编辑框=` 是**两个**开关，必须分开报 ——
-				//   只报一个的话，"闸门过了但解析屏还没点掉"这种中间态
-				//   在日志里看不出来，而它正好是三个界面状态里的第二个。
-				//   `编辑框=` 报的是 `AdvEditShouldShow()`（与真正去
-				//   ShowWindow 的是**同一个函数**），不是"句柄存不存在" ——
-				//   后者在闸门屏也是 1（控件早建好了，只是隐藏着），
-				//   报它等于给探针一条**恒真**的判据。
-				printf("[adv] 页面已绘制 规则=%d 页签=%d 闸门=%d 编辑框=%d 客户区=%dx%d\n",
-					RRule::Count(), g_activeTab, g_advQuizPassed ? 1 : 0,
-					AdvEditShouldShow() ? 1 : 0,
-					static_cast<int>(client.right), static_cast<int>(client.bottom));
-				fflush(stdout);
-			}
-		}
+		DrawTextSimple(dc, L"规则编辑台已经搬到独立工具 r3shieldcore-cfg.exe。",
+			{ left, y, right, y + 24 }, g_labelFont, ColorTextPrimary,
+			DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS);
+		y += AdvTextLineStep;
+		DrawTextSimple(dc,
+			L"在那儿可以写中文规则、对照 API 返回值的「改前 / 改后」字节，"
+			L"并把规则保存下来给引擎用。",
+			{ left, y, right, y + AdvTextSecondBoxHeight }, g_labelFont, ColorTextSecondary,
+			DT_LEFT | DT_WORDBREAK | DT_END_ELLIPSIS);
+		y += AdvTextThirdLineStep;
+		DrawTextSimple(dc,
+			L"cfg 已经跟着主程序一起启动了 —— 点下面的按钮可以把它叫到前台。",
+			{ left, y, right, y + AdvTextThirdBoxHeight }, g_labelFont, ColorTextSecondary,
+			DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS);
 
-		// ---------------- 摘要行 ----------------
-		{
-			WCHAR buffer[320] = {};
-			if (!g_advQuizPassed) {
-				swprintf_s(buffer, _countof(buffer),
-					L"替换 API 结果 · 规则引擎编辑台 —— 编辑区**已锁定**（先过三道题闸门）· 规则 %d 条",
-					RRule::Count());
-			}
-			else if (!g_advWhyDismissed) {
-				swprintf_s(buffer, _countof(buffer),
-					L"替换 API 结果 · 规则引擎编辑台 —— 闸门已通过，看完解析点「开始编辑规则」");
-			}
-			else {
-				swprintf_s(buffer, _countof(buffer),
-					L"替换 API 结果 · 规则引擎编辑台 —— 规则 %d 条 · first-match wins，未命中回落内置默认行为",
-					RRule::Count());
-			}
-			DrawTextSimple(dc, buffer,
-				{ layout.Left, layout.SummaryTop, layout.Right, layout.SummaryTop + 22 },
-				g_labelFont, ColorTextSecondary, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS);
-		}
+		// 复用 ARK 那套自绘按钮 —— 它就是本项目的"通用自绘按钮"
+		//（铁律 195：同一种外观不抄第二遍）。参数依次是
+		// 启用 / 悬停 / 按下 / 危险色，这里只有前三个用得上。
+		const RECT button = AdvLaunchButtonRect(client);
+		DrawArkButton(dc, button, L"打开高级规则编辑台",
+			true, g_advLaunchHover == 0, g_advLaunchPressed == 0, false);
 
-		// ---------------- 三个状态 ----------------
-		if (!g_advQuizPassed) {
-			AdvDrawQuiz(dc, layout);
-		}
-		else if (!g_advWhyDismissed) {
-			AdvDrawWhy(dc, layout);
+		// 核对日志（探针读它）：证明"这一页真被画到了"。
+		//
+		// ★ 为什么必须有：`--gui-preview` 下探针只能靠**应用自己的日志**
+		//   区分"这一页画到了"和"窗口是空的/画错了页" —— 两者在截图上
+		//   分不开（铁律 24/28）。做法与 ARK 页的 `[ark] 页面已绘制` 一致。
+		//
+		// ⚠️ 每帧都打（WM_PAINT 的频率）。探针读的是"有没有这一句"，
+		//    不是出现次数；行内容必须短。
+		//    这里顺带把**按钮矩形**报出来 —— 探针可以用它验证
+		//    "按钮确实落在客户区内"（几何算错时是最容易看不出来的一类错）。
+		printf("[adv] 跳转页已绘制 按钮=%ld,%ld,%ld,%ld 失败=%d 客户区=%ldx%ld\n",
+			button.left, button.top, button.right, button.bottom,
+			g_advLaunchError.empty() ? 0 : 1,
+			client.right, client.bottom);
+
+		if (!g_advLaunchError.empty()) {
+			// 失败原因直接画出来（不弹窗）—— 否则用户只看到"点了没反应"。
+			DrawTextSimple(dc, g_advLaunchError.c_str(),
+				{ button.left - 100, button.bottom + 12,
+				  button.right + 100, button.bottom + 60 },
+				g_labelFont, ColorBlocked, DT_CENTER | DT_WORDBREAK | DT_END_ELLIPSIS);
 		}
 		else {
-			AdvDrawEditor(dc, layout);
-			AdvDrawPreview(dc, layout);
-		}
-
-		// ---------------- 底部按钮 + 说明 ----------------
-		int lastButtonRight = layout.Left;
-		for (int i = 0; i < AdvButtonAll; i++) {
-			if (!AdvButtonVisible(i)) {
-				continue;
-			}
-			AdvDrawButton(dc, layout.Buttons[i], AdvButtonLabel(i),
-				g_advHoverAction == i, g_advPressedAction == i);
-			lastButtonRight = layout.Buttons[i].right;
-		}
-		{
-			PCWSTR hint = L"";
-			if (g_advQuizPassed && g_advWhyDismissed) {
-				// ★ 编辑态有 6 个按钮，右边只剩百来像素 —— 这句必须短。
-				//   写长了会被 DT_END_ELLIPSIS 截成"规则文件路径…"，
-				//   等于什么都没说（路径本来就印在左栏底部）。
-				hint = L"重启引擎后生效";
-			}
-			else if (!g_advQuizPassed) {
-				hint = L"闸门与命令行控制台共用同一套题（advanced_quiz.h）。";
-			}
-			// ★ 说明行接在**最后一个可见按钮**右边 —— 不能写死
-			//   "Left + AdvButtonWidth*3 + 32"：三个状态各显示 2 / 1 / 6 个按钮，
-			//   写死的话编辑态那 6 个按钮会被这行说明**压在底下**
-			//   （实测：截图里「重置为示例规则」「清空规则表」两个按钮上叠着字，
-			//    而日志和像素判据都完全看不出来）。
-			DrawTextSimple(dc, hint,
-				{ lastButtonRight + 16, layout.ButtonTop,
-				  layout.Right, layout.ButtonTop + AdvButtonHeight },
-				g_labelFont, ColorTextSecondary,
-				DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+			DrawTextSimple(dc,
+				L"（cfg 已在运行时会直接切到它的「高级」页，不会重复开一个）",
+				{ button.left - 160, button.bottom + 14,
+				  button.right + 160, button.bottom + 34 },
+				g_labelFont, ColorTextSecondary, DT_CENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
 		}
 	}
-
 	// -----------------------------------------------------------------
 	// 页签栏
 	// -----------------------------------------------------------------
@@ -4857,7 +3560,7 @@ namespace
 			DrawArkPage(buffer, client);
 		}
 		else if (g_activeTab == 5) {
-			// ★ v77：「高级」页 —— 替换 API 结果的规则引擎预览台。
+			// ★ v80：「高级」页 —— 只剩一个"跳转到 cfg"的按钮（见上方注释）。
 			DrawAdvancedPage(buffer, client);
 		}
 		else {
@@ -4892,18 +3595,6 @@ namespace
 			DrawTopProcesses(buffer, y, snapshot, rows);
 			DrawPromptSummary(buffer, client.bottom, snapshot);
 		}
-
-		// ★ v78：「高级」页的 EDIT 子控件同步（显示 / 隐藏 / 摆位）。
-		//
-		//   为什么放在 BitBlt **之前**：`AdvSyncEdit` 只做"把 AdvLayoutFor 算
-		//   出来的矩形应用到控件上"，与画的内容无关；放前面是为了让
-		//   "控件位置"和"同一帧里画的框线/标签"用**同一次**布局计算，
-		//   否则窗口尺寸刚变的那一帧会出现"标签在新位置、编辑框还在旧位置"。
-		//
-		//   ⚠️ 它在非「高级」页 / 闸门未过时会直接 SW_HIDE —— 所以不需要
-		//      在切页签的地方再写一遍"隐藏编辑框"（那种分散的开关状态
-		//      正是"切了页签编辑框还浮在上面"的成因）。
-		AdvSyncEdit(hwnd, client);
 
 		BitBlt(dc, 0, 0, client.right, client.bottom, buffer, 0, 0, SRCCOPY);
 
@@ -4995,22 +3686,6 @@ namespace
 			return 0;
 		}
 
-		case WM_CTLCOLOREDIT: {
-			// ★ v78：「高级」页的规则编辑框要**白底深字**。
-			//
-			//   为什么必须显式处理：主窗口是自绘的，但原生 EDIT 不归我们画 ——
-			//   它会用**系统主题色**填背景（深色主题下就是深灰/黑），
-			//   于是"白底深字"的自绘页面里突然出现一个黑框，看起来像画错了。
-			//
-			//   ⚠️ 返回的刷子**不能是临时创建又没人删的**（每次重绘漏一个 GDI 对象，
-			//      拖久了进程会耗尽 GDI 句柄）。`GetStockObject(WHITE_BRUSH)`
-			//      是系统共享对象：不需要（也不能）DeleteObject。
-			HDC dc = reinterpret_cast<HDC>(wParam);
-			SetTextColor(dc, ColorTextPrimary);
-			SetBkColor(dc, RGB(255, 255, 255));
-			return reinterpret_cast<LRESULT>(GetStockObject(WHITE_BRUSH));
-		}
-
 		case WM_PAINT:
 			PaintWindow(hwnd);
 			return 0;
@@ -5042,26 +3717,23 @@ namespace
 				hoveredArk = HitTestArkButton(point, client);
 			}
 
-			// ★ v77：「高级」页的两个按钮（同样不在 HeaderAction 那套里 ——
+			// ★ v80：「高级」页只剩一个跳转按钮（同样不在 HeaderAction 那套里 ——
 			//   位置随客户区大小变，且只在这一页存在）。
-			// ★ v78：外加**模板芯片**的悬停（闸门过了、进了编辑态才有）。
-			int hoveredAdv = AdvButtonNone;
-			int hoveredChip = -1;
+			int hoveredLaunch = -1;
 			if (g_activeTab == 5) {
 				RECT client = {};
 				GetClientRect(hwnd, &client);
-				hoveredAdv = HitTestAdvButton(point, client);
-				hoveredChip = HitTestAdvChip(point, client);
+				if (HitTestAdvLaunch(point, client)) {
+					hoveredLaunch = 0;
+				}
 			}
 
 			if (hovered != g_hoverButton || hoveredTab != g_hoverTab
-				|| hoveredArk != g_arkHoverAction || hoveredAdv != g_advHoverAction
-				|| hoveredChip != g_advHoverChip) {
+				|| hoveredArk != g_arkHoverAction || hoveredLaunch != g_advLaunchHover) {
 				g_hoverButton = hovered;
 				g_hoverTab = hoveredTab;
 				g_arkHoverAction = hoveredArk;
-				g_advHoverAction = hoveredAdv;
-				g_advHoverChip = hoveredChip;
+				g_advLaunchHover = hoveredLaunch;
 				InvalidateRect(hwnd, nullptr, FALSE);
 			}
 			return 0;
@@ -5070,13 +3742,11 @@ namespace
 		case WM_MOUSELEAVE:
 			g_trackingMouseLeave = false;
 			if (g_hoverButton != HeaderAction::None || g_hoverTab >= 0
-				|| g_arkHoverAction != ArkButtonNone || g_advHoverAction != AdvButtonNone
-				|| g_advHoverChip != -1) {
+				|| g_arkHoverAction != ArkButtonNone || g_advLaunchHover != -1) {
 				g_hoverButton = HeaderAction::None;
 				g_hoverTab = -1;
 				g_arkHoverAction = ArkButtonNone;
-				g_advHoverAction = AdvButtonNone;
-				g_advHoverChip = -1;
+				g_advLaunchHover = -1;
 				InvalidateRect(hwnd, nullptr, FALSE);
 			}
 			return 0;
@@ -5085,11 +3755,10 @@ namespace
 			// 捕获被抢走（弹了 UAC、别的窗口抢了鼠标）⇒ 清掉按下态，
 			// 否则按钮会永远停在"按下"的样子。
 			if (g_pressedButton != HeaderAction::None || g_arkPressedAction != ArkButtonNone
-				|| g_advPressedAction != AdvButtonNone || g_advPressedChip != -1) {
+				|| g_advLaunchPressed != -1) {
 				g_pressedButton = HeaderAction::None;
 				g_arkPressedAction = ArkButtonNone;
-				g_advPressedAction = AdvButtonNone;
-				g_advPressedChip = -1;
+				g_advLaunchPressed = -1;
 				InvalidateRect(hwnd, nullptr, FALSE);
 			}
 			return 0;
@@ -5155,58 +3824,14 @@ namespace
 				return 0;
 			}
 
-			// ★ v77/v78：「高级」页 —— 三种可点区域，按**界面状态**分派。
-			//
-			//   闸门未过 ⇒ 只有「三道题的选项」可点（编辑区锁着，连按钮都
-			//   只剩「提交答案 / 清空作答」两个，见 AdvButtonVisible）。
-			//   闸门过了 ⇒ 模板芯片 / 规则表行 / 底部按钮。
-			//
-			//   ⚠️ 这三种命中函数各自都**自带状态判断**（不在对应状态时直接
-			//      返回"没命中"）—— 所以这里不需要再写一遍 if 分支去区分，
-			//      少一处分支就少一处"状态和分支对不上"的机会。
+			// ★ v80：「高级」页 —— 只剩一个跳转按钮。
 			if (g_activeTab == 5) {
 				RECT client = {};
 				GetClientRect(hwnd, &client);
-
-				// ① 闸门选项（只在未通过时命中）。
-				int quizOpt = -1;
-				const int quizCol = HitTestAdvQuizOption(point, client, &quizOpt);
-				if (quizCol >= 0) {
-					g_advPick[quizCol] = quizOpt;
-					// ★ 重选就**撤掉这一题的"错"标记** —— 否则用户改对了，
-					//   界面上那题还是红的，他会以为没点上（判据滞后于输入）。
-					g_advWrongMask &= ~(1 << quizCol);
-					printf("[adv] 第%d题 选了 %c\n", quizCol + 1,
-						static_cast<char>('A' + quizOpt));
-					fflush(stdout);
-					InvalidateRect(hwnd, nullptr, FALSE);
-					return 0;
-				}
-
-				// ② 模板芯片（只在已解锁时命中）。
-				const int chip = HitTestAdvChip(point, client);
-				if (chip >= 0) {
-					g_advPressedChip = chip;
+				if (HitTestAdvLaunch(point, client)) {
+					g_advLaunchPressed = 0;
 					SetCapture(hwnd);
 					InvalidateRect(hwnd, nullptr, FALSE);
-					return 0;
-				}
-
-				// ③ 规则表某一行（只在已解锁时命中）。
-				const int row = HitTestAdvTableRow(point, client);
-				if (row >= 0) {
-					AdvSelectRule(row);
-					InvalidateRect(hwnd, nullptr, FALSE);
-					return 0;
-				}
-
-				// ④ 底部按钮。
-				const int button = HitTestAdvButton(point, client);
-				if (button != AdvButtonNone) {
-					g_advPressedAction = button;
-					SetCapture(hwnd);
-					InvalidateRect(hwnd, nullptr, FALSE);
-					return 0;
 				}
 				// 这一页没有别的可点区域 ⇒ 命中与否都吃掉这次点击
 				//（否则会落到下面日志页那条"左下角开关"的判断里）。
@@ -5242,37 +3867,18 @@ namespace
 		case WM_LBUTTONUP: {
 			const POINT point = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
 
-			// ★ v78：「高级」页的**模板芯片**（比按钮先判 —— 芯片和按钮
-			//   的按下态是两个独立的变量，同时为真的情况不会出现，
-			//   但先判谁决定了"万一同时为真"时的行为，写清楚更好读）。
-			if (g_advPressedChip != -1) {
-				const int pressed = g_advPressedChip;
-				g_advPressedChip = -1;
-				if (GetCapture() == hwnd) {
-					ReleaseCapture();
-				}
-				RECT client = {};
-				GetClientRect(hwnd, &client);
-				// 标准按钮语义：松手时仍停在**同一个**芯片上才触发。
-				if (HitTestAdvChip(point, client) == pressed) {
-					AdvClickChip(pressed);
-				}
-				InvalidateRect(hwnd, nullptr, FALSE);
-				return 0;
-			}
-
-			// ★ v77：「高级」页的按钮（与 ARK 那套同样单独处理）。
-			if (g_advPressedAction != AdvButtonNone) {
-				const int pressed = g_advPressedAction;
-				g_advPressedAction = AdvButtonNone;
+			// ★ v80：「高级」页的跳转按钮（与 ARK 那套同样单独处理 ——
+			//   它不在 HeaderAction 那套枚举里）。
+			if (g_advLaunchPressed != -1) {
+				g_advLaunchPressed = -1;
 				if (GetCapture() == hwnd) {
 					ReleaseCapture();
 				}
 				RECT client = {};
 				GetClientRect(hwnd, &client);
 				// 只有松手时鼠标仍停在**同一个**按钮上才触发（标准按钮语义）。
-				if (HitTestAdvButton(point, client) == pressed) {
-					PerformAdvAction(pressed);
+				if (HitTestAdvLaunch(point, client)) {
+					AdvLaunchCfg(hwnd);
 				}
 				InvalidateRect(hwnd, nullptr, FALSE);
 				return 0;
@@ -5501,17 +4107,6 @@ namespace
 		case WM_DESTROY:
 			KillTimer(hwnd, 1);
 			KillTimer(hwnd, TopMostReinforceTimerId);
-			// ★ v78：「高级」页的 EDIT 子控件。
-			//   必须显式销毁 —— 它是本窗口的子窗口，DestroyWindow 会连带销毁，
-			//   但**不销毁也不会报错**（所以这不是防崩，是防"g_advEdit 变成
-			//   悬空句柄"）：GUI 线程可能被 Start() 再拉起来一次
-			//   （UIAccess 接管实例），那时 `AdvCreateEdit` 会看到
-			//   `g_advEdit != nullptr` 而**直接返回**，新的编辑框永远建不出来。
-			//   那种故障的表现是"规则编辑框不见了"，且没有任何日志。
-			if (g_advEdit) {
-				DestroyWindow(g_advEdit);
-				g_advEdit = nullptr;
-			}
 			return 0;
 
 		default:
@@ -5541,7 +4136,7 @@ namespace
 			else if (n > 0 && _wcsicmp(tabEnv, L"ark") == 0) {
 				g_activeTab = 4;
 			}
-			// ★ v77：`advanced` —— 「高级」页（规则引擎预览台）。
+			// ★ v80：`advanced` —— 「高级」页（现在只剩一个"跳转到 cfg"的按钮）。
 			//   理由同 ark：这一页也是自绘、没有控件句柄，自动化点击既过不了
 			//   UIPI 也点不准；要核对它只能靠这个开关 + `--gui-preview`。
 			else if (n > 0 && _wcsicmp(tabEnv, L"advanced") == 0) {
@@ -5552,30 +4147,26 @@ namespace
 		g_window = CreateWindowEx(
 			WS_EX_APPWINDOW | WS_EX_TOPMOST,
 			GuiClassName, GuiTitle,
-			// ★★ v78：`WS_CLIPCHILDREN` 是**必须的**，不是优化。
-			//   「高级」页有一个原生 EDIT 子控件，而本窗口是**整块双缓冲**
-			//   （见 PaintWindow 末尾的 `BitBlt`）。没有这个位，`BitBlt` 会
-			//   直接盖到 EDIT 上 ⇒ 编辑框**看不见**（连边框都没了），
-			//   而界面上不会有任何报错，只有截图能看出来（铁律 181）。
-			//   加上之后父窗口的绘制区自动挖掉子控件占的那块。
+			// ★ v80：`WS_CLIPCHILDREN` —— **刻意保留**，但理由变了。
+			//
+			//   v78 加它是因为「高级」页有个原生 EDIT 子控件，而本窗口是
+			//   **整块双缓冲**（见 PaintWindow 末尾的 `BitBlt`）—— 没有这个位，
+			//   `BitBlt` 会直接盖到子控件上 ⇒ 控件**看不见**，界面上不会有
+			//   任何报错，只有截图能看出来（铁律 181）。
+			//
+			//   v80 把编辑台搬去 cfg 之后，本窗口已经**没有任何子控件**，
+			//   这个位现在是空转。留着它是因为代价为零，而"忘了它"的代价
+			//   正是铁律 181 那条 —— 以后再加自绘页面上的控件时不会重踩。
 			WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_THICKFRAME
 				| WS_CLIPCHILDREN,
 			CW_USEDEFAULT, CW_USEDEFAULT, WindowWidth, WindowHeight,
 			nullptr, nullptr, g_instance, nullptr);
 
 		if (g_window) {
-			// ★ v78：「高级」页的规则编辑框（原生 EDIT）。
+			// ★ v80：本窗口现在**没有任何子控件**了 —— 规则编辑框（原生 EDIT）
+			//   跟着「高级」编辑台一起搬去了 cfg，这里原来那段
+			//   `AdvCreateEdit` + 预览预置文本已删除。
 			//
-			//   为什么在**这里**建、而不是 WM_CREATE 里：
-			//   子控件的创建必须发生在**拥有它的线程**上，而这段代码本来就跑在
-			//   GUI 线程（GuiThreadProc）里 —— 与后面 SetTimer/ShowWindow 同一处，
-			//   顺序一眼能看清。放 WM_CREATE 也行，但那样"谁建了控件"要翻两处。
-			//
-			//   ⚠️ 建出来是**隐藏**的（没调 ShowWindow），位置由 PaintWindow 里
-			//      的 `AdvSyncEdit` 按当前页签/闸门状态决定要不要显示 ——
-			//      位置只在 `AdvLayoutFor` 里算一次（铁律 182）。
-			AdvCreateEdit(g_window);
-
 			// ★ 图标：注册窗口类时已经给了（hIcon / hIconSm），正常情况这就够了。
 			//   这里再显式发一次 WM_SETICON，是为了兜住两种边角情况：
 			//     · 类注册发生在**同进程的另一个实例**之后（hIcon 不生效）；
@@ -5612,6 +4203,32 @@ namespace
 			// ★ v63：ARK 页的刷新定时器。间隔来自 `ark_refresh_ms`；
 			//   不在 ARK 页时它只做一次判断就返回（见 WM_TIMER），几乎零成本。
 			SetTimer(g_window, ArkRefreshTimerId, ArkRefreshIntervalMs(), nullptr);
+
+			// ★ v80：预览模式下**模拟点一下「打开高级规则编辑台」**。
+			//
+			//   为什么在**进程内**发消息，而不是让探针从外面点：
+			//   按钮矩形只在 `AdvLaunchButtonRect` 里算一次（铁律 182），
+			//   探针从外面要么再算一遍（几何抄两份，必然漂），要么去解析
+			//   日志里的矩形（而 exe 独占着日志句柄，探针读不到）。
+			//   在进程内发用的是**同一份几何**，而且走的是真实消息路径 ——
+			//   WM_LBUTTONDOWN → SetCapture → WM_LBUTTONUP → 命中判定
+			//   → AdvLaunchCfg，**不是**直接调那个动作函数（那样只验了动作，
+			//   没验"按钮到底在不在那儿"）。
+			//
+			//   ⚠️ 只在 `--gui-preview` 下由环境变量置起（见 RunPreview），
+			//      生产路径读不到它。
+			if (g_previewJumpClick) {
+				RECT client = {};
+				GetClientRect(g_window, &client);
+				const RECT button = AdvLaunchButtonRect(client);
+				const LPARAM at = MAKELPARAM((button.left + button.right) / 2,
+					(button.top + button.bottom) / 2);
+				printf("[adv] 预览：模拟点击跳转按钮 at=%ld,%ld 页签=%d\n",
+					GET_X_LPARAM(at), GET_Y_LPARAM(at), g_activeTab);
+				fflush(stdout);   // 铁律 80
+				PostMessageW(g_window, WM_LBUTTONDOWN, MK_LBUTTON, at);
+				PostMessageW(g_window, WM_LBUTTONUP, 0, at);
+			}
 
 			// UIAccess 接管实例启动后必须立即尝试真实 Band；普通实例仍支持
 			// R3SHIELDCORE_START_TOPMOST=normal|super 调试入口。
@@ -5729,6 +4346,12 @@ namespace R3ShieldCoreGui
 		g_tabFont = CreateFont(-14, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
 			DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
 			CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Microsoft YaHei UI");
+		// ★ v79：Markdown 加粗用。**字号/字面与 g_labelFont 完全一致**，
+		//   只把字重从 FW_NORMAL 换成 FW_BOLD —— 同一行里"加粗的那几个字"
+		//   与普通字混排时，字号一致才不会出现基线跳动。
+		g_boldFont = CreateFont(-13, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
+			DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+			CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Microsoft YaHei UI");
 
 		InterlockedExchange(&g_stop, 0);
 
@@ -5763,6 +4386,7 @@ namespace R3ShieldCoreGui
 		if (g_monoFont) { DeleteObject(g_monoFont); g_monoFont = nullptr; }
 		if (g_logFont) { DeleteObject(g_logFont); g_logFont = nullptr; }
 		if (g_tabFont) { DeleteObject(g_tabFont); g_tabFont = nullptr; }
+		if (g_boldFont) { DeleteObject(g_boldFont); g_boldFont = nullptr; }
 
 		if (g_classRegistered) {
 			UnregisterClass(GuiClassName, g_instance);
@@ -5872,57 +4496,22 @@ namespace R3ShieldCoreGui
 		Options options = {};
 		options.Mode = R3ShieldCore::Mode::Log;
 
-		// ★ v78：预览模式下**预置「高级」页的状态**。
+		// ★ v80：预览模式下**模拟点一下「高级」页的跳转按钮**。
 		//
-		//   为什么需要：这一页有**三个互斥的界面状态**（闸门未过 / 刚全对 /
-		//   已解锁编辑）。没有这两个开关，探针永远只能截到"闸门那一屏"，
-		//   而**新加的编辑台（表格 + 芯片 + 原生 EDIT）长什么样**就又回到
-		//   "只能靠人眼"——本项目吃过这个亏（铁律 24/28）。
+		//   用户要的核心行为是"点主程序的「高级」→ 跳到 cfg 的高级页"，
+		//   而这条链路的每一环（窗口类名 / 激活消息 / 页号 / exe 名）都可能
+		//   **静默**对不上 —— "点了没反应"和"页面画错了"在截图上分不开
+		//   （铁律 24/28）。有了这个开关，探针只要设环境变量、再检查
+		//   cfg 的窗口有没有出现、停在第几页，就能把整条链路钉死。
 		//
-		//   ⚠️ 这两个环境变量**只在 `--gui-preview` 里生效**（本函数只在
-		//      `--gui-preview` 分流时被调用，见 app.cpp）。它们解锁的只是
-		//      **界面**上的编辑区 —— 引擎读规则文件这件事完全不经过这里
-		//      （规则是否生效仍由 ini 的三个开关决定）。所以这不是一道
-		//      "能被绕过的安全闸门"，它本来就只是防误操作的 UX 闸门。
-		//
-		//   · R3SHIELDCORE_PREVIEW_ADV = why | editor
-		//       why    -> 当成"三道题刚全对"，截解析屏
-		//       editor -> 再往前一步，截编辑台
-		//   · R3SHIELDCORE_PREVIEW_GATES = all | 1
-		//       把三个总闸显示成"开"（只为截图能同时看到两种配色）
+		//   ⚠️ 只在 `--gui-preview` 里生效（本函数只在 `--gui-preview`
+		//      分流时被调用，见 app.cpp）—— 生产路径读不到这个变量。
 		{
-			wchar_t advEnv[32] = {};
-			const DWORD advLen = GetEnvironmentVariableW(
-				L"R3SHIELDCORE_PREVIEW_ADV", advEnv, _countof(advEnv));
-			if (advLen > 0 && _wcsicmp(advEnv, L"why") == 0) {
-				g_advQuizPassed = true;
-			}
-			else if (advLen > 0 && _wcsicmp(advEnv, L"editor") == 0) {
-				g_advQuizPassed = true;
-				g_advWhyDismissed = true;
-			}
-
-			wchar_t gatesEnv[32] = {};
-			const DWORD gatesLen = GetEnvironmentVariableW(
-				L"R3SHIELDCORE_PREVIEW_GATES", gatesEnv, _countof(gatesEnv));
-			if (gatesLen > 0 && (_wcsicmp(gatesEnv, L"all") == 0 || wcscmp(gatesEnv, L"1") == 0)) {
-				options.SpoofReg = true;
-				options.SpoofClipboard = true;
-				options.SpoofRegEnum = true;
-			}
-
-			// R3SHIELDCORE_PREVIEW_RULES = <规则文件路径>
-			//   把这一页读/写的规则文件重定向到一个**临时文件**。
-			//   自动核对要的是确定性（"规则=3 来源=示例"这条判据在别人机器上
-			//   不该因为 ProgramData 里恰好有个规则文件而变红），同时也让
-			//   自动核对**完全不碰**用户的真实规则文件。
-			//   ⚠️ 只有本函数（`--gui-preview`）会读这个变量 ⇒ 生产路径下
-			//      `g_previewRulesPath` 恒为空，界面与引擎仍然指向同一个真实路径。
-			wchar_t rulesEnv[MAX_PATH] = {};
-			const DWORD rulesLen = GetEnvironmentVariableW(
-				L"R3SHIELDCORE_PREVIEW_RULES", rulesEnv, _countof(rulesEnv));
-			if (rulesLen > 0 && rulesLen < _countof(rulesEnv)) {
-				wcsncpy_s(g_previewRulesPath, rulesEnv, _TRUNCATE);
+			wchar_t jumpEnv[16] = {};
+			const DWORD jumpLen = GetEnvironmentVariableW(
+				L"R3SHIELDCORE_PREVIEW_JUMP", jumpEnv, _countof(jumpEnv));
+			if (jumpLen > 0 && _wcsicmp(jumpEnv, L"click") == 0) {
+				g_previewJumpClick = true;
 			}
 		}
 
@@ -5945,11 +4534,8 @@ namespace R3ShieldCoreGui
 			WindowWidth, WindowHeight, g_activeTab);
 		printf("[gui-preview] **预览模式**：不注入、不启动引擎、不读屏幕；关窗口即退出。\n");
 		printf("[gui-preview] 换页签：设 R3SHIELDCORE_START_TAB=log|process|config|ark|advanced\n");
-		// ★ v78：「高级」页有**三个互斥的界面状态**，一个页签名看不全 ——
-		//   下面这两个变量用来把另外两屏也截出来（详见函数开头的注释）。
-		printf("[gui-preview] 「高级」页状态：R3SHIELDCORE_PREVIEW_ADV=why|editor；"
-			"总闸显示：R3SHIELDCORE_PREVIEW_GATES=all\n");
-		printf("[gui-preview] 规则文件重定向（自动核对用）：R3SHIELDCORE_PREVIEW_RULES=<路径>\n");
+		printf("[gui-preview] 注：「高级」页现在只是跳转入口，编辑台在 r3shieldcore-cfg.exe。\n");
+		printf("[gui-preview] 模拟点跳转按钮（自动核对用）：R3SHIELDCORE_PREVIEW_JUMP=click\n");
 
 		// 喂一个"引擎没在跑"的状态，让概览页有确定内容（否则全是初值）。
 		Update(0);

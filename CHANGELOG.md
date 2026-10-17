@@ -11,6 +11,347 @@
 
 ## [未发布]
 
+### 变更 — cfg 日志页：**删掉「控制台日志」**，「事件日志」改为**向服务端取**（v81）
+
+用户要求（原话）：「下拉框的事件日志就是从服务端取……控制台日志没用了，应该删掉」。
+
+v81 第一版把"数据来源"做成了一个**复选框**（「引擎实时数据」）+ 一个**下拉框**
+（事件/控制台/服务）。两个控件**各自独立** ⇒ 出现了**静默失效**：勾着复选框
+再从下拉框选「控制台日志」，列表会被清空、文件被打开，但 `ReadMore` 看到复选框
+还勾着就**直接早退** ⇒ 那个文件**永远不被读**（"选了没反应"）。
+
+- **「事件日志」这一项本身就是"向服务端要"** —— 不再需要单独的复选框：
+  · 引擎在跑 ⇒ 走管道要它**进程内**的事件流（`R3ShieldCoreStats` 环形缓冲）；
+  · 引擎没跑 ⇒ **回落**读事件日志文件，状态栏写明"日志文件（引擎未运行）"。
+  ★ 回落是**临时**的（不清标志位）⇒ 引擎后来起来了会自动切回实时流，
+  不需要用户再操作一次。
+- **删除「控制台日志」**（`r3shieldcore-console.log`）—— 那是**主程序自己**的
+  stdout 诊断输出，对使用者没有意义。下拉框现在只有两项：
+  `事件日志` / `服务日志`。
+- **删除「引擎实时数据」复选框**（`IDC_LOGFROMSOURCE`）。
+- 日志面板标题由写死的「事件日志」改成中性的「**日志内容**」（内容跟着下拉框走）。
+- 副标题：`配置表单  ·  逐行保真写入  ·  事件日志：引擎实时 / 服务日志：文件  ·  不注入`。
+- ★ **核对**：新增 `cfg/log` 与 `cfg/log:svc` 两屏（**成对**，铁律 249）。
+  cfg 新增一行给探针看的判据：`[log] 日志页已就绪 来源=event|svc 项数=N`
+  —— ★★ 其中 **`项数=2` 是"控制台日志已删除"的唯一机器判据**：
+  下拉列表是收起的，**截图证明不了"一共几项"**（铁律 **265**）。
+  探针 `gui_preview_probe.cpp` 的 cfg 断言原来对**所有**页签都跑"高级页"那几条
+  ⇒ 加了 `tab == "advanced"` 的门，并新增日志页分支。
+- 预览开关 `R3SHIELDCORE_PREVIEW_LOGSRC` 语义改为 `event|svc`（原来 `engine|file`）。
+- 铁律新增 **265**：**同一个语义不要用两个控件表达**。
+- ★★ **修掉界面核对探针的一处 race**（铁律 **266**）：做"把「控制台日志」加回来"
+  的**反向对照**时，探针报的是 `窗口没出现（15s 超时）` —— **看着像崩溃**，
+  而不是预期的 `项数=2` 变红。根因：探针清上一轮 cfg 走 `TerminateProcess`（**异步**），
+  **窗口先消失、进程的单实例互斥体还在** ⇒ 立刻 `CreateProcess` ⇒ 新 cfg 撞
+  `ERROR_ALREADY_EXISTS` ⇒ **静默早退**（`exit 0`）；而早退发生在 stdout 重定向
+  **之前** ⇒ **连日志都不建** ⇒ 只剩"窗口没出现"这一条线索。
+  修法（两侧同源，铁律 127）：互斥体名收进 `shared/r3shieldcore/cfg_launch.h`
+  （`kSingleInstanceMutex` + `SingleInstanceTaken()` + `WaitSingleInstanceFree()`），
+  探针在 `CreateProcess` **之前**轮询等它释放，等不到就打一行**诊断**
+  （明说"接下来必然报窗口没出现，不是崩溃"）。
+  修后同一条反向对照**干净地红在 `项数=2`**（6 通过 / 1 失败）⇒ 判据确实有分辨力。
+- ★ `check_dist_sync.sh` 的 v80 节新增两条判据：`cfg_launch.h` 含 `kSingleInstanceMutex`、
+  cfg exe 含宽串 `Local\R3ShieldCoreCfg.SingleInstance`。
+  ⚠️ 两条都做负对照时**第一版没变红** —— 裸 `grep -qF` 被 `..._TMP` **子串满足**
+  （铁律 **209** 复发）⇒ 改 `grep -qwF` 后才精准 FAIL。
+- ★★ **发布目录残留清单补第三个已知名**：`r3shieldcore-cfg-console.log`（v80 引入）。
+  它是配置工具在预览模式下被 `R3SHIELDCORE_PREVIEW_LOG` 重定向出来的 stdout，
+  探针跑的是 `dist/R3ShieldCore-x64/r3shieldcore-cfg.exe` ⇒ 它就落在**发布目录**里，
+  会随包发出去。`deploy_dist.sh` 的 2b 步与 `check_dist_sync.sh` 的 v74 节
+  **两侧清单同步**加上它（仍然**只列已知名、不用通配 `*.log`**，铁律 117）。
+- ★★ **探针的"相对路径"坑**（铁律 **267**）：给探针传**相对** exe 路径时，
+  它必报 `窗口没出现（15s 超时）`，而 `test_gui_preview.sh`（传绝对路径）一直正常
+  —— 极易被误判成"探针坏了/偶发"。根因：相对 `exePath` ⇒ `exeDir` 也相对 ⇒
+  派生出的 `R3SHIELDCORE_PREVIEW_LOG` 是相对路径，而 `CreateProcess` 的
+  `lpCurrentDirectory` **又设成同一个 `exeDir`** ⇒ 相对路径**相对它自己**解析
+  ⇒ 目录不存在 ⇒ `_wfreopen_s` 失败、stdout 被关 ⇒ 首句 `printf` 撞 CRT
+  无效参数处理器 ⇒ `__fastfail` 秒退（退出码 `0xC0000409`）。
+  修法：`Run()` 开头 `GetFullPathNameW` **规范成绝对路径**再派生一切。
+  ★ 同步补**诊断**：超时时打印**子进程退出码** + 命令行 + 工作目录
+  —— "进程还活着没建窗"与"进程已退出"是**两个完全不同的排查方向**。
+
+### 新增 — 配置工具**向引擎索取实时数据**（命名管道 IPC）；日志行唯一实现（v81）
+
+先说要解决什么：v80 把「高级」编辑台搬进 `r3shieldcore-cfg.exe` 之后，配置工具
+**只能读日志文件**。而引擎里那份"事件流"其实是**进程内**的环形缓冲
+（`R3ShieldCoreStats`），它**不进共享内存**（共享内存里只有 `Policy`）——
+所以配置文件里的日志天生**滞后**（要等 DLL 落盘），而且"引擎还没落盘的那几条"看不到。
+v81 让它能**直接问引擎要**：配置工具与引擎之间加一条**命名管道**通道。
+
+- **协议契约抽成共享头 `R3ShieldCore/shared/r3shieldcore/cfg_ipc.h`**（铁律 127）：
+  管道名 / VERB / 请求应答文法 / **转义规则** / 字段名**全部只定义一处**，两侧
+  `#include` 同一个头。
+  · VERB：`HELLO`（握手，回协议版本 + ABI + pid + 引擎 exe 路径）/ `LOG`（取事件流，
+    `LOG|<sinceSerial>|<maxCount>`）/ `CONFIG`（取引擎**当前生效**配置）/
+    `SYNC`（请引擎重读 ini 并热应用）/ `PING`（只探活）。
+  · 线格式：UTF-8 文本，**一行一条记录**。请求 `<VERB>[|<字段>]...\n`；
+    应答首行是状态行 `OK|<字段>...`（含 `count=N`），后面跟 N 条载荷行；失败 `ERR|<说明>`。
+  · ★ **转义**：自由文本字段（日志行里有 `|`、路径里有 `\`）必须过 `Escape()`：
+    `\`→`\\`、`|`→`\p`、CR→`\r`、LF→`\n`；数字字段不转义。`Unescape` 是**单趟
+    左到右**扫描 —— 不做"先解 `\\` 再解 `\p`"，否则 `\\p` 会被错解成 `|`（二次解码）。
+    ★ 一个没转义的 `|` 会让字段数漂、下游按位置取字段全错位，而症状是
+    "能连上、能读到行、只是内容不对" —— 最难发现的一类。
+  · ★ **管道名带会话号**：`\\.\pipe\R3ShieldCoreCfgIpc` + `ProcessIdToSessionId()`。
+    `Local\` 只保证会话内唯一，多登录会话（RDP / 快速用户切换）下两个会话会撞名字 ——
+    后到的那个可能连上**另一个会话的引擎**，然后显示别人的日志。
+
+- **服务端在主程序里，不在引擎 DLL 里**（这一点最容易搞错）：
+  真正能碰 `GlobalHookSession` 共享内存、能执行"热应用"的是**主程序
+  `R3 Shield Core.exe`** 那个进程 ⇒ 管道服务端由它起。
+  · 代码 `R3ShieldCore/R3ShieldCore/r3shieldcore_cfgipc.cpp`（`Start` / `Stop` /
+    `PollSync` / `GetStats`），编进主程序（`build.sh` 的 sources 里加一行 ——
+    ★ 漏这一行的症状是链接期十几条 `LNK2001`，极易被当"环境问题"）。
+  · ★★ **DACL 必须显式放行调用方**：引擎是 `requireAdministrator`、cfg 是普通用户
+    ⇒ 跨完整性级别访问命名管道**必须**在 `SECURITY_ATTRIBUTES` 里授
+    「调用方用户 SID + Administrators」，否则恒定 `ERROR_ACCESS_DENIED(5)`，
+    而症状**伪装成"引擎没在运行"**（管道建不出来 ≈ 对端看不到）。
+  · ★★ **管道模式两侧必须一致**：服务端用
+    `PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS`
+    ⇒ 客户端也必须**字节模式 + 内容分帧**（不能设消息读模式 —— 对字节型管道设
+    消息读模式会**直接失败**，而 `ReadFile` 仍按字节流工作，即静默失效）。
+
+- **SYNC 语义必须诚实**：引擎里真正能"改完立刻生效"的**只有 `mode`**
+  （`GlobalHookSessionSetMode` 只改共享内存 Policy 块里的 `Mode`）；其余键是启动期
+  定死的 `EngineSettings` ⇒ 应答必须回三个字段：`applied=`（已立即生效的键）/
+  `restart=`（需要重启引擎的键）/ `detail=`（给人看的一句话）。不说清楚，
+  用户会以为"保存完就生效了"。
+  · ★★ **热应用必须由主循环做，不能由服务线程直接做**：`SetMode` 会碰 DLL 共享内存、
+    必要时还要建询问通道 ⇒ `PollSync(engineControl)` 跑在**主循环**里；服务线程只
+    "挂请求 + 等结论"（5s 超时回 `ERR`，绝不挂死界面）。
+
+- **配置工具侧接入**（`tools/r3shieldcore_cfg.cpp`）：
+  · 日志页加「引擎实时数据」复选框（`IDC_LOGFROMSOURCE`）；默认**优先问引擎**，
+    连不上且**从没连上过** ⇒ 自动取消勾选、回落读日志文件（状态栏明说
+    "引擎未运行，已回落读日志文件"）；连上过又断 ⇒ 只提示"正在重试"，保留列表。
+  · 配置页加「立即同步」按钮（`IDC_SYNCNOW`）：有未保存改动时弹
+    `是/否/取消`（是=先保存再同步 / 否=只同步文件 / 取消=什么都不做）；
+    同步后弹窗显示 `applied` / `restart` / `detail`。
+  · ★ **引擎重启检测**：序号从 1 起，回传的 `latest` 比我们要的起点**小** ⇒
+    对面是新引擎进程 ⇒ 游标归零、从头取一遍（否则"引擎重启后再也没有新日志"）。
+
+- **日志行格式化抽成共享头 `R3ShieldCore/shared/r3shieldcore/log_line.h`**（铁律 127）：
+  `FormatEventLine(event, processName)` 是 DLL **落盘**与引擎界面**显示**共用的
+  **同一份**格式化；`r3shieldcore_log.cpp` 的 `WriteEventLine` 改为只解析进程名 +
+  逐字写出（净减 173 行、只留 19 行）。
+  · 另有 `text_conv.h`（`Utf8ToWide` / `WideToUtf8`，按显式长度转、失败返回**空串**）。
+
+- **核对链**（都不跑引擎，铁律 175）：
+  · `tools/log_line_rt_ut.cpp` + `build_log_line_rt_ut.sh`：链接**真代码**
+    （`r3shieldcore_stats.cpp` / `r3shieldcore_log_replay.cpp`），15 组断言。
+    实测 **95 passed / 0 failed**；带真实日志语料做**逐字节回环**
+    （`format(parse(行)) == 行`）⇒ **98 passed**。
+  · `tools/cfg_ipc_probe.cpp` + `build_cfg_ipc_probe.sh`：**端到端**夹具 ——
+    自己起一个"假引擎"服务端（复用共享头编解码），用**生产客户端**
+    `Ipc::Call` 去连。5 组断言（HELLO / LOG 含 `|` 转义 / CONFIG 键值转义 /
+    SYNC applied+restart / 引擎不在跑必须明确失败）。实测 **20 passed / 0 failed**
+    （x64 + x86）。
+    ★ `--neg` 反向对照（故意用**消息模式**建管道）⇒ 必须失败
+    ⇒ 证明判据有分辨力（铁律 128）。
+
+- **发布闸门新增 v81 节**（`check_dist_sync.sh`）：
+  ① 前提：`cfg_ipc.h` 含契约三件套；服务端源码含 `PipeName`；cfg 源码含
+     `cfg_ipc.h` + `Ipc::Call`；`build.sh` 源清单里有 `r3shieldcore_cfgipc.cpp`。
+  ② ★★ **两侧同源**：主程序 exe（服务端）与 cfg exe（客户端）**都**含管道名宽串
+     —— 这是整条链唯一的"接头"，任一侧改名 ⇒ 症状是"引擎没在运行"（伪装成引擎没跑）。
+  ③ 两侧都含 VERB `HELLO`（协议常量同源）。
+  ④ cfg exe 含 v81 宽串标记 `R3SHIELDCORE_PREVIEW_LOGSRC`。
+  · 新增核对开关 `R3SHIELDCORE_PREVIEW_LOGSRC=engine|file`：**钉死**日志页数据来源，
+    让探针在"引擎不允许运行"的机器上也能核对到「引擎（实时）」那条分支
+    （不钉的话每次都被自动回落成文件 ⇒ 该分支**永远核对不到**，铁律 142/175）。
+
+- **修复 — `deploy_dist.sh` 清运行时残留**在**静默失效**：
+  本机 shell 里 `rm` 是一个**函数**（沙箱注入的 `safe-bin/rm`），而那个 shim 目录
+  不存在 ⇒ `rm` 退出码 **127**、**什么都没删**，旧代码却紧接着无条件
+  `echo "清掉..."` ⇒ **脚本谎报成功**（后果正是这一步要防的两条：泄漏 + 夹具读到旧日志）。
+  修法：① 用 `command rm` 绕开函数；② 删完**回查**文件是否真没了，没删掉就**报错退出**
+  （铁律 142：只喊成功不验结果 = 假绿）。
+
+### 变更 — 规则编辑台**整体搬去 `r3shieldcore-cfg.exe`**；主程序「高级」变成**跳转入口**（v80）
+
+用户要求（原话）：「把高级放到 r3shieldcore-cfg.exe 里去，cfg 和主程序**同时启动**，
+同时主程序**保留高级按钮**，按一下就**跳转到 cfg** 里去」。
+
+先说**为什么搬**：两个页签的**操作节奏根本不同** —— 「配置」是"看一眼、勾一下"，
+「高级」是"坐下来写规则"。挤在一个窗口里，写规则时每敲一个字都要重绘整屏
+（v79 刚把实时提示做成"每次 `EN_CHANGE` 现算"），而且窗口一关规则编辑就中断。
+
+- **主程序「高级」页 → 跳转提示页**（第 6 个页签**保留**）。
+  内容从"编辑台"换成一段说明 + 一个按钮「打开高级规则编辑台」；点它 = 跳到 cfg 的「高级」页。
+  · 主程序 `r3shieldcore_gui.cpp` 净减 **1885 行**（6347 → 4462）：
+    整块删掉 `AdvLayout` / `AdvDrawQuiz` / `AdvDrawEditor` / `AdvCreateEdit` /
+    `HitTestAdvTableRow` / `PerformAdvAction` / `g_adv*` 状态、`WM_COMMAND`(EN_CHANGE)、
+    `WM_CTLCOLOREDIT` 两个 case，以及 7 个只服务编辑台的 include。
+  · 界面代码搬到 cfg 之后，**进程级前置条件也得跟着搬**（见下面"踩坑"的 `setlocale`）。
+- **cfg 新增第 3 个页签「高级」**（配置 / 日志 / 高级），编辑台原样落地。
+  · 页号常量只此一处：`kPageConfig = 0` / `kPageLog = 1` / `kPageAdvanced = 2`。
+- **两个 exe 的启动/激活契约抽成共享头 `R3ShieldCore/shared/r3shieldcore/cfg_launch.h`**：
+  窗口类名、激活消息名、exe 名、页号、`--quiet` 开关**全部只定义一处**（铁律 127）——
+  **连探针也 `#include` 它**，避免"探针以为的契约"与"两个 exe 实现的契约"悄悄漂开。
+  · `ActivateMessageId()` 用 `RegisterWindowMessageW(L"R3ShieldCoreCfg.Activate")`：
+    同一字符串在**任何进程、任何时候**调用都返回同一个 id，两个 exe 不需要共享内存、
+    也不需要约定一个数字。
+    ★ 注册消息的**数值运行时才知道** ⇒ 必须在 WndProc 的 `switch` **之前**用
+    `if (msg == Id)` 判断，**不能写成 `case` 标签**（编译期常量才能当 case）。
+  · `LaunchOrActivate(opts, &err)` 三条路径：
+    ① 窗口已在 + `quiet` ⇒ **直接返回成功，什么都不做**；
+    ② 窗口已在 + 非 quiet ⇒ `AllowProcessForeground()` + `PostMessageW(激活消息, page)`；
+    ③ 没在跑 ⇒ 检查 exe 存在性 ⇒ `CreateProcessW(..., SW_SHOWMINNOACTIVE, ...)`。
+- **主程序启动时"顺手拉起" cfg，且必须 quiet**：
+  `app.cpp` 在 `R3ShieldCoreGui::Start` 成功之后调
+  `LaunchOrActivate({page = kPageAdvanced, quiet = true})`。
+  · ★ quiet 的语义 = **"在跑就什么都不做"**（连切页都不做、更不抢焦点）。
+    原因：UIAccess 接管时父/子两个主程序实例会**并发**走到这一段，非 quiet 就会抢前台。
+  · ★ 自动拉起用 `SW_SHOWMINNOACTIVE`，而 cfg 侧只有用 **`SW_SHOWDEFAULT`** 才会**尊重**
+    这个值；写 `SW_SHOW` 会把自动拉起的 cfg 弹到前台。
+  · ★ 抢前台用 **`AllowSetForegroundWindow(pid)`** 而不是 `ASFW_ANY` ——
+    只放行**被点名的那个进程**，避免"接下来谁都可以抢前台"。
+- **cfg 单实例 + 被激活**：
+  · `Local\` 前缀的**命名互斥体**（每个登录会话一个实例）；
+    `CreateMutexW` 后查 `GetLastError() == ERROR_ALREADY_EXISTS`。
+  · 被激活时 `AllowProcessForeground(existing)` + `PostMessageW(..., g_startPage, 0)`
+    ⇒ **激活已有窗口并切到请求的页**，不重复开。
+  · ★ `--selftest` 必须**绕过**单实例（检查放在 `RunSelfTest` 返回**之后**），
+    否则自动化自检会被自己挡住。
+  · ★ cfg 带 `--quiet` 撞上单实例 ⇒ **安静退出**（不发激活消息）。
+- **命令行 `--page N`**：主程序点「高级」时用 `kPageAdvanced` 拉起/激活 cfg 的「高级」页。
+
+#### 本轮修掉的真缺陷
+
+- ★ **cfg `--page 2` 会停在配置页**。`WM_CREATE` 里写的是
+  `ShowPage(g_startPage == 1 ? 1 : 0)` —— 那是"只有 0/1 页"时代的写法，
+  `--page 2` 被**静默压回第 0 页**。后果：主程序点「高级」跳了个寂寞（窗口开了，停在配置页）。
+  改成 `ShowPage(g_startPage >= 0 && g_startPage < kTabCount ? g_startPage : 0)`
+  —— 页号的唯一判据是共享头里的 `kPage*`。
+- ★★ **主程序跳转页的版式重叠**（只有截图看得出）。
+  按钮的 top 是**拍脑袋**的 `TabBarTop + TabBarHeight + 104`，
+  而第二行说明文字的盒子是 `+94 .. +142` ⇒ **按钮整个压在文字上**；
+  按钮下面那行提示又落在第三行说明文字上（`+154..+178` vs `+158..+178`）。
+  画按钮 / 画文字的两段代码各自都明明白白 —— 自绘界面里"重叠"**不会报错，只会盖住**
+  （铁律 237 同族）。⇒ 改成"从面板顶按行距**推导**"（`AdvButtonTopOffset`），
+  并把面板顶抽成 `AdvPanelTop()`（面板矩形 / 文字起点 / 按钮几何三处共用同一个来源）。
+- ★★★ **核对探针一直在截「别的窗口」**（本轮最贵的一个）。
+  探针从**屏幕 DC** BitBlt 取图（不用 `PrintWindow`），所以必须让目标窗口在屏幕最前面。
+  原先靠 `SetForegroundWindow` + 等 `GetForegroundWindow()` —— 但那**会被前台锁拒绝**
+  （探针是从 bash 起的后台进程，没有抢前台的资格）。
+  而主程序窗口**自己置顶**（安全控制台），所以主程序那几屏一直是对的；
+  cfg 的窗口不置顶 ⇒ **五屏全部**截到了压在它上面的编辑器窗口。
+  更糟的是**像素判据在一个无关窗口上求值照样能过**
+  （编辑器 UI 里本来就有紫色图标 ⇒ "紫 > 0" 假绿、`非白 > 3%` 也必然过），
+  只有"紫 = 0"那种时刻才偶发红 —— 症状被误读成"偶发失败"。
+  ⇒ 两处修：① 用「TOPMOST → NOTOPMOST」把窗口抬到 z 序最前（**不需要**前台权），
+  必要时先 `SW_RESTORE`；② 加一条**硬判据** ——
+  `WindowFromPoint(窗口中心)` → `GetAncestor(GA_ROOT)` 必须**就是**那个 hwnd，
+  否则直接报"实际在那个位置的是窗口类「X」"并说明"下面的像素判据全部不可信"。
+  · 实测效果：cfg 两屏的 `紫` 从 **0 → 4504/4506**（一屏的 `非白` 从 28.6% 回到 15.0%）。
+  · ★ 泛化：**"截图核对"这类判据最容易塌掉的地方不是判据写错，而是"看的不是那个东西"** ——
+    必须有一条判据专门回答"我截的到底是不是它"。
+
+#### 踩坑（都是"不报错、只静默"型）
+
+- ★★★★ **`printf("%ls")` 依赖 locale；代码搬了家，进程级前置条件也得跟着搬**。
+  MSVC 的 `printf` 按**当前 locale** 把宽串转窄串；默认 `"C"` locale 转不了非 ASCII
+  ⇒ **从第一个 `%ls` 处直接停住**，该行剩下的 `%d` / 换行**全部丢失，且不报任何错**。
+  症状：cfg 日志里 `[adv] 初始规则=3 来源=` 之后没了（其实后面还有字段）。
+  主程序 `app.cpp:337` 早有 `setlocale(LC_ALL, "")`，cfg 没有 ⇒ 补上。
+- ★★★★ **不要用 `setvbuf(stdout, nullptr, _IOLBF, 0)`**：实测加了它
+  ⇒ **窗口建不出来**（进程活着、日志 0 字节、没有任何窗口、也没有报错）。
+  必须用 `_IONBF`（与 `app.cpp` 一致）。
+- ★★★ **`TerminateProcess` 是异步的**：清残留不能"杀完立刻找窗口"，
+  必须**轮询等窗口真的消失**，否则会找到上一轮的残骸并截它的图。
+- ★★★ **从屏幕 DC 取图必须先等窗口真的到前台**（探针用的是 BitBlt 而非 `PrintWindow`）：
+  症状是"某像素判据偶发红、单独重跑又全绿"。
+  修法：截图前 `SetForegroundWindow` 轮询到 `GetForegroundWindow() == hwnd` 再 `Sleep`。
+- ★★ **`CreateProcessW` 的 `lpCommandLine` 要再带一次引号**（exe 路径含空格时）。
+- ★★ **"顺手拉起"依赖 exe 在**同目录**：`CfgExePath()` 按本进程目录找
+  `r3shieldcore-cfg.exe`。核对脚本里主程序所在目录必须**同时**放一份 cfg
+  （这条判据**抓到过真问题**：只放主程序 ⇒ 点跳转后"cfg 窗口没出现"）。
+- ★★ **"查不到某标记"与"某标记被搬家"是两回事**：代次标记随代码搬家时，
+  闸门的 `*_SRC` / `*_EXE` 路径必须同步，否则会**静默变成恒 PASS**。
+
+#### 核对链
+
+- **一份探针同时核对两个 exe**（`tools/gui_preview_probe.cpp`）：
+  新增 `app = main | cfg` 参数，按 app 分派命令行（cfg 用 `--page N`，main 用 `--gui-preview`）
+  与断言块；窗口类名从共享头取。
+- `tools/test_gui_preview.sh` 默认 **8 个规格**（`[main|cfg]/<tab>[:<mode>]`）：
+  `main/advanced:jump`（跳转页）/ `main/advanced:click`（**端到端**：点了按钮之后 cfg 真的起来、
+  且日志报 `页签=2` + `[adv] 页面已绘制`）/ `cfg/advanced:quiz` / `:why` / `:editor` / `:typing` /
+  `:error` / `main/ark`（负对照）。
+  · 截图名带 app 前缀（`gui-preview-main-advanced-click.png` 等）。
+  · `[2/4]` 后把 cfg **拷到主程序旁边**（发布布局），否则端到端那条判据永远红。
+- **探针取图前先证明"截的就是它"**（本轮最贵的一个坑，详见上面"真缺陷"）。
+  每屏多一条判据：`屏幕该位置上的顶层窗口就是被截的那个`。
+- 实测 **8 屏 0 FAIL**（共 59 项）：jump 6/0、click **10/0**、cfg quiz 7/0、why 6/0、
+  editor 9/0、typing 8/0、error 8/0、ark 5/0。
+- **闸门**：`check_dist_sync.sh` 的 v78 / v79 代次标记**改指 cfg**（编辑台整块搬走了，
+  标记不跟着搬家会恒 FAIL 或更糟恒 PASS），并**新增 v80 节**：
+  ① 前提（共享头含契约三件套、两侧源码各含接入点）；
+  ② **两侧同源**（主程序 exe 与 cfg exe **都**含 `R3ShieldCoreCfg.Activate` 与 `r3shieldcore-cfg.exe`）；
+  ③ 主程序 exe 含 `R3SHIELDCORE_PREVIEW_JUMP`、cfg exe 含 `R3SHIELDCORE_PREVIEW_LOG` 与窗口类名。
+- **GBK 闸门覆盖面扩大**：`build_cfgtool.sh` 编译前加**窄 + 宽**前置闸门
+  （覆盖 `tools/r3shieldcore_cfg.cpp` 与 `cfg_launch.h`）；
+  `build_gui_preview_probe.sh` 的宽闸门文件列表加 `cfg_launch.h`。
+
+### 新增 — 题目**渲染 Markdown** + 规则编辑器做成 **IDE 式**（v79）
+
+两个反馈都来自实际使用：**"题目显示要支持 md"**、**"编辑器做成类似 IDE 的，
+可以点下方的按钮也可以直接输入，输入的时候要有提示"**。
+
+- **题干 / 解析现在渲染 Markdown，不再把星号画出来**。
+  共享题目文本（`advanced_quiz.h`）里本来就写着 `**加粗**`、`` `行内代码` ``
+  —— 那是给**控制台**看的记号（终端里只能这么表达强调）。窗口这一侧过去是**原样**
+  画出来的，于是用户看到的是四个星号。
+  · 新增 `shared/r3shieldcore/md_inline.h`：极简**行内**解析（`**加粗**`、`` `代码` ``、
+    行首 8 空格代码行、`- ` 列表）。**不引第三方库** —— 需要渲染的只有题干和解析。
+  · ★ 解析**单独抽成共享头**是为了**能单测**：渲染要 DC，但"哪几个字是加粗的"
+    是纯文本逻辑。混在一起的话，Markdown 支不支持就只能靠截图去猜（铁律 24/28）。
+  · ★ **缩进阈值取 8 而不是 4**：4 空格在共享文本里是**控制台的续行对齐记号**
+    （那些行全是中文正文），8 空格才是真代码行（`RegOpenKeyExW(...)`）。
+    取 4 会把正文续行整段变成等宽。
+  · 未配对的 `*` / 反引号**原样输出**（`Pass.*` 这类通配写法里就有单个 `*`）——
+    宁可显示朴素，也不能吞字符。
+- **编辑器改成 IDE 式**（用户原话："可以点**下方**的按钮，也可以直接输入"）：
+  · 布局顺序**反转**：规则表 → **输入框** → **模板按钮（在下方）** → **实时提示** → 动作状态。
+    原先按钮在输入框**上面**。
+  · **输入时的实时提示**（两行，跟着每次 `EN_CHANGE` 重算）：
+    第一行 = 这一行**能不能用**（`√ 可以解析 —— <归一化后的一句话>` / `× <具体错在哪>`）；
+    第二行 = **下一步该写什么**（`下一步：写动作：替换为 … / 隐藏 / 拒绝 / 放行`）。
+    · 新增 `rules_codec.h` 的 `NextStepHint()`：按 DSL 语法顺序扫一遍 token，
+      指出"写到哪一段了、下一段该写什么"。★ 它**只用于提示、不参与判定**
+      （能不能用永远由 `Parse` 说了算）—— 这是它敢做轻量扫描而不抄一遍 `Parse` 的前提。
+    · ★ "已经写完却还报错"要**分两种话术**：这时再报"下一步该写什么"是误导
+      （用户按提示补完还是错，会以为软件坏了）⇒ 改成"按 × 后面的提示改"。
+    · ★ 提示**不缓存**、绘制时现算：缓存就多一份状态，而"状态与输入不同步"
+      正是这类界面的经典故障（屏幕上写着"可以解析"，点「加入」却报错）。
+  · 输入框空着的时候，提示的第一行**就是**语法骨架 —— 于是面板底部那三行
+    常驻"语法速查"删掉了（面/算子/动作的词表本来就印在模板按钮上）。
+  · 规则表行数改为**按可用高度自适应**（`AdvTableMaxRows`，绘制与命中读同一函数）：
+    窗口拉到最小高度（640）时 6 行表格会把输入框挤出面板，而"能编辑"正是这一页的意义。
+- **单测 `tools/v79_quiz_md_ut.cpp`（30 项）**：Markdown 解析全分支 + 真实题目文本里
+  确实用到了记号 + `NextStepHint` 全路径。含三条**反向对照**（4 空格不是代码、
+  未配对记号不被吞、"扫描说写完了"时 `Parse` 仍可能拒绝）。
+- **界面核对链从 3 屏扩到 5 屏 + 负对照**（`tools/test_gui_preview.sh` 默认全跑）：
+  `advanced` / `advanced:why` / `advanced:editor` / **`advanced:typing`（合法规则 ⇒ 提示=可解析）**
+  / **`advanced:error`（非法规则 ⇒ 提示=错误）** / `ark`（负对照）。
+  · 新增预览环境变量 `R3SHIELDCORE_PREVIEW_EDIT`（预置编辑框内容）——
+    实时提示是"输入时才有"的，空输入框截不到它。★ 只在 `--gui-preview` 生效。
+  · 日志新增 `提示=空|可解析|错误` 字段：截图上只能看出"有两行字"，
+    看不出那两行**跟没跟着输入变**；`typing`/`error` 成对断言才排得掉"恒真"。
+  · ★ **负对照 `ark` 进了默认跑法** —— 之前默认列表里没有它，那条判据在默认跑法下
+    根本没执行（等于白设，铁律 128）。
+
+### 修复 — 宽字面量闸门查出的编码隐患（v79）
+
+- `check_source_gbk.py --wide` 首次对 `r3shieldcore_gui.cpp` 跑，查出 **4 处**
+  `⚠`(U+26A0) 在宽字面量里 —— CP936 编不出。**核实后确认是合法假阳性**：
+  那几行只经 GDI `DrawTextW` 绘制，**从不**经过 `WideCharToMultiByte(CP_ACP)`。
+  ⇒ 保留字形，在**该行**加 `// gbk-ok` 豁免并写明理由（闸门自带的机制，审得动）。
+- 新增的提示符号**换成 CP936 里有的**：`✓`(U+2713) → `√`(U+221A)、
+  `✗`(U+2717) → `×`(U+00D7)、圆点 `•`(U+2022) → `●`(U+25CF)。
+  没必要时不留"取决于谁调用"的隐患。
+- ★ 把这个**宽闸门接进 `build_gui_preview_probe.sh`**（覆盖 `r3shieldcore_gui.cpp` +
+  `md_inline.h`）—— 那一页的源码有编码隐患时，"核对它"这件事本身就不可信。
+
 ### 新增 — 「高级」页从**只读预览**变成**可编辑的规则编辑台**，且规则**真的作用于引擎**（v78）
 
 v77 的「高级」页只是"把规则跑一遍给你看字节"。v78 把它补成**能写、能存、引擎真读**的闭环。
@@ -805,7 +1146,7 @@ bash tools/spoof_e2e.sh --run-engine
 都用 `cygpath -w` 转成**绝对 Windows 路径**并加引号（路径含空格）：
 
 ```
-"D:\...\PortableGit\usr\bin\bash.exe" "D:\用户态杀软\tools\spoof_e2e.sh" --run-engine
+"D:\...\PortableGit\usr\bin\bash.exe" "D:\项目\tools\spoof_e2e.sh" --run-engine
 ```
 
 - 新增 `bash_line()`（**单点维护**，避免各处各写一份）与 `admin_hint()`，

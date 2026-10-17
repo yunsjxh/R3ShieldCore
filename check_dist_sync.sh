@@ -759,8 +759,12 @@ echo ""
 # ★ 判据是"这两个**已知名**不存在"，不是通配 `*.log`：将来若真有随包发的
 #   日志文件，通配会误杀（铁律 117：判据要窄）。
 echo "=== v74 发布目录里没有运行时残留日志 ==="
+# ★ 2026-10-16 加了第三个已知名 `r3shieldcore-cfg-console.log`（v80 引入）：
+#   配置工具在预览模式下被 `R3SHIELDCORE_PREVIEW_LOG` 重定向出来的 stdout，
+#   探针跑的是 dist 里的 cfg exe ⇒ 它就落在**发布目录**里（不是随包内容）。
+#   ⚠️ 仍然只列已知名、不用通配 `*.log`（铁律 117）。
 _stale_found=0
-for _stale in r3shieldcore-console.log r3shieldcore-events.log; do
+for _stale in r3shieldcore-console.log r3shieldcore-events.log r3shieldcore-cfg-console.log; do
     if [ -f "$DIST_DIR/$_stale" ]; then
         echo "[FAIL] dist 里有运行时残留: $_stale —— 它会随包发出去，且会让夹具读到旧日志"
         echo "       修法：跑 bash deploy_dist.sh（2b 步会清），或手动删掉它"
@@ -768,7 +772,7 @@ for _stale in r3shieldcore-console.log r3shieldcore-events.log; do
     fi
 done
 if [ "$_stale_found" -eq 0 ]; then
-    echo "[ OK ] 没有 r3shieldcore-console.log / r3shieldcore-events.log"
+    echo "[ OK ] 没有 r3shieldcore-console.log / r3shieldcore-events.log / r3shieldcore-cfg-console.log"
 else
     fail=1
 fi
@@ -955,16 +959,22 @@ fi
 #   · 引擎 `r3shieldcore-lib.dll` 里多了**启动时读规则文件**的逻辑。
 #   ⇒ 两样都必须有标记，否则"改了源码没重编"照样全绿（铁律 142）。
 #
+# ★★ v80：编辑台（连同这些标记）**整块搬去了 cfg 工具** ——
+#   所以本节里的"界面侧"从 `R3 Shield Core.exe` 换成了
+#   `r3shieldcore-cfg.exe` + `tools/r3shieldcore_cfg.cpp`。
+#   ⚠️ 标记没跟着搬家的话，这一节会**恒 FAIL**（源码里 grep 不到），
+#      或者更糟：恒 PASS（查的还是旧位置，而旧位置已经被删空了）。
+#
 # ★ 判据：
 #   ① ★ **前提检查**（铁律 117）：标记必须先在源码里存在，否则"查不到"
 #      会被误当成"没重编"，而真因是"标记被改名 / 删了"。
-#        a) `r3shieldcore_gui.cpp` 含 `R3SHIELDCORE_PREVIEW_ADV`
+#        a) `tools/r3shieldcore_cfg.cpp` 含 `R3SHIELDCORE_PREVIEW_ADV`
 #           —— 预览模式给「高级」页预置界面状态的环境变量（v78 新增）。
 #        b) `shared/r3shieldcore/rules_file.h` 存在且含 `r3shieldcore-rules.txt`
 #           —— 规则文件名的**唯一一份**定义。
-#   ② 主程序 exe 含**宽**串 `R3SHIELDCORE_PREVIEW_ADV`
-#      —— 证明「高级」页的新代码真的编进了 exe。
-#   ③ ★★ **两侧同源**：主程序 exe 与引擎 dll **都**含宽串
+#   ② cfg 的 exe 含**宽**串 `R3SHIELDCORE_PREVIEW_ADV`
+#      —— 证明「高级」页的新代码真的编进了那个 exe。
+#   ③ ★★ **两侧同源**：cfg exe 与引擎 dll **都**含宽串
 #      `r3shieldcore-rules.txt`。
 #      这一条是本节的重点：界面**写**这个文件、引擎**读**它，两边必须指向
 #      同一个名字。只查一侧的话，"界面存到 A、引擎读 B"这种
@@ -976,9 +986,9 @@ echo "=== v78 代次标记（「高级」页可编辑 + 规则文件路径两侧
 
 V78_MARK="R3SHIELDCORE_PREVIEW_ADV"
 V78_RULES="r3shieldcore-rules.txt"
-V78_SRC="$PROJECT_ROOT/R3ShieldCore/R3ShieldCore/r3shieldcore_gui.cpp"
+V78_SRC="$PROJECT_ROOT/tools/r3shieldcore_cfg.cpp"
 V78_RULES_HDR="$PROJECT_ROOT/R3ShieldCore/shared/r3shieldcore/rules_file.h"
-V78_EXE="$DIST_DIR/R3 ShieldCore.exe"
+V78_EXE="$DIST_DIR/r3shieldcore-cfg.exe"
 
 # ① 前提检查
 if [ ! -f "$V78_SRC" ]; then
@@ -1002,15 +1012,15 @@ if [ ! -f "$V78_EXE" ]; then
     fail=1
 else
     if strings -el "$V78_EXE" | grep -qwF "$V78_MARK"; then
-        echo "[ OK ] EXE 含 v78 宽串标记 '$V78_MARK'（「高级」页可编辑已编入）"
+        echo "[ OK ] cfg EXE 含 v78 宽串标记 '$V78_MARK'（「高级」页可编辑已编入）"
     else
-        echo "[FAIL] EXE 缺 v78 宽串标记 '$V78_MARK'（用 strings -el 查）"
-        echo "       ⇒ exe 没重编，或标记被改名 / 改成了窄串"
+        echo "[FAIL] cfg EXE 缺 v78 宽串标记 '$V78_MARK'（用 strings -el 查）"
+        echo "       ⇒ cfg exe 没重编，或标记被改名 / 改成了窄串"
         fail=1
     fi
 fi
 
-# ★ 两侧同源：exe（写）与 dll（读）都要带规则文件名。
+# ★ 两侧同源：cfg exe（写）与 dll（读）都要带规则文件名。
 v78_src_exe=0
 v78_src_dll=0
 if [ -f "$V78_EXE" ] && strings -el "$V78_EXE" | grep -qF "$V78_RULES"; then
@@ -1023,9 +1033,9 @@ for arch in 64 32; do
     fi
 done
 if [ "$v78_src_exe" -eq 1 ]; then
-    echo "[ OK ] EXE 含宽串 '$V78_RULES'（界面**写**的那个文件名）"
+    echo "[ OK ] cfg EXE 含宽串 '$V78_RULES'（界面**写**的那个文件名）"
 else
-    echo "[FAIL] EXE 缺宽串 '$V78_RULES' ⇒ 界面侧没有把 rules_file.h 编进去"
+    echo "[FAIL] cfg EXE 缺宽串 '$V78_RULES' ⇒ 界面侧没有把 rules_file.h 编进去"
     echo "       （用 strings -el 查；写成 -a 永远查不到，铁律 193）"
     fail=1
 fi
@@ -1038,8 +1048,425 @@ else
 fi
 
 echo ""
+# ---------------------------------------------------------------------------
+# v79 代次标记（题干/解析渲染 Markdown + 规则输入实时提示）
+# ---------------------------------------------------------------------------
+# ★ 为什么需要这节：v79 加的东西**全部只影响界面那一侧**（引擎 DLL 一行没动），
+#   所以它最容易出现"源码改了、包里的 exe 还是旧的"这种**看不见的不同步** ——
+#   而症状只是"题目里的星号没渲染 / 输入时没有提示"，不会报任何错。
+#
+# ★★ v80：这一整套（题干渲染 + 实时提示 + 编辑台）搬去了 cfg 工具 ⇒
+#   "界面那一侧"从 `R3 Shield Core.exe` 换成了 `r3shieldcore-cfg.exe`。
+#
+# 三组判据：
+#   ① 共享头真的在（`md_inline.h`）+ 解析器命名空间在；
+#   ② 两个接入点真的在（cfg 源码里 `MdDraw` / `AdvComputeHint`）；
+#   ③ **exe 里能查到 v79 独有的宽串** `R3SHIELDCORE_PREVIEW_EDIT`
+#      —— 那是 v79 新增的预览环境变量，只在界面 exe 里出现。
+#      ⚠️ 为什么不用中文当标记：`strings -el` 只吐 ASCII 区间的宽字符，
+#         中文标记根本查不到（查不到就会被当成"没编进去"，假 FAIL）。
+echo "=== v79 代次标记（题干 Markdown 渲染 + 规则输入实时提示）==="
+V79_MD_HDR="$PROJECT_ROOT/R3ShieldCore/shared/r3shieldcore/md_inline.h"
+V79_MD_NS="R3ShieldCoreMd"
+V79_CODEC="$PROJECT_ROOT/R3ShieldCore/shared/r3shieldcore/rules_codec.h"
+V79_HINT_FN="NextStepHint"
+V79_GUI="$PROJECT_ROOT/tools/r3shieldcore_cfg.cpp"
+V79_MARK="R3SHIELDCORE_PREVIEW_EDIT"
+V79_EXE="$DIST_DIR/r3shieldcore-cfg.exe"
+
+if [ ! -f "$V79_MD_HDR" ]; then
+    echo "[FAIL] 缺失: $V79_MD_HDR（Markdown 行内解析器 —— 渲染的前提）"
+    fail=1
+elif ! grep -qF "$V79_MD_NS" "$V79_MD_HDR" 2>/dev/null; then
+    echo "[FAIL] $V79_MD_HDR 里没有 '$V79_MD_NS' —— 解析器命名空间不见了"
+    fail=1
+else
+    echo "[ OK ] 共享头 md_inline.h 在（含 '$V79_MD_NS'）"
+fi
+
+if [ ! -f "$V79_CODEC" ]; then
+    echo "[FAIL] 缺失: $V79_CODEC（输入提示所在）"
+    fail=1
+elif ! grep -qF "$V79_HINT_FN" "$V79_CODEC" 2>/dev/null; then
+    echo "[FAIL] $V79_CODEC 里没有 '$V79_HINT_FN' —— 输入提示被删了"
+    fail=1
+else
+    echo "[ OK ] rules_codec.h 含 '$V79_HINT_FN'（输入提示）"
+fi
+
+if [ ! -f "$V79_GUI" ]; then
+    echo "[FAIL] 缺失: $V79_GUI"
+    fail=1
+else
+    v79_md=0
+    v79_hint=0
+    grep -qF "MdDraw" "$V79_GUI" 2>/dev/null && v79_md=1
+    grep -qF "AdvComputeHint" "$V79_GUI" 2>/dev/null && v79_hint=1
+    if [ "$v79_md" -eq 1 ] && [ "$v79_hint" -eq 1 ]; then
+        echo "[ OK ] cfg 源码里两个接入点都在（MdDraw / AdvComputeHint）"
+    else
+        echo "[FAIL] cfg 源码缺接入点：MdDraw=$v79_md AdvComputeHint=$v79_hint"
+        fail=1
+    fi
+fi
+
+if [ ! -f "$V79_EXE" ]; then
+    echo "[FAIL] 缺失: $V79_EXE"
+    fail=1
+else
+    if strings -el "$V79_EXE" | grep -qwF "$V79_MARK"; then
+        echo "[ OK ] cfg EXE 含 v79 宽串标记 '$V79_MARK'（实时提示/预览支持已编入）"
+    else
+        echo "[FAIL] cfg EXE 缺 v79 宽串标记 '$V79_MARK'（用 strings -el 查）"
+        echo "       ⇒ 包里的 cfg exe 不是 v79 产物（重新 build_cfgtool.sh + deploy_dist.sh）"
+        fail=1
+    fi
+fi
+
+# ---------------------------------------------------------------------------
+# v80 代次标记（「高级」编辑台搬去 cfg + 主程序只留跳转入口）
+# ---------------------------------------------------------------------------
+# ★ 为什么需要这节：v80 改的是**两个发布物**，而且它们之间有一份**契约** ——
+#   · 主程序 `R3 Shield Core.exe`：启动时顺手拉起 cfg，页内留一个跳转按钮；
+#   · cfg `r3shieldcore-cfg.exe`：多了第 3 个页签「高级」+ 单实例/被激活。
+#
+#   契约（窗口类名 / 激活消息名 / 页号 / exe 名）**只定义一处** ——
+#   共享头 `shared/r3shieldcore/cfg_launch.h`（铁律 127）。
+#   两边各写一份的后果是**静默对不上**：主程序照样"启动成功"，窗口却
+#   永远停在第 0 页，而两边都不报错 —— 这正是最难查的一类故障。
+#   ⇒ 所以本节**两侧都要查，而且查的是同一个字符串**。
+#
+# ★ 判据：
+#   ① ★ **前提检查**（铁律 117）：
+#        a) `cfg_launch.h` 存在，且含窗口类名 / 激活消息名 / exe 名；
+#        b) 主程序源码含 `cfg_launch.h` + 跳转动作 `AdvLaunchCfg`；
+#        c) cfg 源码含 `kQuietSwitch`（"顺手拉起"的安静标记）。
+#   ② ★★ **两侧同源**：主程序 exe 与 cfg exe **都**含宽串
+#      `R3ShieldCoreCfg.Activate`（激活消息名）与 `r3shieldcore-cfg.exe`（exe 名）。
+#      ⚠️ 只查一侧的话，"主程序点名 A、cfg 注册的是 B"这种
+#         **点了没反应**的故障查不出来（铁律 195/127）。
+#   ③ 主程序 exe 含宽串 `R3SHIELDCORE_PREVIEW_JUMP`（v80 新增的预览开关）
+#      —— 证明"跳转页"的新代码真的编进了主程序。
+#   ④ cfg exe 含宽串 `R3SHIELDCORE_PREVIEW_LOG`（v80 新增）
+#      —— 证明日志重定向那段真的编进了 cfg。
+#      ⚠️ 宽串必须用 `strings -el`（16 位），`-a` 看的是 8 位世界（铁律 193）。
+echo "=== v80 代次标记（「高级」编辑台搬去 cfg + 主程序跳转入口）==="
+
+V80_HDR="$PROJECT_ROOT/R3ShieldCore/shared/r3shieldcore/cfg_launch.h"
+V80_CLASS="R3ShieldCoreCfgWnd"
+V80_MSG="R3ShieldCoreCfg.Activate"
+V80_EXENAME="r3shieldcore-cfg.exe"
+V80_QUIET="kQuietSwitch"
+V80_MAIN_SRC="$PROJECT_ROOT/R3ShieldCore/R3ShieldCore/r3shieldcore_gui.cpp"
+V80_CFG_SRC="$PROJECT_ROOT/tools/r3shieldcore_cfg.cpp"
+V80_MAIN_EXE="$DIST_DIR/R3 ShieldCore.exe"
+V80_CFG_EXE="$DIST_DIR/r3shieldcore-cfg.exe"
+
+# ① 前提检查
+if [ ! -f "$V80_HDR" ]; then
+    echo "[FAIL] 缺失: $V80_HDR（启动/激活契约的唯一一份定义 —— 两侧同源的前提）"
+    fail=1
+else
+    v80_hdr_ok=1
+    for mark in "$V80_CLASS" "$V80_MSG" "$V80_EXENAME"; do
+        if ! grep -qF "$mark" "$V80_HDR" 2>/dev/null; then
+            echo "[FAIL] $V80_HDR 里没有 '$mark' —— 契约被改了名，两侧会静默对不上"
+            v80_hdr_ok=0
+            fail=1
+        fi
+    done
+    if [ "$v80_hdr_ok" -eq 1 ]; then
+        echo "[ OK ] cfg_launch.h 含契约三件套（类名 / 激活消息 / exe 名）"
+    fi
+fi
+
+if [ ! -f "$V80_MAIN_SRC" ]; then
+    echo "[FAIL] 缺失: $V80_MAIN_SRC"
+    fail=1
+else
+    v80_hdr_inc=0
+    v80_action=0
+    grep -qF "cfg_launch.h" "$V80_MAIN_SRC" 2>/dev/null && v80_hdr_inc=1
+    grep -qF "AdvLaunchCfg" "$V80_MAIN_SRC" 2>/dev/null && v80_action=1
+    if [ "$v80_hdr_inc" -eq 1 ] && [ "$v80_action" -eq 1 ]; then
+        echo "[ OK ] 主程序源码含 cfg_launch.h + 跳转动作 AdvLaunchCfg"
+    else
+        echo "[FAIL] 主程序源码缺：cfg_launch.h=$v80_hdr_inc AdvLaunchCfg=$v80_action"
+        fail=1
+    fi
+fi
+
+if [ ! -f "$V80_CFG_SRC" ]; then
+    echo "[FAIL] 缺失: $V80_CFG_SRC"
+    fail=1
+elif ! grep -qF "$V80_QUIET" "$V80_CFG_SRC" 2>/dev/null; then
+    echo "[FAIL] $V80_CFG_SRC 里没有 '$V80_QUIET' —— 单实例的「安静退出」分支被删了"
+    echo "       （删掉它的后果：UIAccess 父子实例并发拉起时，第二个 cfg 会"
+    echo "         去激活已有窗口、把 cfg 抢到前台打断用户）"
+    fail=1
+else
+    echo "[ OK ] cfg 源码含 '$V80_QUIET'（顺手拉起时安静退出）"
+fi
+
+# ①b ★★ 单实例互斥体名也必须在契约头里（铁律 127/266）
+#
+#   为什么它也算"契约"：这个名字有**两个消费者** ——
+#     ① cfg 自己（拦第二个实例）；② **探针**（判断"上一个 cfg 真的走了"）。
+#   探针不能只看"窗口消没消失"：它清上一轮走的是 `TerminateProcess`（**异步**），
+#   窗口没了而互斥体还在 ⇒ 立刻 `CreateProcess` ⇒ 新实例撞上
+#   `ERROR_ALREADY_EXISTS` ⇒ **静默早退**（连日志都不建，因为早退发生在
+#   stdout 重定向**之前**）⇒ 症状是"窗口没出现"，**看着像崩溃**（铁律 266）。
+#   ⇒ 名字退回成 cfg 里的字面量 = 探针再也拿不到它 = 那个 race 又回来。
+V80_MUTEX="kSingleInstanceMutex"
+V80_MUTEX_STR='Local\R3ShieldCoreCfg.SingleInstance'
+if [ -f "$V80_HDR" ]; then
+    # ⚠️ 必须 `-w`（词边界）—— 裸 `-F` 会让 `kSingleInstanceMutex_TMP` **满足**
+    #    `kSingleInstanceMutex`（子串包含）⇒ 改名后闸门**照样 PASS** = 假绿。
+    #    实测：第一版就是裸 `-qF`，负对照（改名 + `_TMP`）**没变红**（铁律 209）。
+    if grep -qwF "$V80_MUTEX" "$V80_HDR" 2>/dev/null; then
+        echo "[ OK ] cfg_launch.h 含 '$V80_MUTEX'（单实例互斥体名 —— 探针靠它等上一轮真的走了）"
+    else
+        echo "[FAIL] $V80_HDR 里没有 '$V80_MUTEX' —— 互斥体名退回成 cfg 里的字面量了"
+        echo "       （后果：探针只能靠'窗口消失'判断 ⇒ 撞 TerminateProcess 的异步 race，"
+        echo "         表现为「窗口没出现」这种看着像崩溃的假红，铁律 266）"
+        fail=1
+    fi
+fi
+
+# ②③④ dist 的两个发布物
+v80_main_ok=1
+if [ ! -f "$V80_MAIN_EXE" ]; then
+    echo "[FAIL] 缺失: $V80_MAIN_EXE"
+    fail=1
+    v80_main_ok=0
+else
+    if strings -el "$V80_MAIN_EXE" | grep -qF "$V80_MSG"; then
+        echo "[ OK ] 主程序 EXE 含宽串 '$V80_MSG'（它**点名**用的那个消息名）"
+    else
+        echo "[FAIL] 主程序 EXE 缺宽串 '$V80_MSG' ⇒ 跳转那半边没编进去"
+        fail=1
+        v80_main_ok=0
+    fi
+    if strings -el "$V80_MAIN_EXE" | grep -qF "$V80_EXENAME"; then
+        echo "[ OK ] 主程序 EXE 含宽串 '$V80_EXENAME'（它要拉起的那个 exe 名）"
+    else
+        echo "[FAIL] 主程序 EXE 缺宽串 '$V80_EXENAME'"
+        fail=1
+        v80_main_ok=0
+    fi
+    if strings -el "$V80_MAIN_EXE" | grep -qwF "R3SHIELDCORE_PREVIEW_JUMP"; then
+        echo "[ OK ] 主程序 EXE 含 v80 宽串标记 'R3SHIELDCORE_PREVIEW_JUMP'"
+    else
+        echo "[FAIL] 主程序 EXE 缺 v80 宽串标记 'R3SHIELDCORE_PREVIEW_JUMP'"
+        fail=1
+        v80_main_ok=0
+    fi
+fi
+
+if [ ! -f "$V80_CFG_EXE" ]; then
+    echo "[FAIL] 缺失: $V80_CFG_EXE"
+    fail=1
+else
+    if strings -el "$V80_CFG_EXE" | grep -qF "$V80_MSG"; then
+        echo "[ OK ] cfg EXE 含宽串 '$V80_MSG'（它**应答**用的那个消息名 —— 两侧同源）"
+    else
+        echo "[FAIL] cfg EXE 缺宽串 '$V80_MSG' ⇒ 被激活那半边没编进去"
+        echo "       （主程序点名了、cfg 不认，症状就是「点了没反应」）"
+        fail=1
+    fi
+    if strings -el "$V80_CFG_EXE" | grep -qF "$V80_CLASS"; then
+        echo "[ OK ] cfg EXE 含宽串 '$V80_CLASS'（窗口类名 —— 主程序靠它找窗口）"
+    else
+        echo "[FAIL] cfg EXE 缺宽串 '$V80_CLASS'"
+        fail=1
+    fi
+    if strings -el "$V80_CFG_EXE" | grep -qwF "R3SHIELDCORE_PREVIEW_LOG"; then
+        echo "[ OK ] cfg EXE 含 v80 宽串标记 'R3SHIELDCORE_PREVIEW_LOG'"
+    else
+        echo "[FAIL] cfg EXE 缺 v80 宽串标记 'R3SHIELDCORE_PREVIEW_LOG'"
+        fail=1
+    fi
+    # ★ 互斥体名真的编进去了（而不是"常量改了名、字面量还在别处"）
+    #   ⚠️ 同样要 `-w`（见上面 ①b 的说明，铁律 209）。
+    if strings -el "$V80_CFG_EXE" | grep -qwF "$V80_MUTEX_STR"; then
+        echo "[ OK ] cfg EXE 含宽串 '$V80_MUTEX_STR'（单实例互斥体名已编入）"
+    else
+        echo "[FAIL] cfg EXE 缺宽串 '$V80_MUTEX_STR' ⇒ 单实例保护没编进去"
+        fail=1
+    fi
+fi
+if [ "$v80_main_ok" -eq 1 ]; then
+    echo "[ OK ] 主程序 EXE 三件套齐全（消息名 / exe 名 / v80 预览开关）"
+fi
+
+# ---------------------------------------------------------------------------
+# v81 代次标记（配置工具 ⇄ 引擎的命名管道 IPC）
+# ---------------------------------------------------------------------------
+# ★ 为什么需要这节：v81 让 cfg 工具**不再自己 tail 日志文件**，改为向引擎
+#   **索取**「进程内事件流」（`R3ShieldCoreStats` 环形缓冲只活在引擎进程里，
+#   不进共享内存 ⇒ 跨进程只能问）。两侧之间新增一份**线协议契约** ——
+#   管道名 / VERB / 转义规则 / 字段名，全部只定义一处：
+#   共享头 `shared/r3shieldcore/cfg_ipc.h`（铁律 127）。
+#
+# ★★ 谁在服务、谁在请求（这里最容易搞错，写错就会去查错文件）：
+#   · **服务端 = 主程序 `R3 Shield Core.exe`** —— 它才是持有引擎控制块、
+#     能碰 `GlobalHookSession` 共享内存的那个进程（`PollSync(engineControl)`
+#     在主循环里跑）。代码：`R3ShieldCore/r3shieldcore_cfgipc.cpp`，
+#     由 `build.sh` 的 `build_demo` 编进主程序。
+#   · **客户端 = cfg `r3shieldcore-cfg.exe`** —— 它用共享头里的 `Ipc::Call`
+#     发请求。
+#   ⚠️ 我曾一度以为服务端在引擎 DLL 里 —— 错。DLL 里**没有**管道名宽串，
+#      拿"引擎 DLL 缺宽串"当判据会得到**假 FAIL**。判据必须盯**主程序 exe**。
+#
+# ★ 判据：
+#   ① ★ **前提检查**（铁律 117）：
+#        a) `cfg_ipc.h` 存在，且含管道名前缀 / 至少一个 VERB / 转义函数；
+#        b) 服务端源码 `r3shieldcore_cfgipc.cpp` 存在且含 `PipeName`；
+#        c) 客户端源码 `tools/r3shieldcore_cfg.cpp` 含 `cfg_ipc.h` + `Ipc::Call`；
+#        d) `build.sh` 的 sources 里真的列了 `r3shieldcore_cfgipc.cpp`
+#           —— 漏这一行的症状是**链接期十几条 LNK2001**，极易被当"环境问题"；
+#   ② ★★ **两侧同源**：主程序 exe（服务端）与 cfg exe（客户端）
+#      **都**含宽串 `\\.\pipe\R3ShieldCoreCfgIpc`（管道名）。
+#      这是整条链唯一的"接头" —— 任一侧改名 ⇒ 症状是"引擎没在运行"
+#      （伪装成**引擎没跑**，实际是名字对不上），极难查（铁律 195/127）。
+#   ③ 两侧都含窄串 VERB `HELLO`（握手）—— 证明协议常量真的编进去。
+#      ⚠️ 只查一侧的话，"客户端发 HELLO、服务端不认"查不出来。
+#   ④ cfg exe 含 v81 宽串标记 `R3SHIELDCORE_PREVIEW_LOGSRC`
+#      —— 证明"日志页「事件日志 / 服务日志」两项 + 事件日志走服务端"那段界面
+#         真的编进了 cfg。（★ 该标记是**预览环境变量名**，只在预览模式生效。）
+#      ⚠️ 宽串必须用 `strings -el`（16 位），`-a` 看的是 8 位世界（铁律 193）。
+#
+# ★★ 代次标记搬家提醒（铁律 255）：v80 已把「高级」编辑台整块搬去过 cfg，
+#   那次教训是**标记跟着代码走、闸门路径没跟** ⇒ 闸门查了个空文件却**恒 PASS**。
+#   本节的两个宽串都在**当前**所在文件里核实过，不在旧位置。
+echo "=== v81 代次标记（配置工具 ⇄ 引擎 管道 IPC）==="
+
+V81_HDR="$PROJECT_ROOT/R3ShieldCore/shared/r3shieldcore/cfg_ipc.h"
+V81_PIPE_PREFIX='\\.\pipe\R3ShieldCoreCfgIpc'
+V81_VERB="HELLO"
+V81_SRV_SRC="$PROJECT_ROOT/R3ShieldCore/R3ShieldCore/r3shieldcore_cfgipc.cpp"
+V81_CLI_SRC="$PROJECT_ROOT/tools/r3shieldcore_cfg.cpp"
+V81_BUILD="$PROJECT_ROOT/build.sh"
+V81_MAIN_EXE="$DIST_DIR/R3 ShieldCore.exe"
+V81_CFG_EXE="$DIST_DIR/r3shieldcore-cfg.exe"
+
+# ① 前提检查
+v81_pre_ok=1
+if [ ! -f "$V81_HDR" ]; then
+    echo "[FAIL] 缺失: $V81_HDR（线协议契约的唯一一份定义 —— 两侧同源的前提）"
+    fail=1
+    v81_pre_ok=0
+else
+    v81_hdr_pipe=0
+    v81_hdr_verb=0
+    v81_hdr_esc=0
+    grep -qF "R3ShieldCoreCfgIpc" "$V81_HDR" 2>/dev/null && v81_hdr_pipe=1
+    grep -qF "HELLO" "$V81_HDR" 2>/dev/null && v81_hdr_verb=1
+    grep -qE "Escape|Unescape" "$V81_HDR" 2>/dev/null && v81_hdr_esc=1
+    if [ "$v81_hdr_pipe" -eq 1 ] && [ "$v81_hdr_verb" -eq 1 ] && [ "$v81_hdr_esc" -eq 1 ]; then
+        echo "[ OK ] cfg_ipc.h 含契约三件套（管道名 / VERB / 转义规则）"
+    else
+        echo "[FAIL] $V81_HDR 契约不全：管道名=$v81_hdr_pipe VERB=$v81_hdr_verb 转义=$v81_hdr_esc"
+        fail=1
+        v81_pre_ok=0
+    fi
+fi
+
+if [ ! -f "$V81_SRV_SRC" ]; then
+    echo "[FAIL] 缺失: $V81_SRV_SRC（管道服务端实现）"
+    fail=1
+    v81_pre_ok=0
+elif ! grep -qF "PipeName" "$V81_SRV_SRC" 2>/dev/null; then
+    echo "[FAIL] $V81_SRV_SRC 里没有 'PipeName' —— 服务端没接共享头的管道名"
+    fail=1
+    v81_pre_ok=0
+fi
+
+if [ ! -f "$V81_CLI_SRC" ]; then
+    echo "[FAIL] 缺失: $V81_CLI_SRC"
+    fail=1
+    v81_pre_ok=0
+else
+    v81_cli_inc=0
+    v81_cli_call=0
+    grep -qF "cfg_ipc.h" "$V81_CLI_SRC" 2>/dev/null && v81_cli_inc=1
+    grep -qF "Ipc::Call" "$V81_CLI_SRC" 2>/dev/null && v81_cli_call=1
+    if [ "$v81_cli_inc" -eq 1 ] && [ "$v81_cli_call" -eq 1 ]; then
+        echo "[ OK ] cfg 源码含 cfg_ipc.h + 客户端调用 Ipc::Call（走共享头，不自己编协议）"
+    else
+        echo "[FAIL] cfg 源码缺：cfg_ipc.h=$v81_cli_inc Ipc::Call=$v81_cli_call"
+        echo "       （自己另写一份协议 ⇒ 与引擎静默对不上，铁律 127）"
+        fail=1
+        v81_pre_ok=0
+    fi
+fi
+
+if [ ! -f "$V81_BUILD" ]; then
+    echo "[FAIL] 缺失: $V81_BUILD"
+    fail=1
+    v81_pre_ok=0
+elif ! grep -qF "r3shieldcore_cfgipc.cpp" "$V81_BUILD" 2>/dev/null; then
+    echo "[FAIL] build.sh 的 sources 里没有 'r3shieldcore_cfgipc.cpp'"
+    echo "       ⇒ 服务端实现没编进主程序（症状是链接期十几条 LNK2001，"
+    echo "         极易被误当成环境问题）"
+    fail=1
+    v81_pre_ok=0
+fi
+if [ "$v81_pre_ok" -eq 1 ]; then
+    echo "[ OK ] v81 前提齐全（共享头 / 服务端源码 / 客户端接入 / build.sh 源清单）"
+fi
+
+# ② 两侧同源：管道名宽串（这一条是整条链的"接头"）
+if [ ! -f "$V81_MAIN_EXE" ]; then
+    echo "[FAIL] 缺失: $V81_MAIN_EXE（服务端所在进程）"
+    fail=1
+else
+    if strings -el "$V81_MAIN_EXE" | grep -qF "$V81_PIPE_PREFIX"; then
+        echo "[ OK ] 主程序 EXE 含宽串管道名 '$V81_PIPE_PREFIX'（服务端已编入）"
+    else
+        echo "[FAIL] 主程序 EXE 缺宽串管道名 ⇒ 服务端那半边没编进去"
+        echo "       （cfg 会一直显示「引擎未运行」，而引擎其实在跑）"
+        fail=1
+    fi
+fi
+
+if [ ! -f "$V81_CFG_EXE" ]; then
+    echo "[FAIL] 缺失: $V81_CFG_EXE"
+    fail=1
+else
+    if strings -el "$V81_CFG_EXE" | grep -qF "$V81_PIPE_PREFIX"; then
+        echo "[ OK ] cfg EXE 含宽串管道名 '$V81_PIPE_PREFIX'（客户端已编入 —— 两侧同源）"
+    else
+        echo "[FAIL] cfg EXE 缺宽串管道名 ⇒ 客户端那半边没编进去"
+        fail=1
+    fi
+    if strings -el "$V81_CFG_EXE" | grep -qwF "R3SHIELDCORE_PREVIEW_LOGSRC"; then
+        echo "[ OK ] cfg EXE 含 v81 宽串标记 'R3SHIELDCORE_PREVIEW_LOGSRC'（日志页事件日志/服务日志切换已编入）"
+    else
+        echo "[FAIL] cfg EXE 缺 v81 宽串标记 'R3SHIELDCORE_PREVIEW_LOGSRC'"
+        echo "       ⇒ 包里的 cfg exe 不是 v81 产物（重新 build_cfgtool.sh + deploy_dist.sh）"
+        fail=1
+    fi
+fi
+
+# ③ 两侧都含 VERB（协议常量真的编进去）
+if [ -f "$V81_MAIN_EXE" ] && [ -f "$V81_CFG_EXE" ]; then
+    v81_srv_verb=0
+    v81_cli_verb=0
+    strings -a "$V81_MAIN_EXE" | grep -qE "^$V81_VERB$" && v81_srv_verb=1
+    strings -a "$V81_CFG_EXE"  | grep -qE "^$V81_VERB$" && v81_cli_verb=1
+    if [ "$v81_srv_verb" -eq 1 ] && [ "$v81_cli_verb" -eq 1 ]; then
+        echo "[ OK ] 两侧 EXE 都含 VERB '$V81_VERB'（协议常量同源）"
+    else
+        echo "[FAIL] VERB '$V81_VERB' 缺失：主程序=$v81_srv_verb cfg=$v81_cli_verb"
+        echo "       （只查一侧 ⇒ 「客户端发、服务端不认」查不出来）"
+        fail=1
+    fi
+fi
+
+echo ""
 if [ "$fail" -eq 0 ]; then
-    echo "结果: PASS —— dist 与构建产物一致，双架构同代次，且带 v66/v67/v69/v70/v71/v72/v73/v74/v75/v77/v78 标记。"
+    echo "结果: PASS —— dist 与构建产物一致，双架构同代次，且带 v66/v67/v69/v70/v71/v72/v73/v74/v75/v77/v78/v79/v80/v81 标记。"
     exit 0
 fi
 echo "结果: FAIL —— 发布目录与构建产物不同步，**不要打包**。"

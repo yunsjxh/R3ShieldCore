@@ -69,11 +69,42 @@ fi
 
 mkdir -p "$OBJ_DIR" "$OUT_DIR"
 
+# ★ GBK 前置闸门（铁律 46 / 226）—— 与主程序、探针用**同一份**脚本。
+#
+#   为什么这里也要：v80 把「高级」编辑台从主程序搬了过来 —— 那一页里有
+#   `√` `×` `●` 这类符号，而它们**必须**是 CP936 里有的（铁律 244）：
+#   一旦哪个符号编不出，将来只要有人把这段文字送进
+#   `WideCharToMultiByte(CP_ACP)`（日志、剪贴板、导出的都算），
+#   它就会**静默变成 `?`** —— 界面上看不出来，日志里也只是一串问号。
+#
+#   ⚠️ 与窄闸门不同，宽闸门是**保守**的：它不知道某个字面量会不会被转码。
+#      确属"只经 GDI 绘制"的合法假阳性，在那一行加 `// gbk-ok` 豁免。
+if [ -f "tools/check_source_gbk.py" ]; then
+    echo "=== GBK 闸门：窄字面量（C4566 编译期丢字）==="
+    if ! "$PYTHON" tools/check_source_gbk.py tools/r3shieldcore_cfg.cpp; then
+        echo "GBK 闸门未过，停止编译"; exit 1
+    fi
+    echo "=== GBK 闸门：宽字面量（CP_ACP 输出时变 '?'）==="
+    if ! "$PYTHON" tools/check_source_gbk.py --wide \
+        tools/r3shieldcore_cfg.cpp \
+        R3ShieldCore/shared/r3shieldcore/cfg_launch.h; then
+        echo "GBK 宽闸门未过，停止编译"; exit 1
+    fi
+fi
+
 echo ""
 echo "=== 编译 r3shieldcore_cfg.cpp [$ARCH] ==="
+# ★ v80：「高级」页从主程序搬来 ⇒ 现在要 #include 共享头 + 两个"生产同源"
+#   的伪造 codec（都在 R3ShieldCoreLib 下）。三个 -I 与 build.sh 里给引擎的
+#   完全一致（铁律 127：路径只描述一次，别在两处各写一份）。
+#   ★ 这些头全是 inline/纯头 ⇒ **不需要**链任何引擎的 lib，
+#     配置工具仍然是"不注入、不挂钩、不依赖引擎在跑"的独立进程。
 "$CL" -nologo -c -O2 -MT -std:c++20 -EHsc -W3 \
       -source-charset:utf-8 \
       -DNDEBUG -DWIN32 -D_WINDOWS -DUNICODE -D_UNICODE \
+      -I R3ShieldCore/shared \
+      -I R3ShieldCore/shared/libraries \
+      -I R3ShieldCore/R3ShieldCoreLib \
       -Fo"$OBJ_DIR/r3shieldcore_cfg.obj" \
       "tools/r3shieldcore_cfg.cpp" || { echo "[败] 编译失败"; exit 1; }
 

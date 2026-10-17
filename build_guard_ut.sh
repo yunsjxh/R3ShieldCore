@@ -125,6 +125,11 @@ TESTS=(
     # ★ v78：规则脚本接进引擎 —— 值面 / 枚举面在 `registry_guard.cpp`，
     #   剪贴板面在 `clipboard_guard.cpp`（两者都在底座里编好了）。
     "v78_guard_ut|"
+    # ★ v79：题干/解析的 **Markdown 解析** + 规则输入的**实时提示**。
+    #   两者都是纯文本逻辑（`md_inline.h` / `rules_codec.h` 全 header-only），
+    #   不需要额外 obj —— 但**必须**单测：它们"画出来对不对"只能靠截图，
+    #   而"解析对不对"完全可以在毫秒级钉死（铁律 24/28）。
+    "v79_quiz_md_ut|"
 )
 
 DECLARED=${#TESTS[@]}

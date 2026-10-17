@@ -268,6 +268,13 @@ build_demo() {
         R3ShieldCore/engine_control.cpp
         R3ShieldCore/functions.cpp
         R3ShieldCore/r3shieldcore_ark.cpp
+        # ★ v81：配置工具 ⇄ 引擎 的**管道服务端**。
+        #   配置工具的日志页 / 配置页改成"向引擎要数据"（不再自己 tail 文件），
+        #   引擎这边由它回答。协议在共享头 shared/r3shieldcore/cfg_ipc.h。
+        #   ⚠️ 漏掉这一行不会有编译错 —— 只会在链接时冒出十几条
+        #      `_exports.def : LNK2001 无法解析的外部符号 …`（导出表指向的函数
+        #      一个都没编进来），很容易误判成"导出表坏了"。
+        R3ShieldCore/r3shieldcore_cfgipc.cpp
         R3ShieldCore/r3shieldcore_config.cpp
         R3ShieldCore/r3shieldcore_gui.cpp
         R3ShieldCore/r3shieldcore_log_replay.cpp

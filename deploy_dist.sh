@@ -178,9 +178,34 @@ echo ""
 #        文件"）⇒ 从这里删掉与那份口径**一致**，不会让任何闸门变红。
 #      ⚠️ 只删顶层这两个已知名 —— 不用通配 `*.log`，免得将来真有随包发的
 #        日志文件被误删（铁律 117：判据要窄，别顺手扩大）。
-for _stale in r3shieldcore-console.log r3shieldcore-events.log; do
+#
+#      ★★ 2026-10-16 实测缺陷（**静默失效**，必须按下面这样写）：
+#        本机 shell 里 `rm` 是一个**函数**（沙箱注入的 `safe-bin/rm`）。
+#        那个 shim 目录不存在 ⇒ `rm` 退出码 **127**、**什么都没删**，
+#        而旧代码紧接着无条件 `echo "清掉..."` ⇒ **脚本谎报成功**。
+#        后果正是这一步要防的那两条（泄漏 + 夹具读到旧日志），
+#        而且因为 `rm` 的 stderr 混在编译输出里，极难注意到。
+#        ⇒ 两道修：① 用 `command rm` 绕开函数（走真 /bin/rm）；
+#                  ② 删完**回查**文件是否真没了，没删掉就报错退出
+#                     （铁律 142：只喊成功不验结果 = 假绿）。
+#
+#      ★★ 2026-10-16 又发现**第三个**已知名（v80 引入）：
+#        `r3shieldcore-cfg-console.log` —— 它是**配置工具**在预览模式下
+#        被 `R3SHIELDCORE_PREVIEW_LOG` 重定向出来的 stdout（探针每次跑都写）。
+#        探针跑的是 `dist/R3ShieldCore-x64/r3shieldcore-cfg.exe` ⇒ 它就落在
+#        **发布目录**里。它不是随包内容（安装器自测同样归到 runtime artifact），
+#        所以和上面两个一样要清。
+#        ⚠️ 仍然**只列已知名**、不用通配 `*.log`（铁律 117：判据要窄）——
+#          将来真有随包发的日志文件，才不会被误删。
+for _stale in r3shieldcore-console.log r3shieldcore-events.log r3shieldcore-cfg-console.log; do
     if [ -f "$DIST_DIR/$_stale" ]; then
-        rm -f "$DIST_DIR/$_stale"
+        command rm -f "$DIST_DIR/$_stale" 2>/dev/null || true
+        if [ -f "$DIST_DIR/$_stale" ]; then
+            echo "[败] 删不掉运行时残留: $_stale"
+            echo "     （它会随包发出去，且会让夹具读到旧日志 —— 必须解决再打包）"
+            echo "     （本机 `rm` 可能是被注入的 shell 函数；用 'command rm' 绕开）"
+            exit 1
+        fi
         echo "  清掉运行时残留: $_stale"
     fi
 done
