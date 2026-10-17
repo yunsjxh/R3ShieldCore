@@ -2028,6 +2028,23 @@ void ChooseLogTarget(int comboIdx, bool initial) {
 	//      仍然是空的（不是"带着一条别人的规则启动"）。
 	std::wstring g_previewEditText;
 
+	// ★ v82：`R3SHIELDCORE_PREVIEW_ADV=cycle` —— 让界面**真的走一遍**
+	//   闸门 -> 解析 -> 编辑台 的状态切换（-1 = 关）。
+	//
+	//   为什么需要这么一个"演练"模式（实测踩过）：
+	//     直接置状态建窗（`=editor`）时，窗口**第一次**画出来就是编辑台 ——
+	//     中间没有那两次重绘。而"重绘不擦背景"这类缺陷**只在切换时**现形：
+	//     旧状态的摘要/说明行留在原地，新状态的字叠上去 ⇒ 糊成一团。
+	//     ⇒ 光靠"直接置状态"的截图**永远抓不到它**（铁律 24/28 那一类：
+	//       自动化看不见 = 等于没有判据）。
+	//     这个模式用**定时器**驱动，走的正是真实点击那条路
+	//     （`InvalidateRect(hwnd, nullptr, FALSE)`，与按钮点击同款），
+	//     所以它复现的就是用户看到的那一屏。
+	int g_previewCycleStep = -1;
+
+	// 演练用的定时器 id（现有的 1 号是日志刷新，别撞）。
+	constexpr UINT kCycleTimerId = 2;
+
 	// ---------------- 按钮 ----------------
 	//
 	// ★ 一次把**所有**按钮列出来，再按界面状态决定"这一屏显示哪几个" ——
@@ -4083,6 +4100,42 @@ void HandleCfgTrayMessage(HWND hwnd, LPARAM lp) {
 	}
 }
 
+// ★ v82：预览"演练"模式的一步（`R3SHIELDCORE_PREVIEW_ADV=cycle`）。
+//
+//   为什么要有它：闸门 -> 解析 -> 编辑台 是**三个互斥状态**，每次切换都会
+//   重绘。而"重绘前没擦背景"这种缺陷**只在切换时**留下残留 —— 直接置状态
+//   建窗（`=editor`）截出来是干净的，**永远抓不到**（铁律 24/28）。
+//   这个函数用**与按钮点击完全同款**的 `InvalidateRect(..., FALSE)` 推进，
+//   所以它复现的就是用户连点三次时看到的那一屏。
+void AdvancePreviewCycle(HWND hwnd) {
+	switch (g_previewCycleStep) {
+	case 0:
+		// 闸门屏 -> 解析屏（等价于"三道题全对"）。
+		g_advQuizPassed = true;
+		g_advWhyDismissed = false;
+		printf("[adv] 演练：闸门屏 -> 解析屏\n");
+		break;
+	case 1:
+		// 解析屏 -> 编辑台。
+		g_advWhyDismissed = true;
+		printf("[adv] 演练：解析屏 -> 编辑台\n");
+		break;
+	default:
+		// 到编辑台为止；停掉定时器，让画面稳定下来好截图。
+		KillTimer(hwnd, kCycleTimerId);
+		g_previewCycleStep = -1;
+		printf("[adv] 演练：结束（停在编辑台，共切 2 次）\n");
+		fflush(stdout);
+		return;
+	}
+	++g_previewCycleStep;
+	// ★ 与按钮点击**同款**（`bErase=FALSE`）—— 这正是"旧字没被擦掉"的
+	//   触发条件，演练必须原样复现它，不能偷偷传 TRUE 把它绕过去。
+	InvalidateRect(hwnd, nullptr, FALSE);
+	UpdateWindow(hwnd);
+	fflush(stdout);
+}
+
 // ---------- 窗口过程 ----------
 
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
@@ -4315,6 +4368,26 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 		DeleteObject(bmp);
 		DeleteDC(mem);
 
+		// ★★ 先把**正文区底色**填掉，再画内容。
+		//
+		//   为什么必须在这里填、而不是靠 `WM_ERASEBKGND`（实测踩过）：
+		//   正文区里**有直接画在底色上的文字**（高级页的摘要行 / 说明行 ——
+		//   它们底下没有面板，不像规则表那样每次都被 `DrawPanel` 重新填白）。
+		//   而状态切换走的是 `InvalidateRect(hwnd, nullptr, FALSE)` ——
+		//   `bErase=FALSE` **不会**发 `WM_ERASEBKGND` ⇒ 旧文字留在原地，
+		//   新状态的字直接叠上去。症状：quiz → why → editor 三层摘要糊成一片，
+		//   而这个 bug **只在真按顺序点过去时**才现形（探针是直接置状态建窗，
+		//   中间没有那两次重绘 ⇒ 截出来是干净的，铁律 24/28 那一类）。
+		//
+		//   ⇒ 在绘制入口**无条件**填一次，等价于"保证擦除一定发生"，
+		//     这样就不依赖每个 `InvalidateRect` 调用点都记得传 `TRUE`
+		//     （`FALSE` 是有意用的：它少一次擦除、悬停时更不容易闪）。
+		//   ⚠️ 子控件由 `WS_CLIPCHILDREN` 裁掉 ⇒ 这次填充不会盖住它们。
+		{
+			RECT body = { 0, kContentTop, rc.right, rc.bottom };
+			FillSolid(dc, body, kBg);
+		}
+
 		// 内容区：面板底 + 输入框描边。这一片有子控件，**不能**整体双缓冲
 		// （BitBlt 会把子控件一起盖掉）。绘制区已被 WS_CLIPCHILDREN 裁掉
 		// 子控件覆盖的部分，所以直接画是安全的。
@@ -4484,6 +4557,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
 	case WM_TIMER:
 		if (wp == 1) { ReadMore(); }
+		// ★ v82：演练模式的状态推进（见 AdvancePreviewCycle）。
+		if (wp == kCycleTimerId && g_previewCycleStep >= 0) { AdvancePreviewCycle(hwnd); }
 		return 0;
 
 	case WM_COMMAND: {
@@ -5114,6 +5189,12 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) {
 			} else if (_wcsicmp(adv, L"editor") == 0) {
 				g_advQuizPassed = true;
 				g_advWhyDismissed = true;
+			} else if (_wcsicmp(adv, L"cycle") == 0) {
+				// ★ v82：不直接置到编辑台 —— 停在**闸门屏**起步，之后由
+				//   定时器一步步切过去（见 g_previewCycleStep 的注释）。
+				g_advQuizPassed = false;
+				g_advWhyDismissed = false;
+				g_previewCycleStep = 0;
 			}
 		}
 	}
@@ -5170,6 +5251,16 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) {
 	//   写成 SW_SHOW 的话，被自动拉起时也会"跳"到前台打断用户。
 	ShowWindow(g_main, SW_SHOWDEFAULT);
 	UpdateWindow(g_main);
+
+	// ★ v82：演练模式 —— 首帧（闸门屏）画完之后，用定时器一步步切到编辑台。
+	//
+	//   必须在 `UpdateWindow` **之后**起步：我们要的是"闸门屏先真的画出来，
+	//   再切过去"，这样才复现"旧字留在原地"的条件。
+	//   150ms 一步 ⇒ 300ms 走完两次切换；探针那边是窗口出现后等 1200ms 才截图
+	//   ⇒ 截图时已经稳定停在编辑台。
+	if (g_previewCycleStep >= 0) {
+		SetTimer(g_main, kCycleTimerId, 150, nullptr);
+	}
 
 	// ★ 托盘图标：窗口出来了就注册（"关闭窗口 = 收进托盘"的前提）。
 	//

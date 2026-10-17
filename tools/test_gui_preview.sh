@@ -63,6 +63,15 @@ if [ "${#SPECS[@]}" -eq 0 ]; then
         cfg/advanced:quiz
         cfg/advanced:why
         cfg/advanced:editor
+        # ★ v82：`cycle` = 让界面**真的走一遍**闸门 -> 解析 -> 编辑台 的切换。
+        #   为什么必须有这一屏（这是一个真缺陷的判据）：
+        #   摘要行/说明行是**直接画在底色上**的，而状态切换走
+        #   `InvalidateRect(..., FALSE)`（不发 WM_ERASEBKGND）⇒ 旧字留在
+        #   原地、新字叠上去。`editor` 那一屏是**直接置状态建窗**，
+        #   中间没有那次重绘 ⇒ **永远截不到**这个缺陷（铁律 24/28）。
+        #   它必须和 `editor` **成对**：末态相同 ⇒ 像素应当一致；
+        #   比对由下面的 compare_band.py 做（判据在脚本末尾）。
+        cfg/advanced:cycle
         cfg/advanced:typing
         cfg/advanced:error
         # ★ v81：日志页两屏 —— 默认（事件日志）/ 服务日志。
@@ -153,6 +162,40 @@ for spec in "${SPECS[@]}"; do
         python tools/bmp_to_png.py "$bmp" "$png" && rm -f "$bmp"
     fi
 done
+
+# ---------------------------------------------------------------------------
+# ★ v82：`cycle` 与 `editor` 的**像素**比对 —— "重绘不擦背景"的唯一机器判据。
+# ---------------------------------------------------------------------------
+#
+# 为什么单独放在循环外：
+#   探针是**一个规格一个进程**，它看不到"另一屏"的截图；而这条判据天生
+#   需要**两张图**（末态相同 ⇒ 应当像素一致）。所以由脚本在两屏都跑完之后比。
+#
+# 判据带 y=[138,188)：窗口坐标（截图含边框）里，摘要行 ~147..158、
+#   说明行 ~171..182 那一片（下方 159+ 是面板，不参与）。
+#   ⚠️ 这个坐标绑定**标准预览几何**（窗口 1024x740、客户区 1008x701）——
+#      探针建窗的尺寸是写死的，所以它稳定；哪天窗口尺寸变了，这里要跟着改。
+#
+# ⚠️ 只在两屏都真的产出了 PNG 时才比 —— 只跑了单屏（`bash ... cfg/advanced:cycle`）
+#    时跳过并**明说跳过**（否则"没比"会被读成"比过且通过"）。
+CYCLE_PNG="$SHOTS/gui-preview-cfg-advanced-cycle.png"
+EDITOR_PNG="$SHOTS/gui-preview-cfg-advanced-editor.png"
+if [ -f "$CYCLE_PNG" ] && [ -f "$EDITOR_PNG" ]; then
+    echo ""
+    echo "---- 像素判据: cycle 末态 vs editor（摘要行/说明行那一带）----"
+    python tools/compare_band.py "$CYCLE_PNG" "$EDITOR_PNG" 138 188 0 1010
+    rc=$?
+    if [ "$rc" -eq 0 ]; then
+        echo "  [ OK ] 走完状态切换后，摘要行/说明行与直接进编辑台**像素一致**（没有残留叠字）"
+    else
+        echo "  [FAIL] 走完状态切换后那一带**多出内容** —— 重绘没擦背景，旧状态的字留在原地"
+        echo "         （这就是 v82 修掉的那个真缺陷；判据带见 tools/compare_band.py 的注释）"
+        rc_all=1
+    fi
+else
+    echo ""
+    echo "---- 像素判据: 跳过（需要同时跑 cfg/advanced:editor 与 cfg/advanced:cycle）----"
+fi
 
 echo ""
 echo "=== 结果 ==="

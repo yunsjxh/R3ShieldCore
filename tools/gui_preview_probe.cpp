@@ -432,31 +432,54 @@ namespace
 		//   只有"紫=0"那种时刻才会偶发红 —— 症状被误读成"偶发失败"。
 		//   ⇒ 改用「TOPMOST → NOTOPMOST」把它抬到 z 序最前（**不需要**前台权），
 		//     并且**必须验证**"这个屏幕位置上真的是它"（下面那段）。
-		if (IsIconic(hwnd)) {
-			ShowWindow(hwnd, SW_RESTORE);   // 最小化状态下 SetWindowPos 也抬不上来
-		}
-		SetForegroundWindow(hwnd);
-		SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0,
-			SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW | SWP_NOACTIVATE);
-		SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0,
-			SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW | SWP_NOACTIVATE);
+		//
+		//   ★★ v82 追加：**抬一次不够** —— 探针跑的时候用户可能正在用别的
+		//      程序（实测：浏览器会不断抢回前台）。只抬一次的话，抬完到
+		//      `BitBlt` 之间那几毫秒里就可能被压回去，症状是"偶发红"。
+		//      ⇒ 抬 + 验证 + 不成再抬，重试几次（见下面那段）。
+		auto RaiseToFront = [&]() {
+			if (IsIconic(hwnd)) {
+				ShowWindow(hwnd, SW_RESTORE);   // 最小化状态下 SetWindowPos 也抬不上来
+			}
+			SetForegroundWindow(hwnd);
+			SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+				SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW | SWP_NOACTIVATE);
+			SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0,
+				SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW | SWP_NOACTIVATE);
+		};
+		RaiseToFront();
 		Sleep(1200);   // 等首帧 + 页签切换生效
 
 		// ---- 取窗口矩形（含边框，截图更像"真窗口"）----
 		RECT wr = {};
 		GetWindowRect(hwnd, &wr);
-		const int width = wr.right - wr.left;
-		const int height = wr.bottom - wr.top;
 
 		// ★★ 硬闸门：这个屏幕位置上**真的**是我们要截的那个窗口吗？
 		//
 		//   不查这一步，下面所有像素判据都可能在一个**无关窗口**上求值 ——
 		//   而且**照样能过**（假绿），或莫名其妙红（假红）。这是"截图核对"
 		//   这类判据最容易塌掉的地方：判据本身写得很对，只是**看的不是那个东西**。
+		//
+		//   ★ v82：验证不通过时**先重试抬一次**（最多 6 次），而不是直接认输 ——
+		//     用户的浏览器/编辑器随时可能抢回前台，重试能把"偶发干扰"吸收掉。
+		//     试完仍被压住才报红（那时是真有问题，比如某个置顶窗口）。
+		HWND atRoot = nullptr;
 		{
-			const POINT mid = { (wr.left + wr.right) / 2, (wr.top + wr.bottom) / 2 };
-			HWND atPoint = WindowFromPoint(mid);
-			HWND atRoot = atPoint ? GetAncestor(atPoint, GA_ROOT) : nullptr;
+			for (int attempt = 0; attempt < 6; ++attempt) {
+				const POINT mid = { (wr.left + wr.right) / 2, (wr.top + wr.bottom) / 2 };
+				HWND atPoint = WindowFromPoint(mid);
+				atRoot = atPoint ? GetAncestor(atPoint, GA_ROOT) : nullptr;
+				if (atRoot == hwnd) {
+					break;
+				}
+				WCHAR cls[128] = {};
+				GetClassNameW(atRoot ? atRoot : GetDesktopWindow(), cls, _countof(cls));
+				printf("[gui-preview-probe] 窗口被「%ls」压住，重试抬到最前（第 %d/6 次）\n",
+					cls, attempt + 1);
+				RaiseToFront();
+				Sleep(300);
+				GetWindowRect(hwnd, &wr);
+			}
 			Check(atRoot == hwnd,
 				"屏幕该位置上的顶层窗口就是被截的那个（没被别的窗口压住）");
 			if (atRoot != hwnd) {
@@ -468,6 +491,8 @@ namespace
 			}
 		}
 
+		const int width = wr.right - wr.left;
+		const int height = wr.bottom - wr.top;
 		RECT cr = {};
 		GetClientRect(hwnd, &cr);
 		printf("[gui-preview-probe] 窗口 %dx%d，客户区 %dx%d，页签=%ls\n",
@@ -534,9 +559,12 @@ namespace
 		Check(ratio > 3.0, "画面上有内容（非白像素 > 3%）");
 
 
-		// 编辑台（含 v79 的两屏"输入中"）才有右侧的改前/改后对照区。
+		// 编辑台（含 v79 的两屏"输入中"，以及 v82 的"演练"末态）才有右侧的
+		// 改前/改后对照区。
+		//   ★ v82 `cycle`：它从闸门屏起步、切两次后**停在编辑台** ⇒ 末态
+		//     与 `editor` 完全一样（含对照区），所以这里要把它算进来。
 		const bool editorLike = (advMode == L"editor" || advMode == L"typing"
-			|| advMode == L"error");
+			|| advMode == L"error" || advMode == L"cycle");
 		if (tab == L"advanced") {
 			// 紫色是 Spoof 的语义色：判定/改后两列都用它，出现即说明对照区画出来了。
 			// ⚠️ 这一条只在**编辑台**那几屏成立 —— 闸门屏/解析屏根本没有对照区，
@@ -611,6 +639,30 @@ namespace
 			else if (advMode == L"why") {
 				Check(LogContains(logPath, L"闸门=1 编辑框=0"),
 					"日志报「闸门=1 编辑框=0」（截到的是**刚全对的解析屏**）");
+			}
+			else if (advMode == L"cycle") {
+				// ★ v82：演练模式 —— 从闸门屏起步，切两次后停在编辑台。
+				//
+				//   为什么值得单开一屏（这是一个**真缺陷**的判据）：
+				//   界面状态切换时若重绘不擦背景，旧状态的摘要/说明行会留在
+				//   原地、新状态的字叠上去 ⇒ 糊成一团。而"直接置状态建窗"
+				//   （`=editor`）**永远截不到**它 —— 那种跑法没有中间那次重绘。
+				//
+				//   ⚠️ 下面第一条查的是 `闸门=0 编辑框=0`：那是**首帧**的状态。
+				//      理由：`[adv] 页面已绘制` 那句带 `paintedOnce` 静态，
+				//      **只在第一次绘制时打**（见 r3shieldcore_cfg.cpp）——
+				//      所以它报的是"闸门屏"，而不是切换后的编辑台。
+				//      这正好也证明了"首帧确实是闸门屏"（演练的起点对）。
+				Check(LogContains(logPath, L"闸门=0 编辑框=0"),
+					"日志报「闸门=0 编辑框=0」（首帧是闸门屏 —— 演练确实从闸门起步）");
+				Check(LogContains(logPath, L"[adv] 演练：闸门屏 -> 解析屏")
+						&& LogContains(logPath, L"[adv] 演练：解析屏 -> 编辑台"),
+					"日志报两次「演练：…」（真的切过去了，不是一步到位）");
+				Check(LogContains(logPath, L"[adv] 演练：结束（停在编辑台"),
+					"日志报「演练：结束（停在编辑台）」（末态与 `editor` 一致）");
+				// ★ 逐像素判据不在这里 —— 见 tools/compare_band.py：
+				//   它把这一屏的**摘要行**与 `editor` 那一屏逐像素比对。
+				//   两屏末态相同 ⇒ 像素必须一致；不一致就是"有残留叠字"。
 			}
 			else {
 				Check(LogContains(logPath, L"闸门=0 编辑框=0"),
