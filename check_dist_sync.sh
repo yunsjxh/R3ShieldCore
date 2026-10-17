@@ -1588,9 +1588,78 @@ if [ -f "$V82_MAIN_EXE" ] && [ -f "$V82_CFG_EXE" ]; then
     fi
 fi
 
+# ---------------------------------------------------------------------------
+# v83 代次标记（液态玻璃材质：背景模糊 + 圆角面板 + 玻璃片）
+# ---------------------------------------------------------------------------
+#
+# ★ 为什么需要这节：v83 是**纯界面**改动，恰恰最容易"编进去了但没生效" ——
+#   玻璃层是**运行时**建的（捕获屏幕 / 建 DIB / 合成），任何一步失败都只是
+#   `active=false`、退回不透明外观，**界面照常弹出来、日志也不报错**。
+#   所以这里查三件事：
+#     ① 共享头在、且关键实现还在（材质只有一份，铁律 127）；
+#     ② 两个 exe 都含**宽串**代次标记（真编进去了 —— 中文窄字面量 `strings -el`
+#        查不到，v82 踩过，故标记必须是宽串）；
+#     ③ 两侧源码都还**调用**玻璃层入口（`g_glass.Begin(`）——
+#        这是"重构时被顺手删掉"最可能发生的一处回归。
+echo "=== v83 代次标记（液态玻璃材质）==="
+V83_HDR="$PROJECT_ROOT/R3ShieldCore/shared/r3shieldcore/ui_material.h"
+V83_MARKER="R3ShieldCoreGlass.v83"
+V83_MAIN_SRC="$PROJECT_ROOT/R3ShieldCore/R3ShieldCore/r3shieldcore_gui.cpp"
+V83_CFG_SRC="$PROJECT_ROOT/tools/r3shieldcore_cfg.cpp"
+V83_MAIN_EXE="$DIST_DIR/R3 ShieldCore.exe"
+V83_CFG_EXE="$DIST_DIR/r3shieldcore-cfg.exe"
+
+if [ ! -f "$V83_HDR" ]; then
+    echo "[FAIL] 缺失: $V83_HDR（材质唯一一份定义 —— 两 exe 同源的前提）"
+    fail=1
+else
+    v83_hdr_ok=1
+    for sym in "ComposeGlassPanel" "ComposeGlassChip" "BuildBlurLevels" "ApplyRoundedWindow" "GlassEnabled"; do
+        if grep -qwF "$sym" "$V83_HDR" 2>/dev/null; then
+            echo "[ OK ] ui_material.h 含 '$sym'"
+        else
+            echo "[FAIL] ui_material.h 里没有 '$sym' —— 玻璃/模糊/圆角实现被改动或删掉了"
+            v83_hdr_ok=0
+        fi
+    done
+    if grep -qwF "$V83_MARKER" "$V83_HDR" 2>/dev/null; then
+        echo "[ OK ] ui_material.h 含代次标记 '$V83_MARKER'"
+    else
+        echo "[FAIL] ui_material.h 里没有代次标记 '$V83_MARKER'"
+        v83_hdr_ok=0
+    fi
+    [ "$v83_hdr_ok" -eq 1 ] || fail=1
+fi
+
+# ② 两侧源码都还接在玻璃层上（不是"头在、没人用"）
+for pair in "main|$V83_MAIN_SRC" "cfg|$V83_CFG_SRC"; do
+    who="${pair%%|*}"; src="${pair#*|}"
+    if [ -f "$src" ] && grep -qF "g_glass.Begin(" "$src" 2>/dev/null; then
+        echo "[ OK ] $who 源码仍调用玻璃层入口 g_glass.Begin("
+    else
+        echo "[FAIL] $who 源码里找不到 g_glass.Begin( —— 玻璃层被旁路了（界面会退回不透明）"
+        fail=1
+    fi
+done
+
+# ③ 两个 exe 都含宽串代次标记（真编进去了）
+if [ -f "$V83_MAIN_EXE" ] && [ -f "$V83_CFG_EXE" ]; then
+    v83_main_mark=0
+    v83_cfg_mark=0
+    strings -el "$V83_MAIN_EXE" | grep -qwF "$V83_MARKER" && v83_main_mark=1
+    strings -el "$V83_CFG_EXE"  | grep -qwF "$V83_MARKER" && v83_cfg_mark=1
+    if [ "$v83_main_mark" -eq 1 ] && [ "$v83_cfg_mark" -eq 1 ]; then
+        echo "[ OK ] 两侧 EXE 都含宽串代次标记 '$V83_MARKER'（液态玻璃已编入）"
+    else
+        echo "[FAIL] 宽串代次标记 '$V83_MARKER' 缺失：主程序=$v83_main_mark cfg=$v83_cfg_mark"
+        echo "       ⇒ 包里的 exe 不是 v83 产物（重新 build.sh + build_cfgtool.sh + deploy_dist.sh）"
+        fail=1
+    fi
+fi
+
 echo ""
 if [ "$fail" -eq 0 ]; then
-    echo "结果: PASS —— dist 与构建产物一致，双架构同代次，且带 v66/v67/v69/v70/v71/v72/v73/v74/v75/v77/v78/v79/v80/v81/v82 标记。"
+    echo "结果: PASS —— dist 与构建产物一致，双架构同代次，且带 v66/v67/v69/v70/v71/v72/v73/v74/v75/v77/v78/v79/v80/v81/v82/v83 标记。"
     exit 0
 fi
 echo "结果: FAIL —— 发布目录与构建产物不同步，**不要打包**。"

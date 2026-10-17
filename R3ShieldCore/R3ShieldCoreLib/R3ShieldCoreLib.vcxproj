@@ -111,7 +111,7 @@
     <Link>
       <SubSystem>Windows</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
-      <AdditionalDependencies>MinHook/libMinHook.d.x86.lib;comctl32.lib;gdi32.lib;wintrust.lib;crypt32.lib;taskschd.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>MinHook/libMinHook.d.x86.lib;comctl32.lib;gdi32.lib;wintrust.lib;crypt32.lib;taskschd.lib;wtsapi32.lib;mfplat.lib;mfuuid.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <ModuleDefinitionFile>_exports.def</ModuleDefinitionFile>
     </Link>
   </ItemDefinitionGroup>
@@ -130,7 +130,7 @@
     <Link>
       <SubSystem>Windows</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
-      <AdditionalDependencies>MinHook/libMinHook.d.x64.lib;comctl32.lib;gdi32.lib;wintrust.lib;crypt32.lib;taskschd.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>MinHook/libMinHook.d.x64.lib;comctl32.lib;gdi32.lib;wintrust.lib;crypt32.lib;taskschd.lib;wtsapi32.lib;mfplat.lib;mfuuid.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <ModuleDefinitionFile>_exports.def</ModuleDefinitionFile>
     </Link>
   </ItemDefinitionGroup>
@@ -152,7 +152,7 @@
       <GenerateDebugInformation>false</GenerateDebugInformation>
       <EnableCOMDATFolding>true</EnableCOMDATFolding>
       <OptimizeReferences>true</OptimizeReferences>
-      <AdditionalDependencies>MinHook/libMinHook.x86.lib;comctl32.lib;gdi32.lib;wintrust.lib;crypt32.lib;taskschd.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>MinHook/libMinHook.x86.lib;comctl32.lib;gdi32.lib;wintrust.lib;crypt32.lib;taskschd.lib;wtsapi32.lib;mfplat.lib;mfuuid.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <ModuleDefinitionFile>_exports.def</ModuleDefinitionFile>
     </Link>
   </ItemDefinitionGroup>
@@ -174,7 +174,7 @@
       <GenerateDebugInformation>false</GenerateDebugInformation>
       <EnableCOMDATFolding>true</EnableCOMDATFolding>
       <OptimizeReferences>true</OptimizeReferences>
-      <AdditionalDependencies>MinHook/libMinHook.x64.lib;comctl32.lib;gdi32.lib;wintrust.lib;crypt32.lib;taskschd.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>MinHook/libMinHook.x64.lib;comctl32.lib;gdi32.lib;wintrust.lib;crypt32.lib;taskschd.lib;wtsapi32.lib;mfplat.lib;mfuuid.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <ModuleDefinitionFile>_exports.def</ModuleDefinitionFile>
     </Link>
   </ItemDefinitionGroup>
@@ -194,7 +194,12 @@
     <ClCompile Include="driver_guard.cpp" />
     <ClCompile Include="file_guard.cpp" />
     <ClCompile Include="host_hijack_guard.cpp" />
-    <ClCompile Include="inject_policy.cpp" />
+    <ClCompile Include="inject_policy.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
     <ClCompile Include="process_guard.cpp" />
     <ClCompile Include="network_guard.cpp" />
     <ClCompile Include="camera_guard.cpp" />

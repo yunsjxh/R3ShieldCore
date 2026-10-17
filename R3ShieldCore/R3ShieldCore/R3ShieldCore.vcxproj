@@ -103,7 +103,7 @@
       <SubSystem>Windows</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <AdditionalManifestDependencies>type=%27Win32%27 name=%27Microsoft.Windows.Common-Controls%27 version=%276.0.0.0%27 processorArchitecture=%27*%27 publicKeyToken=%276595b64144ccf1df%27 language=%27*%27;%(AdditionalManifestDependencies)</AdditionalManifestDependencies>
-        <AdditionalDependencies>gdi32.lib;comctl32.lib;advapi32.lib;psapi.lib;%(AdditionalDependencies)</AdditionalDependencies>
+        <AdditionalDependencies>gdi32.lib;comctl32.lib;advapi32.lib;psapi.lib;dwmapi.lib;msimg32.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
     <ResourceCompile>
       <Culture>0x0409</Culture>
@@ -141,7 +141,7 @@
       <SubSystem>Windows</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <AdditionalManifestDependencies>type=%27Win32%27 name=%27Microsoft.Windows.Common-Controls%27 version=%276.0.0.0%27 processorArchitecture=%27*%27 publicKeyToken=%276595b64144ccf1df%27 language=%27*%27;%(AdditionalManifestDependencies)</AdditionalManifestDependencies>
-        <AdditionalDependencies>gdi32.lib;comctl32.lib;advapi32.lib;psapi.lib;%(AdditionalDependencies)</AdditionalDependencies>
+        <AdditionalDependencies>gdi32.lib;comctl32.lib;advapi32.lib;psapi.lib;dwmapi.lib;msimg32.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
     <ResourceCompile>
       <Culture>0x0409</Culture>
@@ -176,7 +176,7 @@
     <Link>
       <SubSystem>Windows</SubSystem>
       <AdditionalManifestDependencies>type=%27Win32%27 name=%27Microsoft.Windows.Common-Controls%27 version=%276.0.0.0%27 processorArchitecture=%27*%27 publicKeyToken=%276595b64144ccf1df%27 language=%27*%27;%(AdditionalManifestDependencies)</AdditionalManifestDependencies>
-        <AdditionalDependencies>gdi32.lib;comctl32.lib;advapi32.lib;psapi.lib;%(AdditionalDependencies)</AdditionalDependencies>
+        <AdditionalDependencies>gdi32.lib;comctl32.lib;advapi32.lib;psapi.lib;dwmapi.lib;msimg32.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <GenerateDebugInformation>false</GenerateDebugInformation>
       <UACExecutionLevel>asInvoker</UACExecutionLevel>
     </Link>
@@ -214,7 +214,7 @@
     <Link>
       <SubSystem>Windows</SubSystem>
       <AdditionalManifestDependencies>type=%27Win32%27 name=%27Microsoft.Windows.Common-Controls%27 version=%276.0.0.0%27 processorArchitecture=%27*%27 publicKeyToken=%276595b64144ccf1df%27 language=%27*%27;%(AdditionalManifestDependencies)</AdditionalManifestDependencies>
-        <AdditionalDependencies>gdi32.lib;comctl32.lib;advapi32.lib;psapi.lib;%(AdditionalDependencies)</AdditionalDependencies>
+        <AdditionalDependencies>gdi32.lib;comctl32.lib;advapi32.lib;psapi.lib;dwmapi.lib;msimg32.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <GenerateDebugInformation>false</GenerateDebugInformation>
       <UACExecutionLevel>asInvoker</UACExecutionLevel>
     </Link>
@@ -239,10 +239,20 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="app.cpp" />
+    <ClCompile Include="ark_actions.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
     <ClCompile Include="engine_control.cpp" />
     <ClCompile Include="functions.cpp" />
     <ClCompile Include="r3shieldcore_config.cpp" />
     <ClCompile Include="r3shieldcore_gui.cpp" />
+    <ClCompile Include="r3shieldcore_ark.cpp" />
+    <ClCompile Include="r3shieldcore_cfgipc.cpp" />
+    <ClCompile Include="r3shieldcore_log_replay.cpp" />
+    <ClCompile Include="r3shieldcore_procwatch.cpp" />
     <ClCompile Include="r3shieldcore_sentinel.cpp" />
     <ClCompile Include="r3shieldcore_stats.cpp" />
     <ClCompile Include="r3shieldcore_superdesk.cpp" />
@@ -254,11 +264,16 @@
     </ClCompile>
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="ark_actions.h" />
     <ClInclude Include="engine_control.h" />
     <ClInclude Include="engine_deploy_acl.h" />
     <ClInclude Include="functions.h" />
     <ClInclude Include="r3shieldcore_config.h" />
     <ClInclude Include="r3shieldcore_gui.h" />
+    <ClInclude Include="r3shieldcore_ark.h" />
+    <ClInclude Include="r3shieldcore_cfgipc.h" />
+    <ClInclude Include="r3shieldcore_log_replay.h" />
+    <ClInclude Include="r3shieldcore_procwatch.h" />
     <ClInclude Include="r3shieldcore_sentinel.h" />
     <ClInclude Include="r3shieldcore_stats.h" />
     <ClInclude Include="r3shieldcore_superdesk.h" />
