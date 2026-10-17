@@ -1657,9 +1657,82 @@ if [ -f "$V83_MAIN_EXE" ] && [ -f "$V83_CFG_EXE" ]; then
     fi
 fi
 
+# ---------------------------------------------------------------------------
+# v84 代次标记（OpenGL 玻璃后端 + 两套界面可切换）
+# ---------------------------------------------------------------------------
+#
+# ★ 为什么需要这节：v84 加了两样**运行时才生效**的东西：
+#   ① OpenGL 玻璃后端 —— 建不出 3.3 core 上下文时会**静默**退回 CPU 合成
+#      （界面上仍然"有玻璃"，但用的不是 GL）。光看界面区分不出来。
+#   ② 界面风格切换 —— `classic` 模式下整套玻璃层都不跑。
+#   两者都属于"编进去了但可能没跑"的类型 ⇒ 判据要盯**产物里有这坨代码**。
+#
+# ★ 判据只查**宽串标记**（中文窄字面量 `strings -el` 查不到，v82 踩过）。
+echo "=== v84 代次标记（OpenGL 后端 + 界面风格切换）==="
+V84_GL_HDR="$PROJECT_ROOT/R3ShieldCore/shared/r3shieldcore/ui_gl.h"
+V84_STYLE_HDR="$PROJECT_ROOT/R3ShieldCore/shared/r3shieldcore/ui_style.h"
+V84_GL_MARK="R3ShieldCoreGL.v84"
+V84_STYLE_MARK="R3ShieldCoreUiStyle.v84"
+V84_MAIN_SRC="$PROJECT_ROOT/R3ShieldCore/R3ShieldCore/r3shieldcore_gui.cpp"
+V84_CFG_SRC="$PROJECT_ROOT/tools/r3shieldcore_cfg.cpp"
+V84_MAIN_EXE="$DIST_DIR/R3 ShieldCore.exe"
+V84_CFG_EXE="$DIST_DIR/r3shieldcore-cfg.exe"
+
+v84_ok=1
+if [ ! -f "$V84_GL_HDR" ]; then
+    echo "[FAIL] 缺失: $V84_GL_HDR（GL 后端的唯一一份实现）"
+    v84_ok=0
+else
+    for sym in "wglCreateContextAttribsARB" "sdRoundBox" "glReadPixels" "PanelDraw"; do
+        if grep -qF "$sym" "$V84_GL_HDR" 2>/dev/null; then
+            echo "[ OK ] ui_gl.h 含 '$sym'"
+        else
+            echo "[FAIL] ui_gl.h 里没有 '$sym' —— GL 后端被改动或删掉了"
+            v84_ok=0
+        fi
+    done
+fi
+if [ ! -f "$V84_STYLE_HDR" ]; then
+    echo "[FAIL] 缺失: $V84_STYLE_HDR（界面风格契约）"
+    v84_ok=0
+else
+    if grep -qF "LoadStyle" "$V84_STYLE_HDR" 2>/dev/null && grep -qF "classic" "$V84_STYLE_HDR" 2>/dev/null; then
+        echo "[ OK ] ui_style.h 含风格读写（LoadStyle / classic）"
+    else
+        echo "[FAIL] ui_style.h 里没有风格读写 —— 两套界面切换被拆了"
+        v84_ok=0
+    fi
+fi
+# 两侧都真的调 Init（不是"头在、没人用"）
+for pair in "main|$V84_MAIN_SRC|g_gl.Init()" "cfg|$V84_CFG_SRC|g_cfgGl.Init()"; do
+    who="${pair%%|*}"; rest="${pair#*|}"; src="${rest%%|*}"; call="${rest#*|}"
+    if [ -f "$src" ] && grep -qF "$call" "$src" 2>/dev/null; then
+        echo "[ OK ] $who 源码仍初始化 GL 后端（$call）"
+    else
+        echo "[FAIL] $who 源码里找不到 $call —— GL 后端被旁路（只会用 CPU 合成）"
+        v84_ok=0
+    fi
+done
+[ "$v84_ok" -eq 1 ] || fail=1
+
+if [ -f "$V84_MAIN_EXE" ] && [ -f "$V84_CFG_EXE" ]; then
+    for mk in "$V84_GL_MARK" "$V84_STYLE_MARK"; do
+        m1=0
+        m2=0
+        strings -el "$V84_MAIN_EXE" | grep -qwF "$mk" && m1=1
+        strings -el "$V84_CFG_EXE"  | grep -qwF "$mk" && m2=1
+        if [ "$m1" -eq 1 ] && [ "$m2" -eq 1 ]; then
+            echo "[ OK ] 两侧 EXE 都含宽串标记 '$mk'"
+        else
+            echo "[FAIL] 宽串标记 '$mk' 缺失：主程序=$m1 cfg=$m2（包里的 exe 不是 v84 产物）"
+            fail=1
+        fi
+    done
+fi
+
 echo ""
 if [ "$fail" -eq 0 ]; then
-    echo "结果: PASS —— dist 与构建产物一致，双架构同代次，且带 v66/v67/v69/v70/v71/v72/v73/v74/v75/v77/v78/v79/v80/v81/v82/v83 标记。"
+    echo "结果: PASS —— dist 与构建产物一致，双架构同代次，且带 v66/v67/v69/v70/v71/v72/v73/v74/v75/v77/v78/v79/v80/v81/v82/v83/v84 标记。"
     exit 0
 fi
 echo "结果: FAIL —— 发布目录与构建产物不同步，**不要打包**。"

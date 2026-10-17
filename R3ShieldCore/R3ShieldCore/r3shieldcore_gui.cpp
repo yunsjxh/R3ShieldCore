@@ -35,6 +35,12 @@
 //   绘制侧**唯一实现**，cfg 那边 #include 同一份 —— 铁律 127。
 #include <r3shieldcore/ui_material.h>
 
+// ★ v84：OpenGL 玻璃后端（真正的着色器实现）。失败会自动退回上面那套 CPU 合成。
+#include <r3shieldcore/ui_gl.h>
+
+// ★ v84：界面风格的契约（两个 exe 共用，铁律 127）。
+#include <r3shieldcore/ui_style.h>
+
 //
 // 界面布局
 // ========
@@ -243,6 +249,53 @@ namespace
 			}
 		}
 		return static_cast<float>(dpi) / 96.0f;
+	}
+
+	// ---------------------------------------------------------------------
+	// ★★ v84：**两套界面可切换** —— 「液态玻璃」/「经典」
+	//
+	//   用户要求（原话）：「做两个可切换的界面版本，一个是用 OpenGL，
+	//   另一个是原来的界面」。
+	//   · 经典 = v82 那套完全不透明的平面界面（结构一模一样，只是不铺玻璃层）
+	//   · 液态玻璃 = GL 着色器（不可用时自动退到 CPU 合成，外观基本一致）
+	//
+	//   取值与环境变量 / 设置文件的规则**只在 ui_style.h 里写一份**（铁律 127）：
+	//   两个 exe 共用，包括托盘里那个「界面：…」文案。
+	// ---------------------------------------------------------------------
+	using R3ShieldCoreUi::Style;
+	Style g_uiStyle = Style::Glass;
+
+	// OpenGL 后端实例（进程级；Init 失败就一直是 CPU 合成）
+	R3ShieldCoreUi::GlGlass g_gl;
+
+	// 把 GlassSurface 的面板表翻译成 GL 后端的入参并渲染。
+	// ★ 这是 CPU / GPU 两条路唯一的分叉点：都产出同一块 top-down BGRA 缓冲。
+	void GlComposeBridge(void* ctx, const R3ShieldCoreUi::Backdrop& bd,
+		const R3ShieldCoreUi::PanelRec* panels, int count,
+		int headerBand, float headerVeil,
+		int w, int h, float dpi, BYTE* out)
+	{
+		auto* gl = static_cast<R3ShieldCoreUi::GlGlass*>(ctx);
+		R3ShieldCoreUi::GlGlass::PanelDraw list[96];
+		const int n = count < 96 ? count : 96;
+		for (int i = 0; i < n; ++i) {
+			list[i].x0 = panels[i].x0;
+			list[i].y0 = panels[i].y0;
+			list[i].x1 = panels[i].x1;
+			list[i].y1 = panels[i].y1;
+			list[i].radius = panels[i].radius;
+			list[i].tint = panels[i].tint;
+			list[i].kind = panels[i].kind;
+		}
+		if (!gl->Render(bd.full.bits, bd.full.w, bd.full.h, list, n,
+			headerBand, headerVeil, w, h, dpi, out)) {
+			// ★★ GL 中途失败（设备丢失 / 驱动异常）⇒ **当场退回 CPU**，并把钩子摘掉。
+			//   不摘的话每帧都会重试、每帧都要多花一次失败的 GL 调用。
+			g_glass.glCompose = nullptr;
+			R3ShieldCoreUi::PaintBackdropBase(out, w, h, bd,
+				R3ShieldCoreUi::DefaultTheme(), R3ShieldCoreUi::DefaultTheme().veil);
+			printf("[glass] 警告：GL 合成本帧失败，已退回 CPU 合成（后续不再尝试 GL）\n");
+		}
 	}
 
 	// ---------------------------------------------------------------------
@@ -3730,17 +3783,33 @@ namespace
 		const bool wantBackdrop = g_glassWantBackdrop ||
 			(GetTickCount64() - g_glassMovedAt) < 1200;   // 拖动/缩放期间持续刷新
 		g_glass.headerBand = TabBarTop + TabBarHeight;   // 顶栏 + 页签条共用一块薄纱
-		g_glass.headerVeil = 0.30f;
-		if (g_glass.Begin(hwnd, client.right, client.bottom, dpi, wantBackdrop)) {
+		g_glass.headerVeil = 0.20f;
+
+		// ★ 风格门：经典模式下**不进**玻璃层（`active` 保持 false ⇒ 走老绘制路径）。
+		const bool glassWanted = (g_uiStyle == Style::Glass);
+		if (!glassWanted) {
+			g_glass.active = false;
+		}
+		if (glassWanted) {
+			// GPU 就绪就走 GL；否则 glCompose 为空 ⇒ CPU 合成（ui_material.h）。
+			if (g_gl.Ready()) {
+				g_glass.glCompose = GlComposeBridge;
+				g_glass.glCtx = &g_gl;
+			} else {
+				g_glass.glCompose = nullptr;
+			}
+		}
+		if (glassWanted && g_glass.Begin(hwnd, client.right, client.bottom, dpi, wantBackdrop)) {
 			g_glassWantBackdrop = false;
 			if (!g_glassLogged) {
 				g_glassLogged = true;
-				printf("[glass] 液态玻璃已就绪 背景=%ls 尺寸=%dx%d dpi=%.2f 标记=%ls\n",
+				printf("[glass] 液态玻璃已就绪 背景=%ls 后端=%ls 尺寸=%dx%d dpi=%.2f 标记=%ls\n",
 					R3ShieldCoreUi::BackdropSourceName(g_glass.backdrop.source),
+					g_glass.backend == 1 ? L"OpenGL" : L"CPU",
 					client.right, client.bottom, static_cast<double>(dpi),
 					R3ShieldCoreUi::kGenerationMarker);
 			}
-		} else {
+		} else if (glassWanted) {
 			static int s_glassFailLogged = 0;
 			if (s_glassFailLogged < 3) {
 				++s_glassFailLogged;
@@ -4094,12 +4163,27 @@ namespace
 			//      见 app.cpp 1114）。两个菜单项做同一件事、后果却写着不一样，
 			//      用户会以为"退出引擎只是停引擎、窗口还在"。⇒ 只留「退出」。
 			//      （铁律 265 家族：同一个语义不要用两个入口表达。）
+			// ★ v84：多一项「界面：…」—— 两套界面的切换入口就在这里。
+			//   标签写**目标**（点下去会变成什么），不是当前状态：
+			//   "界面：经典" 读作"切到经典"，比"当前：液态玻璃"少一次心算。
+			const std::wstring uiLabel = R3ShieldCoreUi::ToggleLabel(g_uiStyle);
 			const R3ShieldCoreTray::TrayMenuAction act =
 				R3ShieldCoreTray::ShowTrayMenu(hwnd,
 					L"显示窗口",
 					false,   // 不给独立的「退出引擎」项（见上）
-					L"");
+					L"",
+					uiLabel);
 			switch (act) {
+			case R3ShieldCoreTray::TrayMenuAction::ToggleUi: {
+				// 切风格：先落盘（下次启动保持），再清掉玻璃缓存重新构图。
+				g_uiStyle = (g_uiStyle == Style::Glass) ? Style::Classic : Style::Glass;
+				R3ShieldCoreUi::SaveStyle(g_uiStyle);
+				g_glass.Shutdown();
+				g_glassWantBackdrop = true;
+				printf("[ui] 界面风格切换为：%ls\n", R3ShieldCoreUi::StyleName(g_uiStyle));
+				InvalidateRect(hwnd, nullptr, FALSE);
+				return;
+			}
 			case R3ShieldCoreTray::TrayMenuAction::ShowWindow:
 				TrayRestoreFromTray(hwnd);
 				return;
@@ -4630,6 +4714,7 @@ namespace
 			// ★ v83：玻璃缓存（背景 + 面板层 + 本帧画布，三块整幅 DIB）必须显式放掉。
 			//   它们不进窗口类的资源管理，不 Shutdown 就是三份内存泄漏。
 			g_glass.Shutdown();
+			g_gl.Shutdown();
 			// ★ 托盘图标必须先摘掉再销毁窗口：图标消息是投给这个 hwnd 的，
 			//   窗口没了还留着图标 = 通知区里一个"点了没反应"的僵尸（铁律 103）。
 			g_tray.icon.Remove();
@@ -4689,6 +4774,23 @@ namespace
 			nullptr, nullptr, g_instance, nullptr);
 
 		if (g_window) {
+			// ★★ v84：界面风格与 GL 后端在窗口建好后立刻定下来。
+			//   风格要**在首帧之前**读到 —— 否则第一帧会先按默认风格画一次、
+			//   再被下一次重绘纠正，肉眼会看到一闪（铁律 24/28 的"首帧"家族）。
+			g_uiStyle = R3ShieldCoreUi::LoadStyle();
+			if (g_uiStyle == Style::Glass) {
+				if (g_gl.Init()) {
+					printf("[glass] OpenGL 后端就绪：%s 标记=%ls\n",
+						g_gl.info[0] ? g_gl.info : "(unknown)",
+						R3ShieldCoreUi::kGlMarker);
+				} else {
+					printf("[glass] OpenGL 不可用（阶段=%d）⇒ 退回 CPU 合成 标记=%ls\n",
+						g_gl.failStage, R3ShieldCoreUi::kGlMarker);
+				}
+			} else {
+				printf("[ui] 界面风格：经典（不铺玻璃层）标记=%ls\n",
+					R3ShieldCoreUi::kStyleMarker);
+			}
 			ApplyGlassWindow(g_window);
 			// ★ v83：外框圆角（"背景透明圆角"）。
 			//   优先 DWM 的 `DWMWA_WINDOW_CORNER_PREFERENCE`（Win11 22H2+，由合成器
