@@ -73,6 +73,9 @@
 //   ⚠️ 回调消息名必须用 `kCallbackMessageCfg`（与主程序**不同**）：两个 exe
 //      各注册各的，免得同一台机器上互相看着像"同一个程序的图标"（见头文件）。
 #include <r3shieldcore/tray_icon.h>
+// ★ v83：液态玻璃材质（背景模糊 + 圆角 SDF + 折射/色散/rim/噪点/投影）。
+//   与主程序**同一份**实现 —— 铁律 127（各写一份 ⇒ 材质参数慢慢分叉且不报错）。
+#include <r3shieldcore/ui_material.h>
 #include "registry_spoof_codec.h"
 #include "clipboard_spoof_codec.h"
 
@@ -747,6 +750,37 @@ const int kTabWidth   = 84;   // TabWidth
 const int kTabGap     = 8;
 const int kTabCount   = 3;    // 配置 / 日志 / 高级（★ v80：高级页从主程序搬来）
 const int kContentTop = kTabBarTop + kTabBarH + 1;   // 101：内容区起点
+
+// ---------------------------------------------------------------------------
+// v83 液态玻璃：背景缓存 + 面板层缓存（与主程序同一套）
+//
+// ★ 与主程序的差别（刻意保留）：cfg 的**正文区有原生子控件**（EDIT / 下拉框 /
+//   列表），所以玻璃层只负责"背景 + 面板"，子控件照旧由系统绘制、下面垫浅色底
+//   （见 WM_CTLCOLORSTATIC 那段注释）。玻璃在控件底下"绕开"，不去硬啃透明控件。
+// ---------------------------------------------------------------------------
+R3ShieldCoreUi::GlassSurface g_glass;
+bool g_glassWantBackdrop = true;
+ULONGLONG g_glassMovedAt = 0;
+
+float CfgDpiScale(HWND hwnd) {
+	using GetDpiForWindowFn = UINT(WINAPI*)(HWND);
+	static GetDpiForWindowFn fn = nullptr;
+	static bool resolved = false;
+	if (!resolved) {
+		HMODULE user = GetModuleHandleW(L"user32.dll");
+		fn = user ? reinterpret_cast<GetDpiForWindowFn>(
+			GetProcAddress(user, "GetDpiForWindow")) : nullptr;
+		resolved = true;
+	}
+	UINT dpi = 96;
+	if (fn && hwnd) {
+		const UINT got = fn(hwnd);
+		if (got > 0) {
+			dpi = got;
+		}
+	}
+	return static_cast<float>(dpi) / 96.0f;
+}
 const int kRowH       = 30;   // 按钮 / 复选框行高（主窗口动作按钮同档）
 
 HFONT g_fontTitle = nullptr;  // -17 FW_SEMIBOLD  标题
@@ -956,15 +990,25 @@ void FillSolid(HDC dc, const RECT& r, COLORREF c) {
 
 // 圆角面板：白底 + 1px 描边 + 左上角标题（与主窗口 DrawPanel 逐字一致）。
 void DrawPanel(HDC dc, RECT rect, PCWSTR title, HFONT titleFont, COLORREF titleColor) {
-	HBRUSH brush = CreateSolidBrush(kHeaderBg);
-	HPEN pen = CreatePen(PS_SOLID, 1, kBorder);
-	HGDIOBJ oldBrush = SelectObject(dc, brush);
-	HGDIOBJ oldPen = SelectObject(dc, pen);
-	RoundRect(dc, rect.left, rect.top, rect.right, rect.bottom, 8, 8);
-	SelectObject(dc, oldBrush);
-	SelectObject(dc, oldPen);
-	DeleteObject(brush);
-	DeleteObject(pen);
+	// ★ v83：外观交给玻璃层（背景模糊 + 圆角 + 折射 + rim + 投影）。
+	//   这里只**登记矩形** + 画标题；玻璃层在下一帧按这张表合成
+	//   （两帧收敛，见 ui_material.h 的 GlassSurface::CommitPanels）。
+	//   玻璃不可用 ⇒ 退回原来的白底圆角，一像素不变。
+	if (g_glass.active) {
+		g_glass.AddPanel(rect.left, rect.top, rect.right, rect.bottom,
+			R3ShieldCoreUi::DefaultTheme().panelRadius * CfgDpiScale(g_main),
+			R3ShieldCoreUi::DefaultTheme().tintIdle);
+	} else {
+		HBRUSH brush = CreateSolidBrush(kHeaderBg);
+		HPEN pen = CreatePen(PS_SOLID, 1, kBorder);
+		HGDIOBJ oldBrush = SelectObject(dc, brush);
+		HGDIOBJ oldPen = SelectObject(dc, pen);
+		RoundRect(dc, rect.left, rect.top, rect.right, rect.bottom, 8, 8);
+		SelectObject(dc, oldBrush);
+		SelectObject(dc, oldPen);
+		DeleteObject(brush);
+		DeleteObject(pen);
+	}
 
 	if (title) {
 		RECT titleRect = { rect.left + 16, rect.top + 12, rect.right - 16, rect.top + 34 };
@@ -4316,8 +4360,16 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 	}
 
 	case WM_SIZE:
-		LayoutAll();
-		InvalidateRect(hwnd, nullptr, TRUE);
+	case WM_MOVE:
+		// ★ v83：背景是"窗口后方那块屏幕"的快照，位置一变就对不上 ⇒ 必须重抓。
+		if (g_glass.active) {
+			g_glassWantBackdrop = true;
+			g_glassMovedAt = GetTickCount64();
+		}
+		if (msg == WM_SIZE) {
+			LayoutAll();
+			InvalidateRect(hwnd, nullptr, TRUE);
+		}
 		return 0;
 
 	case WM_GETMINMAXINFO: {
@@ -4338,6 +4390,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 		HDC dc = reinterpret_cast<HDC>(wp);
 		RECT rc = {};
 		GetClientRect(hwnd, &rc);
+		// ★ v83：玻璃可用时直接抹玻璃层 —— 不铺不透明底色。
+		//   （先铺实色再被玻璃盖掉 = 每次擦背景都闪一下，缩放时尤其明显。）
+		if (g_glass.active && g_glass.layer.dc) {
+			BitBlt(dc, 0, 0, rc.right, rc.bottom, g_glass.layer.dc, 0, 0, SRCCOPY);
+			return 1;
+		}
 		// 标题区/页签栏那一段直接擦成白底（与标题区同色）—— 否则会先闪一下
 		// 灰底再被白底覆盖。
 		RECT strip = { 0, 0, rc.right, kContentTop };
@@ -4353,6 +4411,27 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 		RECT rc = {};
 		GetClientRect(hwnd, &rc);
 
+		// ★ v83：先准备玻璃层（背景 + 面板）。
+		g_glass.headerBand = kContentTop;
+		g_glass.headerVeil = 0.30f;
+		const bool glassOn = g_glass.Begin(hwnd, rc.right, rc.bottom,
+			CfgDpiScale(hwnd),
+			g_glassWantBackdrop || (GetTickCount64() - g_glassMovedAt) < 1200);
+		g_glassWantBackdrop = false;
+		if (glassOn) {
+			// ★ 这行不只是日志：它把宽串代次标记 `kGenerationMarker` **引用**一遍，
+			//   否则链接器看不到有人用它，会把那个常量丢掉 ⇒ 发布闸门
+			//   `check_dist_sync.sh` 的 v83 节查不到标记、报"包里不是 v83 产物"。
+			//   （实测踩过：主程序有这行、cfg 没有 ⇒ 闸门精准 FAIL 在 cfg 那一侧。）
+			static bool s_glassLogged = false;
+			if (!s_glassLogged) {
+				s_glassLogged = true;
+				printf("[glass] 液态玻璃已就绪 背景=%ls 尺寸=%dx%d 标记=%ls\n",
+					R3ShieldCoreUi::BackdropSourceName(g_glass.backdrop.source),
+					rc.right, rc.bottom, R3ShieldCoreUi::kGenerationMarker);
+			}
+		}
+
 		// 标题区 + 页签栏这一段**没有子控件** ⇒ 可以双缓冲（与主窗口同款做法），
 		// 消掉拖动/缩放时的重绘闪烁。
 		const int stripH = kContentTop;
@@ -4360,7 +4439,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 		HBITMAP bmp = CreateCompatibleBitmap(dc, rc.right > 0 ? rc.right : 1, stripH);
 		HGDIOBJ oldBmp = SelectObject(mem, bmp);
 		RECT strip = { 0, 0, rc.right, stripH };
-		FillSolid(mem, strip, kHeaderBg);
+		if (glassOn) {
+			BitBlt(mem, 0, 0, rc.right, stripH, g_glass.layer.dc, 0, 0, SRCCOPY);
+		} else {
+			FillSolid(mem, strip, kHeaderBg);
+		}
 		DrawHeader(mem, rc);
 		DrawTabBar(mem, rc);
 		BitBlt(dc, 0, 0, rc.right, stripH, mem, 0, 0, SRCCOPY);
@@ -4385,7 +4468,14 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 		//   ⚠️ 子控件由 `WS_CLIPCHILDREN` 裁掉 ⇒ 这次填充不会盖住它们。
 		{
 			RECT body = { 0, kContentTop, rc.right, rc.bottom };
-			FillSolid(dc, body, kBg);
+			if (glassOn) {
+				// 玻璃层已经算好「背景 + 面板」，正文区直接抹上去；
+				// 子控件由 WS_CLIPCHILDREN 裁掉 ⇒ 不会盖住它们。
+				BitBlt(dc, 0, kContentTop, rc.right, rc.bottom - kContentTop,
+					g_glass.layer.dc, 0, kContentTop, SRCCOPY);
+			} else {
+				FillSolid(dc, body, kBg);
+			}
 		}
 
 		// 内容区：面板底 + 输入框描边。这一片有子控件，**不能**整体双缓冲
@@ -4399,6 +4489,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 		} else {
 			DrawContentPanels(dc, hwnd);
 			PaintFieldFrames(dc, hwnd);
+		}
+		// ★ 本帧记下的面板表若与"已合成的那张"不一致 ⇒ 再刷一帧
+		//   （切页签 / 缩放 / 悬停态变化时会触发；稳定后零额外成本）。
+		if (g_glass.active && g_glass.CommitPanels()) {
+			InvalidateRect(hwnd, nullptr, FALSE);
 		}
 		EndPaint(hwnd, &ps);
 		return 0;
@@ -4866,6 +4961,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
 	case WM_DESTROY:
 		KillTimer(hwnd, 1);
+		// ★ v83：玻璃缓存（背景 + 面板层，两块整幅 DIB）必须显式放掉。
+		g_glass.Shutdown();
 		// ★ 摘图标要在关文件**之前或之后都行**，但必须做：图标消息投给这个 hwnd，
 		//   窗口没了还留着图标 = 通知区里一个"点了没反应"的僵尸（铁律 103）。
 		g_tray.icon.Remove();
@@ -5236,6 +5333,16 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) {
 	if (!g_main) {
 		MessageBoxW(nullptr, L"窗口创建失败。", L"R3 ShieldCore 配置与日志", MB_ICONERROR);
 		return 1;
+	}
+
+	// ★ v83：外框圆角（"背景透明圆角"）。优先 DWM 抗锯齿圆角，
+	//   不成就退回 region 硬裁剪。判据是 API 返回值，不是版本号。
+	{
+		const int cornerMode = R3ShieldCoreUi::ApplyRoundedWindow(
+			g_main, static_cast<int>(8.0f * CfgDpiScale(g_main) + 0.5f));
+		if (cornerMode == 0) {
+			printf("[glass] 警告：外框圆角不可用（DWM 与 region 都没成）\n");
+		}
 	}
 
 	// ★ 高级页的那个原生 EDIT 必须**在首次绘制之前**建好并摆位

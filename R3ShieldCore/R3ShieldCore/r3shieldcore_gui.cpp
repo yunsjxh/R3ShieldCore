@@ -5,6 +5,9 @@
 #include "r3shieldcore_superdesk.h"
 
 #include <commctrl.h>
+#include <dwmapi.h>
+#pragma comment(lib, "dwmapi.lib")
+#pragma comment(lib, "msimg32.lib")
 #include <windowsx.h>
 
 #include <algorithm>
@@ -27,6 +30,10 @@
 
 // ★ 托盘图标（关闭窗口 = 收进托盘）。两个 exe 共用一份实现 —— 铁律 127。
 #include <r3shieldcore/tray_icon.h>
+
+// ★ v83：液态玻璃材质（背景模糊 + 圆角 SDF + 折射/色散/rim/噪点/投影）。
+//   绘制侧**唯一实现**，cfg 那边 #include 同一份 —— 铁律 127。
+#include <r3shieldcore/ui_material.h>
 
 //
 // 界面布局
@@ -132,9 +139,9 @@ namespace
 	constexpr int LogColStatusWidth = 46;    // 只在非零状态时画
 
 	// 配色（浅色主题）
-	constexpr COLORREF ColorBackground = RGB(250, 250, 250);
-	constexpr COLORREF ColorHeaderBackground = RGB(255, 255, 255);
-	constexpr COLORREF ColorBorder = RGB(226, 226, 226);
+	constexpr COLORREF ColorBackground = RGB(235, 243, 250);
+	constexpr COLORREF ColorHeaderBackground = RGB(247, 251, 255);
+	constexpr COLORREF ColorBorder = RGB(207, 221, 235);
 	constexpr COLORREF ColorTextPrimary = RGB(24, 24, 24);
 	constexpr COLORREF ColorTextSecondary = RGB(110, 110, 110);
 	constexpr COLORREF ColorAccent = RGB(0, 120, 215);
@@ -146,13 +153,13 @@ namespace
 	// 完全拦截模式的徽章色：比 BLOCK 更深更沉，一眼能跟普通拦截区分开。
 	constexpr COLORREF ColorBlockAll = RGB(139, 0, 0);
 	constexpr COLORREF ColorTrack = RGB(232, 232, 232);
-	constexpr COLORREF ColorTabActiveBg = RGB(0, 120, 215);
+	constexpr COLORREF ColorTabActiveBg = RGB(45, 132, 220);
 	constexpr COLORREF ColorTabActiveText = RGB(255, 255, 255);
 	constexpr COLORREF ColorTabInactiveText = RGB(90, 90, 90);
 	// 未选中页签的悬停态（浅蓝底 + 淡蓝描边）。
-	constexpr COLORREF ColorTabHoverBg = RGB(233, 242, 252);
-	constexpr COLORREF ColorTabHoverBorder = RGB(178, 210, 240);
-	constexpr COLORREF ColorLogRowAlt = RGB(246, 246, 246);
+	constexpr COLORREF ColorTabHoverBg = RGB(226, 240, 253);
+	constexpr COLORREF ColorTabHoverBorder = RGB(182, 214, 244);
+	constexpr COLORREF ColorLogRowAlt = RGB(241, 247, 252);
 	// ★ v54：历史行（上一轮会话回放出来的）底色 —— 比交替色再暗一档，
 	// 让"这不是本次会话产生的事件"一眼可见。
 	constexpr COLORREF ColorLogRowHistory = RGB(238, 238, 234);
@@ -173,8 +180,70 @@ namespace
 	constexpr COLORREF ColorComAccent = RGB(150, 60, 130);           // COM 激活劫持来源标记（紫红）
 	constexpr COLORREF ColorTaskAccent = RGB(60, 110, 150);          // 计划任务来源标记（钢蓝）
 
+	// Win32 liquid-glass shell: keep native resize/caption behavior while asking
+	// DWM for a softly tinted acrylic backdrop and modern rounded outer corners.
+	struct AccentPolicy { int State; int Flags; DWORD GradientColor; int AnimationId; };
+	struct WindowCompositionAttributeData { int Attribute; void* Data; SIZE_T Size; };
+	using SetWindowCompositionAttributeFn = BOOL(WINAPI*)(HWND, WindowCompositionAttributeData*);
+
+	void ApplyGlassWindow(HWND hwnd)
+	{
+		if (!hwnd) return;
+		// ★★ v83：**不再**调 `SetWindowCompositionAttribute(ACCENT_ENABLE_ACRYLICBLURBEHIND)`。
+		//
+		//   原因（实测，血泪）：那套 acrylic 会让 DWM 把**整块客户区**再和
+		//   模糊背景混一遍 —— 我们自己画的液态玻璃（背景模糊 + 面板 + 深色文字）
+		//   会被它二次淡化，症状是「文字变成白色、几乎看不见」，
+		//   而**我们画出来的缓冲完全正常**（把缓冲导成 BMP 是对的）。
+		//   ⇒ 界面对不对，在加了 acrylic 之后**用缓冲验证不出来**，极易误判成
+		//     "玻璃合成写错了"。现在玻璃完全由我们自绘，DWM 只负责外框圆角。
+		//
+		// ★ 数值而不是枚举：项目按 Win10 SDK 编译，枚举可能不存在。
+		constexpr DWORD DwmwaWindowCornerPreference = 33;
+		constexpr int DwmwcpRound = 2;
+		DwmSetWindowAttribute(hwnd, DwmwaWindowCornerPreference,
+			&DwmwcpRound, sizeof(DwmwcpRound));
+	}
+
 	HINSTANCE g_instance = nullptr;
 	HWND g_window = nullptr;
+
+	// ---------------------------------------------------------------------
+	// v83 液态玻璃：背景缓存 + 面板层缓存 + 本帧画布
+	//
+	// ★ 为什么用一个**全局**而不是每次 PaintWindow 现建：
+	//   背景（屏幕捕获 + 两级模糊）是这块唯一的"重活"，必须跨帧复用；
+	//   面板层同理（见 ui_material.h 里 GlassSurface 的"两帧收敛"说明）。
+	// ★ 生命周期：进程级，随窗口销毁走 Shutdown()；不持有任何句柄泄漏风险
+	//   （Dib32 是 RAII）。
+	// ---------------------------------------------------------------------
+	R3ShieldCoreUi::GlassSurface g_glass;
+	bool g_glassLogged = false;        // 背景来源只打一次日志（避免刷屏）
+	bool g_glassWantBackdrop = true;   // 下一次绘制是否强制重建背景
+	ULONGLONG g_glassMovedAt = 0;      // 最近一次移动/缩放时间（用于静止收敛）
+
+	// 取当前 DPI 缩放（PerMonitorV2 清单 ⇒ 必须按窗口取，不能用 GetDeviceCaps）
+	float GlassDpiScale(HWND hwnd)
+	{
+		// GetDpiForWindow 是 Win10 1607+ 的 API；旧系统退回 96。
+		using GetDpiForWindowFn = UINT(WINAPI*)(HWND);
+		static GetDpiForWindowFn fn = nullptr;
+		static bool resolved = false;
+		if (!resolved) {
+			HMODULE user = GetModuleHandleW(L"user32.dll");
+			fn = user ? reinterpret_cast<GetDpiForWindowFn>(
+				GetProcAddress(user, "GetDpiForWindow")) : nullptr;
+			resolved = true;
+		}
+		UINT dpi = 96;
+		if (fn && hwnd) {
+			const UINT got = fn(hwnd);
+			if (got > 0) {
+				dpi = got;
+			}
+		}
+		return static_cast<float>(dpi) / 96.0f;
+	}
 
 	// ---------------------------------------------------------------------
 	// LoadAppIcon —— 取 exe 资源里的产品图标（ID 见 IconResourceId）。
@@ -784,15 +853,32 @@ namespace
 		border = ColorAccent;
 		textColor = ColorAccent;
 
-		HBRUSH brush = CreateSolidBrush(background);
-		HGDIOBJ oldBrush = SelectObject(dc, brush);
-		HPEN pen = CreatePen(PS_SOLID, 1, border);
-		HGDIOBJ oldPen = SelectObject(dc, pen);
-		RoundRect(dc, rect.left, rect.top, rect.right, rect.bottom, 8, 8);
-		SelectObject(dc, oldBrush);
-		SelectObject(dc, oldPen);
-		DeleteObject(brush);
-		DeleteObject(pen);
+		// ★ v83：主按钮 = 更"厚"一点的小玻璃片（tint 比普通按钮高 2 档），
+		//   强调色留在文字与下划线上。
+		if (g_glass.active) {
+			const ButtonState state = StateOf(HeaderAction::ModeSwitch);
+			float tint = 0.22f;
+			if (state == ButtonState::Hover) { tint = 0.30f; }
+			if (state == ButtonState::Pressed) { tint = 0.36f; }
+			g_glass.AddPanel(rect.left, rect.top, rect.right, rect.bottom,
+				(rect.bottom - rect.top) * 0.5f, tint, 1);
+			{
+				RECT underline = { rect.left + 12, rect.bottom - 4, rect.right - 12, rect.bottom - 3 };
+				HBRUSH ub = CreateSolidBrush(ColorAccent);
+				FillRect(dc, &underline, ub);
+				DeleteObject(ub);
+			}
+		} else {
+			HBRUSH brush = CreateSolidBrush(background);
+			HGDIOBJ oldBrush = SelectObject(dc, brush);
+			HPEN pen = CreatePen(PS_SOLID, 1, border);
+			HGDIOBJ oldPen = SelectObject(dc, pen);
+			RoundRect(dc, rect.left, rect.top, rect.right, rect.bottom, 16, 16);
+			SelectObject(dc, oldBrush);
+			SelectObject(dc, oldPen);
+			DeleteObject(brush);
+			DeleteObject(pen);
+		}
 
 		RECT textRect = rect;
 		if (StateOf(HeaderAction::ModeSwitch) == ButtonState::Pressed) {
@@ -817,15 +903,29 @@ namespace
 		COLORREF textColor = ColorTextSecondary;
 		ButtonColors(active, danger, state, &background, &border, &textColor);
 
-		HBRUSH brush = CreateSolidBrush(background);
-		HPEN pen = CreatePen(PS_SOLID, 1, border);
-		HGDIOBJ oldBrush = SelectObject(dc, brush);
-		HGDIOBJ oldPen = SelectObject(dc, pen);
-		RoundRect(dc, rect.left, rect.top, rect.right, rect.bottom, 8, 8);
-		SelectObject(dc, oldBrush);
-		SelectObject(dc, oldPen);
-		DeleteObject(brush);
-		DeleteObject(pen);
+		// ★ v83：按钮 = 一块小玻璃片。语义（危险=红 / 生效=强调色 / 三态）全部
+		//   保留在 **文字色** 上；底色只表达"玻璃的厚度"（tint 随三态变化）。
+		//   ★ 为什么不把语义色也铺到玻璃上：玻璃是半透明的，一铺色整块就变成
+		//     "实色贴纸"，反而丢掉材质感；而且深色文字压在饱和底色上更难读。
+		if (g_glass.active) {
+			float tint = 0.16f;
+			if (state == ButtonState::Hover) { tint = 0.24f; }
+			if (state == ButtonState::Pressed) { tint = 0.32f; }
+			if (active) { tint += 0.10f; }
+			if (danger) { tint += 0.03f; }
+			g_glass.AddPanel(rect.left, rect.top, rect.right, rect.bottom,
+				(rect.bottom - rect.top) * 0.5f, tint, 1);
+		} else {
+			HBRUSH brush = CreateSolidBrush(background);
+			HPEN pen = CreatePen(PS_SOLID, 1, border);
+			HGDIOBJ oldBrush = SelectObject(dc, brush);
+			HGDIOBJ oldPen = SelectObject(dc, pen);
+			RoundRect(dc, rect.left, rect.top, rect.right, rect.bottom, 16, 16);
+			SelectObject(dc, oldBrush);
+			SelectObject(dc, oldPen);
+			DeleteObject(brush);
+			DeleteObject(pen);
+		}
 
 		// 按下时文字下沉 1px，做出"压下去"的手感。
 		RECT textRect = rect;
@@ -834,6 +934,14 @@ namespace
 		}
 		DrawTextSimple(dc, text, textRect, g_tabFont, textColor,
 			DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+
+		// 生效态：底部一条 1px 的语义色下划线（代替原来的实底高亮）
+		if (g_glass.active && active) {
+			RECT underline = { rect.left + 12, rect.bottom - 4, rect.right - 12, rect.bottom - 3 };
+			HBRUSH ub = CreateSolidBrush(border);
+			FillRect(dc, &underline, ub);
+			DeleteObject(ub);
+		}
 	}
 
 	void DrawHeaderActions(HDC dc)
@@ -1796,15 +1904,49 @@ namespace
 
 	void DrawPanel(HDC dc, RECT rect, PCWSTR title)
 	{
-		HBRUSH brush = CreateSolidBrush(ColorHeaderBackground);
-		HPEN pen = CreatePen(PS_SOLID, 1, ColorBorder);
-		HGDIOBJ oldBrush = SelectObject(dc, brush);
-		HGDIOBJ oldPen = SelectObject(dc, pen);
-		RoundRect(dc, rect.left, rect.top, rect.right, rect.bottom, 8, 8);
-		SelectObject(dc, oldBrush);
-		SelectObject(dc, oldPen);
-		DeleteObject(brush);
-		DeleteObject(pen);
+		// ★ v83：面板的**外观**现在由玻璃层负责（背景模糊 + 圆角 SDF + 边缘折射
+		//   + 色散 + rim + 顶光 + 噪点 + 投影），这里只做两件事：
+		//   ① 把矩形登记给玻璃层（它会在**下一帧**按这张表合成）；
+		//   ② 画标题文字（内容层，每帧都画，压在玻璃上）。
+		//
+		// ★★ 为什么"登记"而不是"当场画"：玻璃层必须在内容**之前**合成好，
+		//   而面板矩形要到绘制过程中才知道 ⇒ 见 ui_material.h 里
+		//   GlassSurface::CommitPanels 的"两帧收敛"说明。
+		//
+		// ★ 玻璃不可用（R3SHIELDCORE_GLASS=off / 建缓冲失败）时退回原来的不透明画法
+		//   —— 这条兜底路径必须保留：现场一键回退靠它（不是可选项）。
+		if (g_glass.active) {
+			const R3ShieldCoreUi::GlassTheme& th = R3ShieldCoreUi::DefaultTheme();
+			g_glass.AddPanel(rect.left, rect.top, rect.right, rect.bottom,
+				th.panelRadius * GlassDpiScale(g_window), th.tintIdle);
+		} else {
+			// ---- 兜底：不透明卡片（v82 及之前的外观）----
+			RECT shadow = { rect.left + 1, rect.top + 3, rect.right + 1, rect.bottom + 3 };
+			HBRUSH shadowBrush = CreateSolidBrush(RGB(220, 231, 242));
+			HGDIOBJ oldBrush = SelectObject(dc, shadowBrush);
+			HGDIOBJ oldPen = SelectObject(dc, GetStockObject(NULL_PEN));
+			RoundRect(dc, shadow.left, shadow.top, shadow.right, shadow.bottom, 18, 18);
+			SelectObject(dc, oldBrush);
+			SelectObject(dc, oldPen);
+			DeleteObject(shadowBrush);
+
+			HBRUSH brush = CreateSolidBrush(RGB(250, 253, 255));
+			HPEN pen = CreatePen(PS_SOLID, 1, ColorBorder);
+			oldBrush = SelectObject(dc, brush);
+			oldPen = SelectObject(dc, pen);
+			RoundRect(dc, rect.left, rect.top, rect.right, rect.bottom, 18, 18);
+			SelectObject(dc, oldBrush);
+			SelectObject(dc, oldPen);
+			DeleteObject(brush);
+			DeleteObject(pen);
+
+			HPEN rim = CreatePen(PS_SOLID, 1, RGB(255, 255, 255));
+			oldPen = SelectObject(dc, rim);
+			MoveToEx(dc, rect.left + 18, rect.top + 1, nullptr);
+			LineTo(dc, rect.right - 18, rect.top + 1);
+			SelectObject(dc, oldPen);
+			DeleteObject(rim);
+		}
 
 		RECT titleRect = { rect.left + 16, rect.top + 12, rect.right - 16, rect.top + 34 };
 		DrawTextSimple(dc, title, titleRect, g_labelFont, ColorTextPrimary,
@@ -2259,15 +2401,33 @@ namespace
 			text = ColorAccent;
 		}
 
-		HBRUSH brush = CreateSolidBrush(fill);
-		HPEN pen = CreatePen(PS_SOLID, 1, border);
-		HGDIOBJ oldBrush = SelectObject(dc, brush);
-		HGDIOBJ oldPen = SelectObject(dc, pen);
-		RoundRect(dc, rect.left, rect.top, rect.right, rect.bottom, 6, 6);
-		SelectObject(dc, oldBrush);
-		SelectObject(dc, oldPen);
-		DeleteObject(brush);
-		DeleteObject(pen);
+		// ★ v83：ARK 页 / 「高级」跳转页的按钮也走玻璃片。
+		//   禁用态**不加玻璃**（一块"什么都没写"的玻璃看起来像可点的按钮，
+		//   而禁用必须一眼看出"点不动"），危险动作靠**红字 + 红下划线**表达。
+		if (g_glass.active) {
+			if (enabled) {
+				float tint = 0.16f;
+				if (hovered) { tint = 0.24f; }
+				if (pressed) { tint = 0.32f; }
+				g_glass.AddPanel(rect.left, rect.top, rect.right, rect.bottom, 8.0f, tint, 1);
+				RECT underline = { rect.left + 10, rect.bottom - 3, rect.right - 10, rect.bottom - 2 };
+				HBRUSH ub = CreateSolidBrush(danger ? ColorBlocked : ColorAccent);
+				FillRect(dc, &underline, ub);
+				DeleteObject(ub);
+			}
+			text = enabled ? (danger ? ColorBlocked : (hovered || pressed ? ColorAccent : ColorTextPrimary))
+				: RGB(170, 170, 170);
+		} else {
+			HBRUSH brush = CreateSolidBrush(fill);
+			HPEN pen = CreatePen(PS_SOLID, 1, border);
+			HGDIOBJ oldBrush = SelectObject(dc, brush);
+			HGDIOBJ oldPen = SelectObject(dc, pen);
+			RoundRect(dc, rect.left, rect.top, rect.right, rect.bottom, 6, 6);
+			SelectObject(dc, oldBrush);
+			SelectObject(dc, oldPen);
+			DeleteObject(brush);
+			DeleteObject(pen);
+		}
 
 		DrawTextSimple(dc, label, rect, g_labelFont, text,
 			DT_CENTER | DT_VCENTER | DT_SINGLELINE);
@@ -3097,44 +3257,67 @@ namespace
 	{
 		const int width = ClientWidth();
 
-		// 页面底色（跟标题区一致，让页签看起来是"挂在"上方内容区上的）
-		RECT strip = { 0, TabBarTop, width, TabBarTop + TabBarHeight };
-		HBRUSH stripBrush = CreateSolidBrush(ColorHeaderBackground);
-		FillRect(dc, &strip, stripBrush);
-		DeleteObject(stripBrush);
-
+		// ★ v83：不再给页签条铺不透明底色 —— 玻璃背景要透上来。
+		//   （原来那块 `ColorHeaderBackground` 的 FillRect 是"玻璃感"的头号杀手：
+		//     页签条下面一片实色，整条看起来就是贴纸。）
+		//   页签条与顶栏共用顶部的"薄纱"（见 PaintWindow 里的 headerBand）。
 		for (int i = 0; i < TabCount; i++) {
 			RECT rect = TabRect(i);
-			bool active = (i == g_activeTab);
+			const bool active = (i == g_activeTab);
+			const bool hover = (i == g_hoverTab);
 
-			if (active) {
+			if (g_glass.active && (active || hover)) {
+				// 页签 = 一块小玻璃片；选中态 tint 更亮（"凸起来"）。
+				const R3ShieldCoreUi::GlassTheme& th = R3ShieldCoreUi::DefaultTheme();
+				g_glass.AddPanel(rect.left, rect.top, rect.right, rect.bottom,
+					(rect.bottom - rect.top) * 0.5f,     // 胶囊：半径 = 半高
+					active ? 0.34f : 0.18f, 1);
+			}
+			else if (active) {
+				// 兜底（玻璃不可用）：保留原来的蓝色实底
 				HBRUSH brush = CreateSolidBrush(ColorTabActiveBg);
 				HGDIOBJ old = SelectObject(dc, brush);
 				HPEN pen = CreatePen(PS_SOLID, 1, ColorTabActiveBg);
 				HGDIOBJ oldPen = SelectObject(dc, pen);
-				RoundRect(dc, rect.left, rect.top, rect.right, rect.bottom, 8, 8);
+				RoundRect(dc, rect.left, rect.top, rect.right, rect.bottom, 16, 16);
 				SelectObject(dc, old);
 				SelectObject(dc, oldPen);
 				DeleteObject(brush);
 				DeleteObject(pen);
 			}
-			else if (i == g_hoverTab) {
-				// 未选中页签的悬停态：浅底 + 淡描边，暗示"这里可以点"。
+			else if (hover) {
 				HBRUSH brush = CreateSolidBrush(ColorTabHoverBg);
 				HGDIOBJ old = SelectObject(dc, brush);
 				HPEN pen = CreatePen(PS_SOLID, 1, ColorTabHoverBorder);
 				HGDIOBJ oldPen = SelectObject(dc, pen);
-				RoundRect(dc, rect.left, rect.top, rect.right, rect.bottom, 8, 8);
+				RoundRect(dc, rect.left, rect.top, rect.right, rect.bottom, 16, 16);
 				SelectObject(dc, old);
 				SelectObject(dc, oldPen);
 				DeleteObject(brush);
 				DeleteObject(pen);
 			}
 
-			DrawTextSimple(dc, TabTitle(i), rect, g_tabFont,
-				active ? ColorTabActiveText
-					: (i == g_hoverTab ? ColorAccent : ColorTabInactiveText),
+			// ★ 文字配色跟着玻璃改：选中/悬停用**深蓝**（玻璃底是浅的，
+			//   原来那个"白字压深蓝底"的反色在这里会完全看不见）。
+			COLORREF textColor;
+			if (g_glass.active) {
+				textColor = (active || hover) ? ColorAccent : ColorTabInactiveText;
+			}
+			else {
+				textColor = active ? ColorTabActiveText
+					: (hover ? ColorAccent : ColorTabInactiveText);
+			}
+			DrawTextSimple(dc, TabTitle(i), rect, g_tabFont, textColor,
 				DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+
+			// 选中态：底部一条 2px 的蓝色下划线（玻璃上比"整块填色"更清爽，
+			// 也更像 iOS 26 那套"玻璃胶囊 + 指示条"）。
+			if (g_glass.active && active) {
+				RECT underline = { rect.left + 14, rect.bottom - 5, rect.right - 14, rect.bottom - 3 };
+				HBRUSH ub = CreateSolidBrush(ColorAccent);
+				FillRect(dc, &underline, ub);
+				DeleteObject(ub);
+			}
 		}
 
 		// 右端的操作按钮（页签在左、操作在右，互不重叠）
@@ -3528,21 +3711,78 @@ namespace
 
 		RECT client = {};
 		GetClientRect(hwnd, &client);
+		if (client.right <= 0 || client.bottom <= 0) {
+			EndPaint(hwnd, &ps);
+			return;
+		}
 
-		// 双缓冲
+		// -----------------------------------------------------------------
+		// ★ v83 液态玻璃：先把"背景 + 面板"这一层准备好，再在上面画内容。
+		//
+		//   玻璃层的内容 = 窗口后方的真实桌面（捕获，已模糊）+ 各面板的
+		//   圆角折射/色散/rim/投影。它**不含**任何文字与表格 —— 那些属于内容层，
+		//   每帧都要重画（ARK 页 300ms 一刷）。这个切分是性能的关键。
+		//
+		//   `Begin()` 返回 false（`R3SHIELDCORE_GLASS=off` 或缓冲区建不起来）
+		//   ⇒ 走原来的不透明渐变路径，一像素都不变（现场一键回退靠它）。
+		// -----------------------------------------------------------------
+		const float dpi = GlassDpiScale(hwnd);
+		const bool wantBackdrop = g_glassWantBackdrop ||
+			(GetTickCount64() - g_glassMovedAt) < 1200;   // 拖动/缩放期间持续刷新
+		g_glass.headerBand = TabBarTop + TabBarHeight;   // 顶栏 + 页签条共用一块薄纱
+		g_glass.headerVeil = 0.30f;
+		if (g_glass.Begin(hwnd, client.right, client.bottom, dpi, wantBackdrop)) {
+			g_glassWantBackdrop = false;
+			if (!g_glassLogged) {
+				g_glassLogged = true;
+				printf("[glass] 液态玻璃已就绪 背景=%ls 尺寸=%dx%d dpi=%.2f 标记=%ls\n",
+					R3ShieldCoreUi::BackdropSourceName(g_glass.backdrop.source),
+					client.right, client.bottom, static_cast<double>(dpi),
+					R3ShieldCoreUi::kGenerationMarker);
+			}
+		} else {
+			static int s_glassFailLogged = 0;
+			if (s_glassFailLogged < 3) {
+				++s_glassFailLogged;
+				printf("[glass] 诊断：Begin 失败 active=%d enabled=%d client=%dx%d stage=%d\n",
+					g_glass.active ? 1 : 0, R3ShieldCoreUi::GlassEnabled() ? 1 : 0,
+					client.right, client.bottom, g_glass.failStage);
+			}
+		}
+
+		// -----------------------------------------------------------------
+		// 双缓冲载体：**始终**是兼容位图（与改造前完全一致）。
+		//
+		// ★★ 为什么不在玻璃层的 32bpp DIB 上直接画内容（踩过）：
+		//   GDI 的 ClearType 在 `CreateDIBSection` 出来的 32bpp 表面上**渲染不出
+		//   深色字** —— 实测整屏文字变成白色（浅底上几乎看不见），而且不报任何错。
+		//   ⇒ 玻璃层只当"背景图"用，`BitBlt` 到兼容位图，内容还是画在兼容位图上。
+		//   代价是多一次整幅拷贝（~1ms），换来的是文字渲染路径零变化。
+		// -----------------------------------------------------------------
 		HDC buffer = CreateCompatibleDC(dc);
 		HBITMAP bitmap = CreateCompatibleBitmap(dc, client.right, client.bottom);
 		HGDIOBJ oldBitmap = SelectObject(buffer, bitmap);
 
-		HBRUSH background = CreateSolidBrush(ColorBackground);
-		FillRect(buffer, &client, background);
-		DeleteObject(background);
+		if (g_glass.active) {
+			// 玻璃层（背景 + 面板）已成品，直接盖到双缓冲上，随后画内容。
+			BitBlt(buffer, 0, 0, client.right, client.bottom, g_glass.layer.dc, 0, 0, SRCCOPY);
+		} else {
+			// ---- 兜底：原来的不透明渐变（`R3SHIELDCORE_GLASS=off` / 玻璃不可用）----
+			TRIVERTEX bodyVertices[2] = {
+				{ 0, 0, 0xF100, 0xF700, 0xFC00, 0x0000 },
+				{ client.right, client.bottom, 0xE800, 0xF100, 0xFA00, 0x0000 }
+			};
+			GRADIENT_RECT bodyGradient = { 0, 1 };
+			GradientFill(buffer, bodyVertices, 2, &bodyGradient, 1, GRADIENT_FILL_RECT_V);
 
-		// 顶部标题区
-		RECT header = { 0, 0, client.right, 62 };
-		HBRUSH headerBrush = CreateSolidBrush(ColorHeaderBackground);
-		FillRect(buffer, &header, headerBrush);
-		DeleteObject(headerBrush);
+			RECT header = { 0, 0, client.right, 62 };
+			TRIVERTEX headerVertices[2] = {
+				{ 0, 0, 0xFFFF, 0xFFFF, 0xFFFF, 0x0000 },
+				{ client.right, 62, 0xF500, 0xFA00, 0xFF00, 0x0000 }
+			};
+			GRADIENT_RECT headerGradient = { 0, 1 };
+			GradientFill(buffer, headerVertices, 2, &headerGradient, 1, GRADIENT_FILL_RECT_V);
+		}
 
 		// 标题文字区右边界要给右侧的「默认置顶 / 超级置顶 / 模式徽章」让位，
 		// 否则拉宽/收窄时文字会钻到按钮底下。
@@ -3614,7 +3854,43 @@ namespace
 			DrawPromptSummary(buffer, client.bottom, snapshot);
 		}
 
-		BitBlt(dc, 0, 0, client.right, client.bottom, buffer, 0, 0, SRCCOPY);
+		// ★ 诊断：设了 `R3SHIELDCORE_GLASS_DUMP=<路径>` 时，把本帧画好的缓冲
+		//   直接落成 BMP（按帧号递增）。这条能区分「画错了」与「屏幕没抓到」。
+		{
+			static int s_dumpCount = 0;
+			static int s_dumpOn = -1;
+			if (s_dumpOn < 0) {
+				s_dumpOn = GetEnvironmentVariableW(L"R3SHIELDCORE_GLASS_DUMP", nullptr, 0) > 0 ? 1 : 0;
+			}
+			if (s_dumpOn && s_dumpCount < 24) {
+				wchar_t path[256];
+				_snwprintf_s(path, _countof(path), _TRUNCATE,
+					L"D:\\用户态杀软\\docs\\shots\\_f%02d.bmp", s_dumpCount);
+				R3ShieldCoreUi::SaveHdcToBmp(buffer, client.right, client.bottom, path);
+				++s_dumpCount;
+			}
+		}
+
+		const BOOL bltOk = BitBlt(dc, 0, 0, client.right, client.bottom, buffer, 0, 0, SRCCOPY);
+		if (!bltOk) {
+			// 只在**失败**时留痕：正常路径每帧打日志会把控制台刷爆，
+			// 而这个失败一旦发生就是"整窗空白"，必须留下线索（铁律 97）。
+			static int s_bltFailLogged = 0;
+			if (s_bltFailLogged < 3) {
+				++s_bltFailLogged;
+				printf("[paint] 警告：BitBlt 上屏失败 err=%lu（整窗会是空白）\n",
+					static_cast<unsigned long>(GetLastError()));
+			}
+		}
+
+		if (g_glass.active) {
+			// ★ 本帧记下的面板表若与"已合成的那张"不一致 ⇒ 再刷一帧
+			//   （详见 ui_material.h 里 GlassSurface::CommitPanels 的两帧收敛说明）。
+			//   典型触发：切页签、窗口缩放、悬停态变化。
+			if (g_glass.CommitPanels()) {
+				InvalidateRect(hwnd, nullptr, FALSE);
+			}
+		}
 
 		SelectObject(buffer, oldBitmap);
 		DeleteObject(bitmap);
@@ -3873,6 +4149,11 @@ namespace
 		case WM_ERASEBKGND:
 			return 1;
 
+		case WM_DWMCOMPOSITIONCHANGED:
+			ApplyGlassWindow(hwnd);
+			InvalidateRect(hwnd, nullptr, FALSE);
+			return 0;
+
 		case WM_GETMINMAXINFO: {
 			MINMAXINFO* info = reinterpret_cast<MINMAXINFO*>(lParam);
 			// 最小宽度 1040：页签占满左侧（Padding 20 + 5×(84+8) - 8 = 472），
@@ -3888,6 +4169,47 @@ namespace
 
 		case WM_PAINT:
 			PaintWindow(hwnd);
+			return 0;
+
+		// -----------------------------------------------------------------
+		// ★ v83：移动/缩放/DPI 变更 ⇒ 背景必须重抓
+		//
+		//   "背景"是**窗口后方那块屏幕内容**的快照，窗口一动它就对不上了
+		//   （玻璃里显示的会是旧位置的桌面）。所以这三个消息都要把
+		//   `g_glassWantBackdrop` 置起来、并记下时间 —— 后者让 PaintWindow
+		//   在拖动过程中**持续**刷新（静止 1.2 秒后自动停，省 CPU）。
+		// -----------------------------------------------------------------
+		case WM_MOVE:
+		case WM_SIZE:
+			if (g_glass.active) {
+				g_glassWantBackdrop = true;
+				g_glassMovedAt = GetTickCount64();
+				InvalidateRect(hwnd, nullptr, FALSE);
+			}
+			return 0;
+
+		case WM_DPICHANGED: {
+			// 缩放比例变了 ⇒ 材质参数（圆角/折射带宽/投影半径）全部要按新 DPI 重算。
+			// `Begin()` 里比对 dpi 会自己重建，这里只要把背景标记脏。
+			g_glassWantBackdrop = true;
+			g_glass.InvalidateLayer();
+			RECT* suggested = reinterpret_cast<RECT*>(lParam);
+			if (suggested) {
+				SetWindowPos(hwnd, nullptr,
+					suggested->left, suggested->top,
+					suggested->right - suggested->left,
+					suggested->bottom - suggested->top,
+					SWP_NOZORDER | SWP_NOACTIVATE);
+			}
+			return 0;
+		}
+
+		case WM_DISPLAYCHANGE:
+		case WM_THEMECHANGED:
+			g_glassWantBackdrop = true;
+			if (g_glass.active) {
+				InvalidateRect(hwnd, nullptr, FALSE);
+			}
 			return 0;
 
 		case WM_MOUSEMOVE: {
@@ -4305,6 +4627,9 @@ namespace
 		case WM_DESTROY:
 			KillTimer(hwnd, 1);
 			KillTimer(hwnd, TopMostReinforceTimerId);
+			// ★ v83：玻璃缓存（背景 + 面板层 + 本帧画布，三块整幅 DIB）必须显式放掉。
+			//   它们不进窗口类的资源管理，不 Shutdown 就是三份内存泄漏。
+			g_glass.Shutdown();
 			// ★ 托盘图标必须先摘掉再销毁窗口：图标消息是投给这个 hwnd 的，
 			//   窗口没了还留着图标 = 通知区里一个"点了没反应"的僵尸（铁律 103）。
 			g_tray.icon.Remove();
@@ -4364,6 +4689,18 @@ namespace
 			nullptr, nullptr, g_instance, nullptr);
 
 		if (g_window) {
+			ApplyGlassWindow(g_window);
+			// ★ v83：外框圆角（"背景透明圆角"）。
+			//   优先 DWM 的 `DWMWA_WINDOW_CORNER_PREFERENCE`（Win11 22H2+，由合成器
+			//   做**抗锯齿**圆角，圆角外面直接是桌面）；不成就退回 `SetWindowRgn`
+			//   硬裁剪（有锯齿，但至少是圆的）。
+			//   ★ 判据是**API 返回值**而不是版本号：版本号在"Win11 但关了圆角"的
+			//     环境上会骗人（r3shieldcore_gui.cpp 的 ApplyGlassWindow 也同理）。
+			const int cornerMode = R3ShieldCoreUi::ApplyRoundedWindow(
+				g_window, static_cast<int>(8.0f * GlassDpiScale(g_window) + 0.5f));
+			printf("[glass] 外框圆角=%ls 标记=%ls\n",
+				cornerMode == 1 ? L"DWM 抗锯齿" : (cornerMode == 2 ? L"region 硬裁剪" : L"不可用"),
+				R3ShieldCoreUi::kGenerationMarker);
 			// ★ v80：本窗口现在**没有任何子控件**了 —— 规则编辑框（原生 EDIT）
 			//   跟着「高级」编辑台一起搬去了 cfg，这里原来那段
 			//   `AdvCreateEdit` + 预览预置文本已删除。
