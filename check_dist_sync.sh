@@ -1464,9 +1464,133 @@ if [ -f "$V81_MAIN_EXE" ] && [ -f "$V81_CFG_EXE" ]; then
     fi
 fi
 
+# ---------------------------------------------------------------------------
+# v82 代次标记（关闭窗口 = 收进托盘；两个 exe 共用 tray_icon.h）
+# ---------------------------------------------------------------------------
+#
+# ★ 为什么需要这节：v82 改的是**两个发布物**，而且它们之间又有一份**契约** ——
+#   托盘回调消息名 / 菜单命令 id / 提示截断长度，全在共享头里。
+#   这几样东西改了名、值分叉了，**都不报错**：
+#     · 消息名分叉 ⇒ 托盘图标点上去"没反应"（回调投给了另一个 id）；
+#     · 命令 id 分叉 ⇒ 菜单项点了没动作；
+#     · 图标 id 撞车 ⇒ 两个 exe 在同机上有时候互相顶掉对方的图标。
+#   所以这一节跟 v80/v81 一样：**共享头 + 两侧真实 exe 宽串**都查。
+#
+# ★ 还要查**行为**："关闭窗口 = 收进托盘"最怕的是退化成"关窗就退出"
+#   （用户点了 X，程序没了）。所以源码里那句 `CfgHideToTray` / `TrayHideToTray`
+#   必须还在 —— 它被删掉是最容易被忽略的一处回归。
+echo "=== v82 代次标记（关闭窗口 = 收进托盘）==="
+V82_HDR="$PROJECT_ROOT/R3ShieldCore/shared/r3shieldcore/tray_icon.h"
+V82_CB_MAIN="R3ShieldCore.TrayIcon.Main"
+V82_CB_CFG="R3ShieldCore.TrayIcon.Cfg"
+V82_MAIN_SRC="$PROJECT_ROOT/R3ShieldCore/R3ShieldCore/r3shieldcore_gui.cpp"
+V82_CFG_SRC="$PROJECT_ROOT/tools/r3shieldcore_cfg.cpp"
+V82_MAIN_EXE="$DIST_DIR/R3 ShieldCore.exe"
+V82_CFG_EXE="$DIST_DIR/r3shieldcore-cfg.exe"
+
+# ① 共享头存在，且两个**不同**的回调消息名都在（分叉点就在这里）
+if [ ! -f "$V82_HDR" ]; then
+    echo "[FAIL] 缺失: $V82_HDR（托盘契约的唯一一份定义 —— 两侧同源的前提）"
+    fail=1
+else
+    v82_hdr_ok=1
+    if grep -qF "$V82_CB_MAIN" "$V82_HDR" 2>/dev/null; then
+        echo "[ OK ] tray_icon.h 含主程序回调消息名 '$V82_CB_MAIN'"
+    else
+        echo "[FAIL] $V82_HDR 里没有 '$V82_CB_MAIN' —— 主程序那份托盘回调消息名被改了"
+        v82_hdr_ok=0
+    fi
+    if grep -qF "$V82_CB_CFG" "$V82_HDR" 2>/dev/null; then
+        echo "[ OK ] tray_icon.h 含 cfg 回调消息名 '$V82_CB_CFG'"
+    else
+        echo "[FAIL] $V82_HDR 里没有 '$V82_CB_CFG' —— cfg 那份托盘回调消息名被改了"
+        v82_hdr_ok=0
+    fi
+    # ★ 两个名字**必须不同** —— 相同就失去"分叉能看出来"的意义。
+    if [ "$V82_CB_MAIN" = "$V82_CB_CFG" ]; then
+        echo "[FAIL] 两个回调消息名**相同** —— 同机上两个进程会收到同一个 id"
+        v82_hdr_ok=0
+    else
+        echo "[ OK ] 两个回调消息名互不相同（同机上两个图标可区分）"
+    fi
+    [ "$v82_hdr_ok" -eq 1 ] || fail=1
+fi
+
+# ② 两侧源码都真的**用上了**共享头，而且"关窗=隐藏"那句还在
+for _pair in "main:$V82_MAIN_SRC:TrayHideToTray" "cfg:$V82_CFG_SRC:CfgHideToTray"; do
+    _who="${_pair%%:*}"
+    _rest="${_pair#*:}"
+    _src="${_rest%%:*}"
+    _fn="${_rest#*:}"
+    if [ ! -f "$_src" ]; then
+        echo "[FAIL] 缺失: $_src"
+        fail=1
+        continue
+    fi
+    if ! grep -qF "tray_icon.h" "$_src" 2>/dev/null; then
+        echo "[FAIL] $_src 没 #include tray_icon.h —— $_who 没用共享契约"
+        fail=1
+    fi
+    if grep -qwF "$_fn" "$_src" 2>/dev/null; then
+        echo "[ OK ] $_src 含 '$_fn'（$_who 的「关窗=收进托盘」还在）"
+    else
+        echo "[FAIL] $_src 里没有 '$_fn' —— $_who 的关窗行为退化成「关掉就退出」了"
+        fail=1
+    fi
+done
+
+# ③ dist 的两个发布物真的编进了各自那份回调消息名
+if [ -f "$V82_MAIN_EXE" ]; then
+    if strings -el "$V82_MAIN_EXE" | grep -qF "$V82_CB_MAIN"; then
+        echo "[ OK ] 主程序 EXE 含宽串 '$V82_CB_MAIN'（它注册的托盘回调消息名）"
+    else
+        echo "[FAIL] 主程序 EXE 缺宽串 '$V82_CB_MAIN' ⇒ 托盘那半边没编进去"
+        fail=1
+    fi
+else
+    echo "[FAIL] 缺失: $V82_MAIN_EXE"
+    fail=1
+fi
+
+if [ -f "$V82_CFG_EXE" ]; then
+    if strings -el "$V82_CFG_EXE" | grep -qF "$V82_CB_CFG"; then
+        echo "[ OK ] cfg EXE 含宽串 '$V82_CB_CFG'（它注册的托盘回调消息名）"
+    else
+        echo "[FAIL] cfg EXE 缺宽串 '$V82_CB_CFG' ⇒ 托盘那半边没编进去"
+        fail=1
+    fi
+else
+    echo "[FAIL] 缺失: $V82_CFG_EXE"
+    fail=1
+fi
+
+# ④ 两侧 exe 都含**宽串**代次标记（托盘代码真的编进去了）
+#
+#    ⚠️ 这里查的是共享头里的 `kGenerationMarker`（宽串），**不是**日志文本。
+#       原因：`printf("[tray] ... 托盘图标已就绪 ...")` 里的中文是**窄**字面量
+#       （按 CP936 存成 GBK 字节），`strings -el` 永远查不到，`strings -a`
+#       也会因为前后是 ASCII 而被切碎 —— 实测过（铁律 209 家族：
+#       判据用的数据来源本身取不到，就是恒 FAIL/恒 PASS 的假判据）。
+#    ⚠️ 两侧**同源**：标记字符串定义在 tray_icon.h（铁律 127），
+#       两个 exe 各编一份 ⇒ 值必然一致，分叉在这里就能看出来。
+V82_MARKER="R3ShieldCoreTray.v82"
+if [ -f "$V82_MAIN_EXE" ] && [ -f "$V82_CFG_EXE" ]; then
+    v82_main_mark=0
+    v82_cfg_mark=0
+    strings -el "$V82_MAIN_EXE" | grep -qwF "$V82_MARKER" && v82_main_mark=1
+    strings -el "$V82_CFG_EXE"  | grep -qwF "$V82_MARKER" && v82_cfg_mark=1
+    if [ "$v82_main_mark" -eq 1 ] && [ "$v82_cfg_mark" -eq 1 ]; then
+        echo "[ OK ] 两侧 EXE 都含宽串代次标记 '$V82_MARKER'（托盘代码已编入）"
+    else
+        echo "[FAIL] 宽串代次标记 '$V82_MARKER' 缺失：主程序=$v82_main_mark cfg=$v82_cfg_mark"
+        echo "       ⇒ 包里的 exe 不是 v82 产物（重新 build.sh + build_cfgtool.sh + deploy_dist.sh）"
+        fail=1
+    fi
+fi
+
 echo ""
 if [ "$fail" -eq 0 ]; then
-    echo "结果: PASS —— dist 与构建产物一致，双架构同代次，且带 v66/v67/v69/v70/v71/v72/v73/v74/v75/v77/v78/v79/v80/v81 标记。"
+    echo "结果: PASS —— dist 与构建产物一致，双架构同代次，且带 v66/v67/v69/v70/v71/v72/v73/v74/v75/v77/v78/v79/v80/v81/v82 标记。"
     exit 0
 fi
 echo "结果: FAIL —— 发布目录与构建产物不同步，**不要打包**。"

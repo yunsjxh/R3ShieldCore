@@ -1,4 +1,4 @@
-﻿#include "stdafx.h"
+#include "stdafx.h"
 #include "r3shieldcore_gui.h"
 #include "r3shieldcore_ark.h"
 #include "r3shieldcore_stats.h"
@@ -24,6 +24,9 @@
 //   exe 名）。契约只定义一处，两边都 #include 它（铁律 127）。
 // ---------------------------------------------------------------------
 #include <r3shieldcore/cfg_launch.h>
+
+// ★ 托盘图标（关闭窗口 = 收进托盘）。两个 exe 共用一份实现 —— 铁律 127。
+#include <r3shieldcore/tray_icon.h>
 
 //
 // 界面布局
@@ -217,6 +220,21 @@ namespace
 	volatile LONG g_quitRequest = 0;   // 用户点了「退出引擎」
 	bool g_classRegistered = false;
 	bool g_allowUiAccessRestart = true;
+
+	// ★ 托盘：关闭窗口**不退出**，收进通知区（用户 2026-10-17 要求）。
+	//
+	//   三个状态各管一件事，别混：
+	//     · `g_tray.icon`          —— 图标本体（RAII，析构时 NIM_DELETE）；
+	//     · `g_tray.windowHidden`  —— 窗口现在是"收起来了"吗（决定双击/菜单是显示还是隐藏）；
+	//     · `g_tray.reallyExiting` —— 用户**真的**要退出（托盘菜单选了「退出」）。
+	//   ★ 最后这个标志是整套东西的关键：`WM_CLOSE` 与「退出」都走
+	//     `DestroyWindow`，**只能靠它区分**。没有它就会出现
+	//     "点了退出却只是把窗口收起来、进程还在跑"这种最坏的观感。
+	struct {
+		R3ShieldCoreTray::TrayIcon icon;
+		bool windowHidden = false;
+		bool reallyExiting = false;
+	} g_tray;
 
 	HFONT g_titleFont = nullptr;
 	HFONT g_labelFont = nullptr;
@@ -3667,8 +3685,190 @@ namespace
 		}
 	}
 
+	// =====================================================================
+	//  托盘（关闭窗口 = 收进通知区）
+	//
+	//   用户 2026-10-17 要求：关闭窗口 → 最小化/收进托盘。
+	//   两个 exe 共用 `shared/r3shieldcore/tray_icon.h`（铁律 127）。
+	//
+	//   ★★ 这套东西里**最要紧**的一条：必须有一个**能真正退出**的入口。
+	//      窗口收起来之后看不出它还在跑；没有退出入口 = "关不掉的程序"，
+	//      用户只能去任务管理器强杀，而强杀会跳过引擎收尾（铁律 107）。
+	//      ⇒ 托盘右键菜单："显示窗口" / "退出引擎" / "退出"（退出要二次确认）。
+	// =====================================================================
+
+	// 当前该用哪个图标/提示（状态文字必须**如实**反映引擎在不在跑 ——
+	// 图标收起来了，托盘提示就是用户唯一的信息来源，铁律 97）。
+	HICON TrayCurrentIcon()
+	{
+		// ★ 用窗口类图标（exe 资源里那个），而不是系统默认图标。
+		//   取不到就退回 IDI_APPLICATION，至少不出现空白方框。
+		HICON icon = LoadAppIcon(GetSystemMetrics(SM_CXSMICON),
+			GetSystemMetrics(SM_CYSMICON));
+		return icon ? icon : ::LoadIconW(nullptr, IDI_APPLICATION);
+	}
+
+	std::wstring TrayTipText()
+	{
+		std::wstring tip = L"R3 ShieldCore 安全控制台 — 监控运行中";
+		if (g_quitRequest) {
+			tip += L"（引擎已停）";
+		}
+		tip += L"\n双击显示窗口，右键更多操作。";
+		return tip;
+	}
+
+	// 把窗口收进托盘。**已经收着**时是幂等的（重复点关闭不会有副作用）。
+	void TrayHideToTray(HWND hwnd)
+	{
+		if (!g_tray.icon.added()) {
+			// ★ 图标没加上就**不要隐藏**：那样窗口会从任务栏和托盘
+			//   **同时**消失，用户彻底找不到它 —— 这比"没实现托盘"还糟。
+			//   宁可退回到旧行为（最小化到任务栏）。
+			printf("[tray] 图标未就绪，退回最小化到任务栏（不隐藏，免得窗口找不到）\n");
+			ShowWindow(hwnd, SW_MINIMIZE);
+			return;
+		}
+		const bool firstTime = !g_tray.windowHidden;
+		ShowWindow(hwnd, SW_HIDE);
+		g_tray.windowHidden = true;
+		g_tray.icon.SetTip(TrayTipText());
+		printf("[tray] 窗口已收进托盘（进程仍在运行）\n");
+
+		// ★ 只弹**第一次**：每次关闭都弹的话，第二次起就是打扰
+		//   （而用户关通知之后，真正要紧的提示也一起被关掉了）。
+		if (firstTime) {
+			g_tray.icon.Balloon(L"仍在后台运行",
+				L"窗口已收进托盘，监控与拦截仍在生效。\n"
+				L"双击托盘图标可重新打开；右键可退出。");
+		}
+	}
+
+	// 从托盘恢复窗口。
+	//
+	// ★ 这里**不能用** `SetForegroundWindow` 了事：本进程可能是被别的窗口
+	//   激活起来的，前台锁会拒绝它（铁律 256 踩过同一个坑）。
+	//   用 `SetWindowPos(HWND_TOPMOST → HWND_NOTOPMOST)` 抬 z 序不需要前台权；
+	//   `SetForegroundWindow` 只作为"能拿到就拿"的补充。
+	void TrayRestoreFromTray(HWND hwnd)
+	{
+		ShowWindow(hwnd, SW_SHOW);
+		if (IsIconic(hwnd)) {
+			ShowWindow(hwnd, SW_RESTORE);
+		}
+		SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+			SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW | SWP_NOACTIVATE);
+		SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0,
+			SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW | SWP_NOACTIVATE);
+		SetForegroundWindow(hwnd);
+		SetFocus(hwnd);
+		g_tray.windowHidden = false;
+		g_tray.icon.SetTip(TrayTipText());
+		printf("[tray] 窗口已从托盘恢复\n");
+	}
+
+	// 真正退出：先让引擎收尾，再销毁窗口（走 WM_DESTROY → 摘图标）。
+	void TrayExitRequested(HWND hwnd)
+	{
+		// ★★ 二次确认是**必须**的（用户明确要求）。
+		//
+		//   理由不是"礼貌"，是**后果确实重**：退出后驱动/服务仍会按策略
+		//   把引擎重新拉起来（开机自启那套），用户以为"关掉了"而实际没关
+		//   —— 不如把话说明白，让他自己决定。
+		//   ✓/✗ 用图标而不是只靠文字：中文按钮容易被一眼扫过（铁律 239 家族）。
+		const int r = MessageBoxW(hwnd,
+			L"退出后将停止监控与拦截，本程序窗口会关闭。\n\n"
+			L"（注意：如果引擎由开机自启服务托管，服务可能会再次把它拉起来。）\n\n"
+			L"确定要退出吗？",
+			L"退出 R3 ShieldCore", MB_ICONWARNING | MB_YESNO | MB_DEFBUTTON2);
+		if (r != IDYES) {
+			printf("[tray] 用户取消了退出\n");
+			return;
+		}
+		printf("[tray] 用户确认退出\n");
+		g_tray.reallyExiting = true;
+		// ★★ 只置位请求，**不要**在这里 `DestroyWindow` —— 界面线程绝不直接
+		//    退进程/毁窗口（见上面 `PerformHeaderAction` 的同款注释）：
+		//    真正的收尾顺序是 app.cpp 主循环 `TakeQuitRequest()` → break →
+		//    EngineControl 析构（**反注入**，把挂起的进程恢复回去）→
+		//    `R3ShieldCoreGui::Stop()` → 关窗口 → 退出进程（铁律 107：
+		//    强杀/乱序退出测不出收尾，必须走**有序**那条路）。
+		//    ⚠️ 第一版写成了"设标志 + DestroyWindow(hwnd)" —— 那会让 GUI 窗口
+		//       在反注入**之前**就被毁掉，等于绕过了有序收尾（正是这条铁律要防的）。
+		InterlockedExchange(&g_quitRequest, 1);
+	}
+
+	// 托盘图标的回调（鼠标事件都塞在 `lParam` 里 —— 这是 NOTIFYICON_VERSION_4 的约定）。
+	void HandleTrayMessage(HWND hwnd, LPARAM lParam)
+	{
+		switch (LOWORD(lParam)) {
+		case WM_LBUTTONUP:
+		case WM_LBUTTONDBLCLK:
+			// 双击（或单击左键抬起）还原窗口。用户选的是"还原并激活"。
+			TrayRestoreFromTray(hwnd);
+			return;
+
+		case WM_RBUTTONUP:
+		case WM_CONTEXTMENU: {
+			// ★ 菜单只放两项：「显示窗口」/「退出」。
+			//
+			//   ⚠️ 一开始还想加一项「退出引擎」（引擎在跑时显示）—— 想通了才发现
+			//      那是**误导**：本程序的"退出引擎"和"退出程序"走的是**同一条**
+			//      收尾路径（`g_quitRequest` → break → 反注入 → 关窗口 → 退进程，
+			//      见 app.cpp 1114）。两个菜单项做同一件事、后果却写着不一样，
+			//      用户会以为"退出引擎只是停引擎、窗口还在"。⇒ 只留「退出」。
+			//      （铁律 265 家族：同一个语义不要用两个入口表达。）
+			const R3ShieldCoreTray::TrayMenuAction act =
+				R3ShieldCoreTray::ShowTrayMenu(hwnd,
+					L"显示窗口",
+					false,   // 不给独立的「退出引擎」项（见上）
+					L"");
+			switch (act) {
+			case R3ShieldCoreTray::TrayMenuAction::ShowWindow:
+				TrayRestoreFromTray(hwnd);
+				return;
+			case R3ShieldCoreTray::TrayMenuAction::Exit:
+				TrayExitRequested(hwnd);
+				return;
+			default:
+				return;
+			}
+		}
+		default:
+			return;
+		}
+	}
+
 	LRESULT CALLBACK GuiWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
 	{
+		// ★ 托盘回调消息 —— **必须**在 switch **之前**用 if 判断（铁律 **250**）。
+		//
+		//   它的 id 是 `RegisterWindowMessageW` 在**运行时**算出来的
+		//   （0xC000~0xFFFF 区间），**不是编译期常量** ⇒ 当不了 `case` 标签
+		//   （写成 case 直接编不过，或者被当成重复常量）。
+		if (message == g_tray.icon.callbackMessage()) {
+			HandleTrayMessage(hwnd, lParam);
+			return 0;
+		}
+
+		// ★ explorer 重启（崩溃重开 / 手动重启）后，通知区被清空 ——
+		//   shell 会向所有**顶层窗口**广播 `TaskbarCreated`，收到就得把图标加回去。
+		//   不处理这条的话，图标一旦消失就再也不回来，而窗口可能已经收进托盘了
+		//   ⇒ **用户再也找不到这个程序**（没有窗口、也没有图标）。
+		//   ⚠️ 这个消息名同样要 `RegisterWindowMessageW`（运行时 id ⇒ 又是 if 不能 case）。
+		{
+			static const UINT taskbarCreated = ::RegisterWindowMessageW(L"TaskbarCreated");
+			if (message == taskbarCreated) {
+				if (g_tray.icon.Add(hwnd, TrayCurrentIcon(), TrayTipText(),
+						R3ShieldCoreTray::kCallbackMessageMain)) {
+					printf("[tray] explorer 重启，托盘图标已重新加入\n");
+				} else {
+					printf("[tray] explorer 重启后重新添加托盘图标失败\n");
+				}
+				return 0;
+			}
+		}
+
 		switch (message) {
 		case WM_ERASEBKGND:
 			return 1;
@@ -4084,29 +4284,30 @@ namespace
 			return 0;
 
 		case WM_CLOSE:
-			// 关窗口不退出程序（引擎还得继续跑）。
+			// 关窗口**不退出程序** —— 收进托盘，引擎继续跑（用户 2026-10-17 要求）。
 			//
-			// ⚠️ 为什么是 SW_MINIMIZE 而不是 SW_HIDE：
-			// 任务管理器「进程 / 应用」页的"结束任务"走的是**友好关闭** ——
-			// 给主窗口发 WM_CLOSE，不是 TerminateProcess（后者在「详细信息」页，
-			// 需要 PROCESS_TERMINATE 句柄，已被 NtOpenProcess 的保护 hook 拦掉）。
-			// WM_CLOSE 是窗口消息，不需要进程句柄，保护 hook 不在链路上，
-			// 所以这条路径拦不住 —— 只能靠窗口过程自己决定怎么响应。
+			// ⚠️ 与旧行为（`SW_MINIMIZE`，留在任务栏）的区别，以及为什么可以改：
+			//   旧注释担心"窗口消失会被误认为已关闭"。现在这个担心由**托盘图标**
+			//   兜住了 —— 图标可见 = 进程还在。所以这里改成 SW_HIDE。
 			//
-			// 但窗口消息的处置权天然就在 WndProc 里，**不需要 hook 任何人**：
-			// 无论谁发、走 PostMessage 还是直调 NtUserMessageCall，
-			// 最终都要经过这里。改这里比 hook 发送方更彻底。
+			// ★★ 但"收起来"必须配一个**能真正退出**的入口，否则就是
+			//    "关不掉的程序"（用户只能去任务管理器强杀，而强杀会跳过
+			//    引擎的收尾 —— 铁律 107）。那个入口在托盘右键菜单里。
 			//
-			// 用 SW_HIDE 的问题是：窗口消失后任务管理器判定"结束成功"、
-			// 不再升级到 TerminateProcess，用户以为引擎已关闭 —— 而监控和拦截
-			// 全都还在生效，这是个危险的误导。最小化则始终留在任务栏上，
-			// 用户一眼就知道它没被关掉。
-			ShowWindow(hwnd, SW_MINIMIZE);
+			// ⚠️ 任务管理器「结束任务」走的就是这条友好关闭路径（不是强杀，
+			//    原因见旧注释：强杀要 PROCESS_TERMINATE 句柄，已被保护 hook 拦掉）。
+			//    ⇒ 用户在那里点"结束任务"时，看到的会是进程**没死**。
+			//      这是本需求要接受的取舍：托盘图标 + 收起来时弹一次气泡，
+			//      把"它还在跑、怎么真正退出"讲清楚（见 TrayHideToTray）。
+			TrayHideToTray(hwnd);
 			return 0;
 
 		case WM_DESTROY:
 			KillTimer(hwnd, 1);
 			KillTimer(hwnd, TopMostReinforceTimerId);
+			// ★ 托盘图标必须先摘掉再销毁窗口：图标消息是投给这个 hwnd 的，
+			//   窗口没了还留着图标 = 通知区里一个"点了没反应"的僵尸（铁律 103）。
+			g_tray.icon.Remove();
 			return 0;
 
 		default:
@@ -4199,6 +4400,23 @@ namespace
 			ShowWindow(g_window, SW_SHOW);
 			UpdateWindow(g_window);
 			SetFocus(g_window); // 收键盘消息用（End 回底、PgUp/PgDn 翻页）
+
+			// ★ 托盘图标：窗口出来了就注册（"关闭窗口 = 收进托盘"的前提）。
+			//
+			//   ⚠️ 必须在窗口**建好之后**加：图标消息是投给这个 hwnd 的。
+			//   ⚠️ 加不上不能当没事发生 —— `TrayHideToTray` 会检查 `added()`
+			//      并退回"最小化到任务栏"（否则窗口从任务栏和托盘同时消失）。
+			if (!g_tray.icon.Add(g_window, TrayCurrentIcon(), TrayTipText(),
+					R3ShieldCoreTray::kCallbackMessageMain)) {
+				printf("[tray] 警告：托盘图标添加失败（Shell_NotifyIcon(NIM_ADD) 失败），"
+					"关闭窗口将退回最小化到任务栏\n");
+			} else {
+				// ★ 带上宽串代次标记（在共享头里，铁律 127）—— 闸门 `check_dist_sync.sh`
+				//   用 `strings -el` 查它确认托盘代码编进了 exe。必须 `%ls` 传宽串。
+				printf("[tray] 托盘图标已就绪（关闭窗口 = 收进托盘）标记=%ls\n",
+					R3ShieldCoreTray::kGenerationMarker);
+			}
+
 			SetTimer(g_window, 1, 300, nullptr);
 			// ★ v63：ARK 页的刷新定时器。间隔来自 `ark_refresh_ms`；
 			//   不在 ARK 页时它只做一次判断就返回（见 WM_TIMER），几乎零成本。
