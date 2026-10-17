@@ -311,6 +311,17 @@ namespace
 
 		const std::string& s = *text;
 
+		// ★ v81：`Line` = **文件里那一行的原文**（已去 BOM）。
+		//
+		//   为什么直接抄原文、而不是"解析完再按格式拼一遍"：
+		//     · 更保真 —— 解析器只认得它关心的那些字段（tid / proto 之类
+		//       它过去是**跳过**的），重新拼必然丢东西；
+		//     · 更快，也不会因为格式化函数的未来改动而"历史突然变了样"。
+		//   这一条和实时路径（`R3ShieldCoreStats::OnEvent` 用 FormatEventLine
+		//   现算）必须**显示成同一个样子** —— 两条路拼出来的字不一样，
+		//   用户会看到"同一个事件两种写法"，而两条路都不报错（铁律 24）。
+		entry.Line = s;
+
 		// ---- 1) 时间戳：固定 23 字符 ----
 		if (s.size() < 23) {
 			g_lastStage = "step1";
@@ -382,8 +393,14 @@ namespace
 		size_t tidDigits = 0;
 		{
 			char* stop = nullptr;
-			strtol(c.p, &stop, 10); // tid 我们不显示，但必须跳过
+			// ★ v81：tid 以前是"跳过不显示"，现在要留下来 —— 引擎侧的实时路径
+			//   把 tid 写进了日志行，回放路径（这条）如果丢掉它，两条数据源
+			//   在界面上就会对不上（同一个事件，一个带 tid、一个不带）。
+			const long tid = strtol(c.p, &stop, 10);
 			tidDigits = static_cast<size_t>(stop - c.p);
+			if (tid > 0) {
+				entry.ThreadId = static_cast<ULONG>(tid);
+			}
 			c.p = stop;
 		}
 
@@ -458,7 +475,30 @@ namespace
 		const char* riskBase = advance(decisionBase, 11, decisionName);
 		const std::string riskName = takeColumn(riskBase, 4);
 		const char* opBase = advance(riskBase, 4, riskName);
-		const std::string opName = takeColumn(opBase, 19);   // 最长 op 名 19 = SetInformationKey
+
+		// ★ v81 修缺陷：op 名**不能按宽度截**。
+		//
+		//   `%-16s` 的 16 只是**下限**，而 op 名最长 23 字符
+		//   （`SetServiceObjectSecurity`），`RegisterTaskDefinition` 是 22。
+		//   原来这里 `takeColumn(opBase, 19)` 把名字砍到 19 字符 ⇒
+		//   `OpFromName` 匹配不上 ⇒ **回放出来的历史事件没有 op 名**
+		//   （界面上那一列空着），而 op 为 0 又会连累 `IsHiveOp` 判定。
+		//   实测：v81 的 `tools/log_line_rt_ut.cpp` 在 SVCCFG / TASK
+		//   两类上直接把这条抓出来了。
+		//
+		//   正确做法：从 op 列起点取到 `  status=` 之前（op 名里不会有双空格）。
+		std::string opName;
+		{
+			const char* save = c.p;
+			c.p = opBase;
+			const char* opEnd = c.end;
+			if (c.Seek("  status=")) {
+				opEnd = c.p - 9;   // 回退掉 "  status=" 这 9 个字符
+			}
+			c.p = save;
+			while (opEnd > opBase && opEnd[-1] == ' ') { --opEnd; }
+			opName.assign(opBase, static_cast<size_t>(opEnd - opBase));
+		}
 
 		// status 之后的部分从 op 列起点之后重新定位（不走列边界，走 Seek）。
 		c.p = columnBase;
@@ -520,6 +560,34 @@ namespace
 
 		// 进程/线程事件：keyPath 后面紧跟 "(pid=N)"，被当成同一段读到，
 		// 这里从中把 pid 抠出来，并把那段从 Target 里去掉。
+		// 进程/线程事件：keyPath 后面紧跟 "  (pid=N)"（见 `log_line.h` 的 procSuffix）。
+		//
+		// ★ v81 修缺陷：**必须在这里、在游标上**把它吃掉。
+		//
+		//   原来只有下面那段"在已取好的 Target 里找 `  (pid=`" —— 但
+		//   `TakeUntilDoubleSpace` 遇到双空格就停了，那段**根本不会进 Target**
+		//   ⇒ 两个后果，都是静默的：
+		//     ① `TargetProcessId` 永远是 0（界面上"目标 pid"那一列空着）；
+		//     ② `(pid=909)` 被当成**第二字段**读走 ⇒ `Value` 显示成 `909)`。
+		//   实测（v81 的 `tools/log_line_rt_ut.cpp`）：PROC / THRD 两类各红一条。
+		//
+		//   注意：下面那段"在 Target 里找"**保留**做兜底（万一将来某条路径
+		//   真把后缀并进了 Target，也不会丢 pid）。
+		if (entry.ObjectType == static_cast<ULONG>(ObjectType::Process) ||
+			entry.ObjectType == static_cast<ULONG>(ObjectType::Thread)) {
+			if (c.p + 5 <= c.end && strncmp(c.p, "(pid=", 5) == 0) {
+				char* stop = nullptr;
+				const long targetPid = strtol(c.p + 5, &stop, 10);
+				if (stop != c.p + 5 && targetPid > 0) {
+					entry.TargetProcessId = static_cast<ULONG>(targetPid);
+				}
+				if (stop) {
+					c.p = stop;
+					if (c.p < c.end && *c.p == ')') { ++c.p; }
+				}
+			}
+		}
+
 		if (entry.ObjectType == static_cast<ULONG>(ObjectType::Process) ||
 			entry.ObjectType == static_cast<ULONG>(ObjectType::Thread)) {
 			const std::wstring marker = L"  (pid=";
@@ -586,6 +654,17 @@ namespace
 				entry.Flags |= R3ShieldCore::FlagEventHighRisk;
 				entry.IsHighRisk = true;
 			}
+		}
+
+		// ★ v81：`[ASK-UNAVAIL→ALLOW]` ⇒ Flags2 位。
+		//
+		//   在**整行**上直接找，不靠游标的当前位置 —— 尾部标签的组合与顺序
+		//   会变（高危 / 被拦 / 降级放行三者可任意叠加），靠顺序 Seek
+		//   很容易漏掉排在最后面的那个。
+		//   只匹配 ASCII 前缀，避免箭头 `→` 的编码差异（文件是 UTF-8，
+		//   但这里只关心"有没有这个标记"）。
+		if (s.find("[ASK-UNAVAIL") != std::string::npos) {
+			entry.Flags2 |= R3ShieldCore::FlagEvent2AskUnavailable;
 		}
 
 		return true;

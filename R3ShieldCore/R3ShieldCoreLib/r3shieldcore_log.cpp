@@ -3,6 +3,12 @@
 #include "r3shieldcore_channel.h"
 #include "logger.h"
 
+// ★ v81：事件日志行的**格式化实现**（唯一一份，铁律 127）。
+//   原来这段逻辑就在本文件的 `WriteEventLine` 里；v81 起引擎侧也要同一份
+//   文本（配置工具向引擎要数据，而不是去读日志文件），所以搬进共享头。
+//   ⇒ 本文件不再保留任何行格式化的副本。
+#include <r3shieldcore/log_line.h>
+
 namespace
 {
 	wil::unique_hfile g_file;
@@ -100,187 +106,27 @@ namespace
 		if (!g_file) {
 			return;
 		}
-		FILETIME fileTime;
-		fileTime.dwLowDateTime = static_cast<DWORD>(event.TimeStamp & 0xFFFFFFFF);
-		fileTime.dwHighDateTime = static_cast<DWORD>(event.TimeStamp >> 32);
 
-		FILETIME localFileTime;
-		SYSTEMTIME systemTime = {};
-		if (FileTimeToLocalFileTime(&fileTime, &localFileTime) && FileTimeToSystemTime(&localFileTime, &systemTime)) {
-			// 已转换成功
-		}
-		else {
-			GetLocalTime(&systemTime);
-		}
-
-		char keyPath[1024] = {};
-		char valueName[512] = {};
-		ToUtf8(event.KeyPath, static_cast<int>(event.KeyPathLength), keyPath, sizeof(keyPath));
-		ToUtf8(event.ValueName, static_cast<int>(event.ValueNameLength), valueName, sizeof(valueName));
-
-		// 进程旁路事件的第二字段是 CommandLine（不是 ValueName）。
-		// DLL 加载事件没有第二字段（KeyPath 已经是完整 DLL 路径）。
-		char spawnCmd[1200] = {};
-		const bool objectIsSpawn = (static_cast<R3ShieldCore::ObjectType>(event.ObjectType)
-			== R3ShieldCore::ObjectType::ProcessSpawn);
-		if (objectIsSpawn) {
-			ToUtf8(event.CommandLine, static_cast<int>(wcslen(event.CommandLine)),
-				spawnCmd, sizeof(spawnCmd));
-		}
-
-		// 不同对象类型的第二个字段含义不同，标签必须区分，否则日志读串：
-		//   文件     → ValueName 是改名后的新名字
-		//   驱动     → ValueName 是服务名
-		//   网络     → 无 ValueName，第二个字段由 TargetPort/NetProtocol 合成
-		//   hive 级  → ValueName 是 hive 文件路径
-		//   键级     → ValueName 才是值名
-		//   进程/线程 → 无第二个字段（pid 跟在路径后面）
-		//   摄像头   → 无第二个字段（KeyPath 是设备/接口说明）
-		//   输入钩子 → KeyPath 是注入的模块路径，ValueName 是钩子类型
-		//   截屏     → KeyPath 是来源（屏幕 DC / 窗口），ValueName 是区域
-		//   DLL加载  → KeyPath / DllPath 都是被加载的 DLL 路径，无第二字段
-		//   剪贴板   → KeyPath 是"打开/读取"，ValueName 是格式
-		//   进程旁路 → KeyPath 是目标映像，CommandLine 是命令行（第二字段）
-		const auto objectType = static_cast<R3ShieldCore::ObjectType>(event.ObjectType);
-		const bool isFile = (objectType == R3ShieldCore::ObjectType::File);
-		const bool isDriver = (objectType == R3ShieldCore::ObjectType::Driver);
-		const bool isProc = (objectType == R3ShieldCore::ObjectType::Process);
-		const bool isThread = (objectType == R3ShieldCore::ObjectType::Thread);
-		const bool isNetwork = (objectType == R3ShieldCore::ObjectType::Network);
-		const bool isCamera = (objectType == R3ShieldCore::ObjectType::Camera);
-		const bool isInputHook = (objectType == R3ShieldCore::ObjectType::InputHook);
-		const bool isScreen = (objectType == R3ShieldCore::ObjectType::Screen);
-		const bool isDllLoad = (objectType == R3ShieldCore::ObjectType::DllLoad);
-		const bool isClipboard = (objectType == R3ShieldCore::ObjectType::Clipboard);
-		const bool isSpawn = (objectType == R3ShieldCore::ObjectType::ProcessSpawn);
-		const bool isServiceConfig = (objectType == R3ShieldCore::ObjectType::ServiceConfig);
-		const bool isComHijack = (objectType == R3ShieldCore::ObjectType::ComHijack);
-		const bool isScheduledTask = (objectType == R3ShieldCore::ObjectType::ScheduledTask);
-		const bool isTokenTheft = (objectType == R3ShieldCore::ObjectType::TokenTheft);
-		const bool isWmiSubscription = (objectType == R3ShieldCore::ObjectType::WmiSubscription);
-		const bool hive = !isFile && !isDriver && !isProc && !isThread && !isNetwork &&
-			!isCamera && !isInputHook && !isScreen && !isDllLoad && !isClipboard && !isSpawn &&
-			!isServiceConfig && !isComHijack && !isScheduledTask &&
-			!isTokenTheft && !isWmiSubscription &&
-			(event.TargetKind == static_cast<ULONG>(R3ShieldCore::TargetKind::Hive));
-
-		const char* secondLabel = isDriver ? "  service="
-			: (isFile ? "  rename="
-			: (isInputHook ? "  hook="
-			: (isScreen ? "  area="
-			: (isClipboard ? "  format="
-			: (isSpawn ? "  cmd="
-			: (isServiceConfig ? "  detail="
-			: (isComHijack ? "  server="
-			: (isScheduledTask ? "  action="
-			: (isTokenTheft ? "  detail="
-			: (isWmiSubscription ? "  detail="
-			: (hive ? "  file=" : "  value=")))))))))));
-		const char* firstLabel = isDriver ? "driver="
-			: (isFile ? "path="
-			: (isNetwork ? "peer="
-			: (isCamera ? "device="
-			: (isInputHook ? "module="
-			: (isScreen ? "source="
-			: (isDllLoad ? "dll="
-			: (isClipboard ? "what="
-			: (isSpawn ? "image="
-			: (isServiceConfig ? "object="
-			: (isComHijack ? "clsid="
-			: (isScheduledTask ? "task="
-			: (isTokenTheft ? "target="
-			: (isWmiSubscription ? "class="
-			: (isProc ? "image=" : (isThread ? "target=" : (hive ? "target=" : "key="))))))))))))))));
-
-		// 进程/线程事件把 pid 跟成 "(pid=N)"，拼进 keyPath 缓冲之后。
-		char procSuffix[32] = {};
-		if ((isProc || isThread) && event.TargetProcessId != 0) {
-			snprintf(procSuffix, sizeof(procSuffix), "  (pid=%u)", event.TargetProcessId);
-		}
-
-		// 网络事件：把端口/协议合成第二字段（ValueName 是空的）。
-		char netDetail[160] = {};
-		if (isNetwork) {
-			if (event.Op == static_cast<ULONG>(R3ShieldCore::NetOp::DnsQuery)) {
-				strcpy_s(netDetail, "dns");
-			}
-			else if (event.TargetPort != 0) {
-				snprintf(netDetail, sizeof(netDetail), "%u/%s",
-					event.TargetPort, R3ShieldCore::NetProtocolName(event.NetProtocol));
-			}
-			else {
-				strcpy_s(netDetail, "n/a");
-			}
-		}
-
-		// 尾部标记。高危优先显示，和"[by R3ShieldCore]"可以并存。
-		char tags[128] = {};
-		if (event.Flags & R3ShieldCore::FlagEventHighRisk) {
-			strcat_s(tags, "  [HIGH-RISK]");
-		}
-		if (event.Flags & R3ShieldCore::FlagEventBlocked) {
-			strcat_s(tags, "  [by R3ShieldCore]");
-		}
-		// ★ v26：全拦模式下"可问项因询问通道不可用而降级放行"。
+		// ★ v81：这一行的**格式**搬去了共享头 `shared/r3shieldcore/log_line.h`
+		//   （铁律 127）。为什么必须搬：
 		//
-		//   为什么必须在日志里显式标出来：这种放行**不是判定结论**，
-		//   而是"该问没问成"的降级。如果日志里看不出来，事后审计会以为
-		//   "这条本来就不该拦"，掩盖了"引擎询问通道坏了"这个真问题
-		//   （VM 实测 2026-09-30：17 条 `key=Software` 静默被拒，
-		//    看日志**完全看不出**是因为通道不可用才走的 fallback）。
-		if (event.Flags2 & R3ShieldCore::FlagEvent2AskUnavailable) {
-			strcat_s(tags, "  [ASK-UNAVAIL→ALLOW]");
-		}
-
-		char line[2048] = {};
-		// ⚠️ 格式串的 %s 个数必须和后面传的实参**严格一致**。
-		//    多一个 %s 会让 snprintf 去读一个不存在的指针 → 立刻 0xC0000005。
-		//    头部 2 个 %s：进程名（紧跟 pid= 方括号内）；
-		//    尾部 6 个 %s：firstLabel / keyPath / procSuffix / 第二字段标签 /
-		//                  第二字段值 / tags。
-		//    合计 8 个 %s，逐个核对下面的实参。
+		//     这一行文本原来只有 DLL 需要（它落盘）。v81 起引擎（主程序）也需要
+		//     **同一份文本** —— 配置工具要“向引擎要数据”，而不是自己去读日志文件。
+		//     如果引擎那边照着重写一遍格式化，两边迟早漂：改个标签、多个空格
+		//     都不会报错，只是“界面上看到的”和“日志文件里看到的”变成两种东西。
 		//
-		// 第二字段的取值按对象类型分流：
-		//   网络     → 合成的 proto/detail（在 netDetail 里）
-		//   进程旁路 → CommandLine（spawnCmd）
-		//   其余     → ValueName（没有就整段留空）
-		const bool hasSecondField = isNetwork || objectIsSpawn || valueName[0];
-		const char* secondTag = isNetwork ? "  proto="
-			: (objectIsSpawn ? secondLabel : (valueName[0] ? secondLabel : ""));
-		const char* secondValue = isNetwork ? netDetail
-			: (objectIsSpawn ? spawnCmd : (valueName[0] ? valueName : ""));
+		//   ⚠️ 本函数现在只做两件事：解析进程名（DLL 侧有它自己的窄字符缓存）、
+		//      把返回值**逐字节**写出去（含行尾 CRLF，由 FormatEventLine 带）。
+		//      格式化逻辑一个字都不许在这里重复。
+		const std::string line = R3ShieldCoreLogLine::FormatEventLine(
+			event, ResolveProcessName(event.ProcessId));
 
-		// 进程名。取不到时退化成 "pid=<N>" 独占（保持原有信息不丢）。
-		const char* processName = ResolveProcessName(event.ProcessId);
-
-		int length = snprintf(line, sizeof(line),
-			"%04u-%02u-%02u %02u:%02u:%02u.%03u  pid=%-6u[%s] tid=%-6u  %-4s %-11s %-4s %-16s  status=0x%08X  %s%s%s%s%s%s\r\n",
-			systemTime.wYear, systemTime.wMonth, systemTime.wDay,
-			systemTime.wHour, systemTime.wMinute, systemTime.wSecond, systemTime.wMilliseconds,
-			event.ProcessId, processName[0] ? processName : "?",
-			event.ThreadId,
-			R3ShieldCore::ObjectTypeName(event.ObjectType),
-			R3ShieldCore::DecisionName(event.Decision),
-			(event.Flags & R3ShieldCore::FlagEventHighRisk) ? "HIGH" : "",
-			R3ShieldCore::AnyOpName(event.ObjectType, event.Op),
-			event.Status,
-			firstLabel,
-			keyPath[0] ? keyPath : "(unknown)",
-			procSuffix,
-			hasSecondField ? secondTag : "",
-			hasSecondField ? secondValue : "",
-			tags);
-
-		if (length <= 0) {
+		if (line.empty()) {
 			return;
 		}
 
-		if (length > static_cast<int>(sizeof(line))) {
-			length = static_cast<int>(sizeof(line));
-		}
-
 		DWORD written = 0;
-		WriteFile(g_file.get(), line, static_cast<DWORD>(length), &written, nullptr);
+		WriteFile(g_file.get(), line.data(), static_cast<DWORD>(line.size()), &written, nullptr);
 	}
 }
 

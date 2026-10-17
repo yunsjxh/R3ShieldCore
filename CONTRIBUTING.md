@@ -24,7 +24,7 @@
 1. **`MSBuild.exe` 可能被安全策略按名字拦截**，`devenv.com` 在本项目里只会把 IDE
    拉起来、不执行命令行构建。所以所有构建都**直接调 `cl.exe` / `link.exe`**
    （`build.sh` 就是这么做的），**不要**新增 `.vcxproj` 依赖。
-2. **仓库路径可能含非 ASCII 字符**（开发机就是 `D:\用户态杀软`）。
+2. **仓库路径可能含非 ASCII 字符**（例如 `D:\我的项目`）。
    编译参数必须带 `-source-charset:utf-8`，脚本里所有路径都要加引号。
 
 ---
@@ -45,7 +45,15 @@ bash driver/build_driver.sh # 内核驱动（可选）
 ```bash
 bash build_ut.sh           # 规则层单测
 bash build_guard_ut.sh     # guard 层单测（链 MinHook）
+bash build_log_line_rt_ut.sh   # 日志行唯一实现 + 协议编解码单测（v81，链真代码）
+bash build_cfg_ipc_probe.sh    # 配置工具 ⇄ 引擎 管道协议端到端夹具（v81）
 ```
+
+> ★ **v81 的两个夹具都不跑引擎**（引擎那份事件流是**进程内**的，夹具自己起一个
+> "假引擎"服务端，复用与生产**同一份**共享头编解码）：
+> `_t/log_line_rt_ut/log_line_rt_ut.exe [真实日志]` —— 带日志文件时做**逐字节回环**；
+> `_t/cfg_ipc_probe/cfg_ipc_probe.exe`（加 `--neg` 走**反向对照**，**应报失败**
+> ⇒ 证明判据有分辨力）。两个都要跑 `x64` 与 `x86`。
 
 **回传数据替换（Spoof）的机制探针** —— 自包含、不注入任何进程、不经过引擎，
 所以**不受**"本机禁止运行引擎"那条约束（铁律 175）：

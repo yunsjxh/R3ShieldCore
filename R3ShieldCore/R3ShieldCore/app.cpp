@@ -9,6 +9,14 @@
 #include "r3shieldcore_sentinel.h"
 #include "r3shieldcore_procwatch.h"
 #include "r3shieldcore_ark.h"
+// ★ v81：配置工具 ⇄ 引擎 的管道**服务端**。
+//   配置工具的日志页 / 配置页不再自己去 tail 日志文件，改成向引擎要数据；
+//   引擎这边由它回答（协议在共享头 shared/r3shieldcore/cfg_ipc.h，铁律 127）。
+#include "r3shieldcore_cfgipc.h"
+// ★ v80：配置工具（r3shieldcore-cfg.exe）的启动 / 激活契约。
+//   「高级」规则编辑台搬去了 cfg，主程序启动时要顺手把它拉起来。
+//   窗口类名 / 激活消息 / 页号 / exe 名只在那个头里定义一份（铁律 127）。
+#include <r3shieldcore/cfg_launch.h>
 #include <atomic>
 #include <clocale>
 #include <fcntl.h>
@@ -795,6 +803,38 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
 
 		if (R3ShieldCoreGui::Start(guiOptions)) {
 			printf("界面窗口    : 已打开（关掉窗口不退出引擎，会继续在后台记录）\n");
+
+			// ★ v80：顺手把配置工具（r3shieldcore-cfg.exe）也拉起来。
+			//
+			//   为什么：v80 把「高级」规则编辑台从主程序**整块搬去**了 cfg
+			//   （主程序那一页现在只剩一个跳转按钮）。既然用户几乎总要用它，
+			//   就在启动时一起拉起来 —— 点「高级」时它是"已经在跑"的状态，
+			//   直接被激活，不会多等一次冷启动。
+			//
+			//   ★ `quiet = true` 是这里的**关键**：这是自动行为，不是用户点的。
+			//     · cfg 已经在跑 ⇒ 什么都不做（连切页都不做，更不抢焦点）；
+			//     · 没在跑       ⇒ 最小化启动（SW_SHOWMINNOACTIVE），
+			//                       且带上 `--quiet` —— 万一并发撞上
+			//                       单实例互斥体，第二个进程会安静退出，
+			//                       不会去"激活已有窗口"抢前台。
+			//     （UIAccess 接管时父 / 子两个实例会并发走到这一段，
+			//       这个 race 是真实存在的，见 cfg_launch.h 的 kQuietSwitch。）
+			//
+			//   ★ 失败**只记日志、不弹窗**：自动拉起失败不该在启动时拦一个框；
+			//     用户真要用的时候点「高级」，那条路径会把原因画在页内。
+			{
+				R3ShieldCoreCfg::LaunchOptions cfgOptions;
+				cfgOptions.page = R3ShieldCoreCfg::kPageAdvanced;
+				cfgOptions.quiet = true;
+				std::wstring cfgError;
+				if (R3ShieldCoreCfg::LaunchOrActivate(cfgOptions, &cfgError)) {
+					printf("配置工具    : 已拉起（r3shieldcore-cfg.exe）\n");
+				}
+				else {
+					printf("配置工具    : 拉起失败 —— %ls\n", cfgError.c_str());
+				}
+				fflush(stdout);   // 铁律 80：诊断 printf 必须紧跟 fflush
+			}
 		}
 		else {
 			printf("界面窗口    : 打开失败，详情写入 r3shieldcore-console.log\n");
@@ -862,6 +902,61 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
 					static_cast<unsigned>(replay.LinesParsed));
 			}
 		}
+
+		//
+		// ==================================================================
+		// ★ v81：配置工具接口（管道服务端）
+		// ==================================================================
+		//
+		// 为什么放在这里（EngineControl 已建好、历史已回放完，主循环之前）：
+		//   · CONFIG 回答的是**引擎真正读到的那份 Policy / EngineSettings**
+		//     —— 两者在上面都已就位；
+		//   · LOG 读的是 `R3ShieldCoreStats` 的环形缓冲 —— 放在回放之后，
+		//     配置工具一连上就能看到"本次启动前的历史"（占序号 1..N），
+		//     不必自己去读文件（这正是用户要的效果）；
+		//   · 主循环一跑起来，`PollSync` 就能处理配置工具发来的"保存后同步"。
+		//
+		// ⚠️ 启动失败**不拦启动**：这只是"配置工具能不能向引擎要数据"，
+		//    失败了配置工具会回落去读日志文件，引擎照常工作。
+		//
+		bool cfgIpcStarted = false;
+		{
+			R3ShieldCoreCfgIpcServer::Options ipcOptions;
+			ipcOptions.Policy = &policy;
+			ipcOptions.EngineSettings = &engineSettings;
+			// ★ 与 `R3ShieldCoreConfig::Load` 内部用的是同一个解析函数
+			//   （铁律 127：路径规则只写一份）—— 配置工具拿它和
+			//   "自己算出来的配置文件路径"对，不一致时明说。
+			ipcOptions.IniPath = R3ShieldCoreConfig::ResolveConfigPath(exeDirectory);
+			ipcOptions.ExeDirectory = exeDirectory;
+
+			cfgIpcStarted = R3ShieldCoreCfgIpcServer::Start(ipcOptions);
+			if (cfgIpcStarted) {
+				printf("配置工具接口: 已启动（%ls）\n",
+					R3ShieldCoreCfgIpc::PipeName().c_str());
+			}
+			else {
+				printf("配置工具接口: 启动失败（配置工具将回落为读日志文件）\n");
+			}
+			fflush(stdout);   // 铁律 80：诊断 printf 必须紧跟 fflush
+		}
+
+		// RAII 收尾：异常 / 提前返回也要把服务线程停掉。
+		// ⚠️ 必须**早于** `EngineControl` 析构 —— 服务线程持有
+		//    `Options.Policy` 指针，那个对象就在 `EngineControl` 的同一个
+		//    作用域里（声明顺序保证本 guard 先析构，见下面的 InjectionThreadGuard）。
+		struct CfgIpcGuard
+		{
+			bool active = false;
+			~CfgIpcGuard() noexcept
+			{
+				if (active) {
+					R3ShieldCoreCfgIpcServer::Stop();
+				}
+			}
+		};
+		CfgIpcGuard cfgIpcGuard;
+		cfgIpcGuard.active = cfgIpcStarted;
 
 		printf("开始全局注入，正在接管非系统程序的注册表行为。详情写入 r3shieldcore-console.log。\n\n");
 
@@ -1047,6 +1142,16 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
 				ApplyMode(engineControl, requestedMode, exeDirectory);
 			}
 
+			// ★ v81：处理配置工具发来的「保存后立即同步」（重读 ini + 热应用）。
+			//
+			//   为什么必须在这里做、不能由服务线程直接做：
+			//     `SetMode` 会碰 DLL 侧共享内存、必要时还会建询问通道
+			//     （`R3ShieldCorePrompt::Create`）—— 那是主循环线程的活。
+			//     服务线程只把请求挂起来，等这里的结论（5s 超时回 ERR，不挂死）。
+			//
+			//   没有请求时它只是一次原子读，开销可忽略。
+			R3ShieldCoreCfgIpcServer::PollSync(engineControl);
+
 			// 高频排空，避免全开模式下后台进程的正常噪音在 1 秒内
 			// 把环形缓冲区套圈。
 			if (drainElapsedMs >= 100) {
@@ -1134,6 +1239,32 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
 		//     （见 r3shieldcore_ark.cpp 的 Stop）—— 这些动作不依赖会话；
 		//   · 但界面还在跑的时候停它没有意义（界面会显示一个空列表）。
 		R3ShieldCoreArk::Stop();
+
+		//
+		// ★ v81：配置工具接口的收尾。
+		//
+		// 位置：在 GUI / ARK 停掉之后、`EngineControl` 析构之前。
+		//   · 服务线程持有 `Options.Policy` 指针（就是本作用域的 `policy`），
+		//     所以必须早于它析构 —— `CfgIpcGuard` 也会兜一次（Stop 可重复调）。
+		//   · 这里先停：正在等 SYNC 结论的配置工具会立刻拿到 ERR，
+		//     而不是干等 5 秒（引擎要退出了，它等不到结果）。
+		//
+		// 计数打出来是**为了核对**：探针可以据此判断"配置工具到底有没有连上、
+		// 有没有真的走过管道"，而不是只看界面上有没有字。
+		//
+		{
+			const R3ShieldCoreCfgIpcServer::Stats ipc = R3ShieldCoreCfgIpcServer::GetStats();
+			printf("配置工具接口: 关闭（连接 %lu 次，日志 %lu 次，配置 %lu 次，同步 %lu 次，"
+				"错误 %lu，无法识别 %lu）\n",
+				static_cast<unsigned long>(ipc.Accepted),
+				static_cast<unsigned long>(ipc.LogRequests),
+				static_cast<unsigned long>(ipc.ConfigRequests),
+				static_cast<unsigned long>(ipc.SyncRequests),
+				static_cast<unsigned long>(ipc.Errors),
+				static_cast<unsigned long>(ipc.Malformed));
+			fflush(stdout);
+			R3ShieldCoreCfgIpcServer::Stop();
+		}
 
 		//
 		// ★ v54：正常退出前存最后一次（准的那次）。

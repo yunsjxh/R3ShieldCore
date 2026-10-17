@@ -1,6 +1,10 @@
 ﻿#include "stdafx.h"
 #include "r3shieldcore_stats.h"
 
+// ★ v81：日志行的格式化实现（与 DLL 落盘用的是同一个函数，铁律 127）。
+//   `OnEvent` 拿到的是**原始 Event**，只有在这里才能把那一行原样生成出来。
+#include <r3shieldcore/log_line.h>
+
 #include <algorithm>
 #include <psapi.h>
 
@@ -391,6 +395,12 @@ namespace R3ShieldCoreStats
 			row.Status = event.Status;
 			row.Flags = event.Flags;
 			row.TargetProcessId = event.TargetProcessId;
+			// ★ v81：这两个字段只为"把日志行原样重现"而留（见 LogEntry::Line）。
+			//   `ThreadId` 是日志行里的 `tid=`，`Flags2` 决定行尾有没有
+			//   `[ASK-UNAVAIL→ALLOW]` —— 少了它们，引擎给的那行会和文件里的
+			//   那行**不一样**，而两条路都不报错（铁律 24）。
+			row.ThreadId = event.ThreadId;
+			row.Flags2 = event.Flags2;
 			row.BlockedByUs = (event.Flags & R3ShieldCore::FlagEventBlocked) != 0;
 			row.IsHive = !isFile && R3ShieldCore::IsHiveOp(event.Op);
 			row.IsHighRisk = (event.Flags & R3ShieldCore::FlagEventHighRisk) != 0;
@@ -443,6 +453,20 @@ namespace R3ShieldCoreStats
 				}
 
 				row.Value.assign(detail);
+			}
+
+			// ★ v81：把"日志文件里的那一行"当场生成好（详见 LogEntry::Line 的注释）。
+			//
+			//   为什么在这里做、而不是等界面/配置工具来问的时候做：
+			//     · 这里**手上有原始的 Event**（`TargetKind`、`ThreadId`、`Flags2`、
+			//       `TargetPort` 这些字段都没进 LogEntry）；出了这个函数就只剩
+			//       被加工过的 Target/Value，再想拼回原文是拼不出来的
+			//       （比如网络事件的 Value 已经被换成中文的"端口 443 (TCP)"）。
+			//     · 用的是 DLL 落盘用的**同一个**格式化函数 ⇒ 两条路显示的字一样。
+			{
+				const std::string nameUtf8 = R3ShieldCoreText::WideToUtf8(row.ProcessName);
+				row.Line = R3ShieldCoreLogLine::StripForDisplay(
+					R3ShieldCoreLogLine::FormatEventLine(event, nameUtf8.c_str()));
 			}
 		}
 
