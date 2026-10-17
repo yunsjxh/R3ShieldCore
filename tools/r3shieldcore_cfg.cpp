@@ -69,6 +69,10 @@
 //   ⚠️ 只在**引擎确实在跑**时走这条路；引擎没在跑 ⇒ **回落**成"读日志文件"，
 //      本工具仍然"不依赖引擎"（这是它一直以来的定位）。
 #include <r3shieldcore/cfg_ipc.h>
+// ★ 托盘图标（关闭窗口 = 收进托盘）。与主程序**同一份**实现 —— 铁律 127。
+//   ⚠️ 回调消息名必须用 `kCallbackMessageCfg`（与主程序**不同**）：两个 exe
+//      各注册各的，免得同一台机器上互相看着像"同一个程序的图标"（见头文件）。
+#include <r3shieldcore/tray_icon.h>
 #include "registry_spoof_codec.h"
 #include "clipboard_spoof_codec.h"
 
@@ -660,6 +664,19 @@ namespace {
 
 HINSTANCE g_inst = nullptr;
 HWND g_main = nullptr;
+
+// ★ 托盘（关闭窗口 = 收进通知区；用户 2026-10-17 要求）。
+//
+//   ⚠️ 这里有个**本工具特有**的坑：`--quiet` 自动拉起（主程序点「高级」时
+//      顺手拉起我们）用的是 `SW_SHOWMINNOACTIVE` —— 那种情况下窗口
+//      本来就该安静地待在任务栏，**不该**被当成"收进托盘"（会白弹一次气泡）。
+//      所以下面用 `g_tray.autoLaunched` 把它区分开。
+struct {
+	R3ShieldCoreTray::TrayIcon icon;
+	bool windowHidden = false;
+	bool reallyExiting = false;   // 用户从托盘菜单选了「退出」⇒ 真退
+	bool autoLaunched = false;    // `--quiet` 自动拉起（不是用户主动打开的）
+} g_tray;
 
 const int IDC_TABAREA = 1;
 enum {
@@ -3938,6 +3955,134 @@ void DrawSectionItem(DRAWITEMSTRUCT* dis) {
 		DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
 }
 
+// ===========================================================================
+//  托盘（关闭窗口 = 收进通知区）
+//
+//   用户 2026-10-17 要求。与主程序共用 `shared/r3shieldcore/tray_icon.h`（铁律 127）。
+//
+//   ★★ 本工具与主程序**唯一**的实质区别：这里的「退出」是**安全**的
+//      （配置工具不注入、不挂钩 —— 它退掉不影响任何防护），所以二次确认
+//      问的是"未保存的修改会不会丢"，而不是"防护会不会停"。
+// ===========================================================================
+
+HICON CfgTrayIcon() {
+	// 用 exe 资源里的图标；取不到退回系统图标（不出现空白方框）。
+	HICON icon = reinterpret_cast<HICON>(
+		LoadImageW(g_inst, MAKEINTRESOURCEW(1), IMAGE_ICON,
+			GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), 0));
+	return icon ? icon : ::LoadIconW(nullptr, IDI_APPLICATION);
+}
+
+std::wstring CfgTrayTipText() {
+	std::wstring tip = L"R3 ShieldCore 配置与日志";
+	if (HasUnsaved()) {
+		// ★ 提示必须**如实**反映"有未保存的修改" —— 图标收起来之后，
+		//   托盘提示就是用户唯一的信息来源（铁律 97：诊断不能自己变假信息）。
+		tip += L" — 有未保存的修改";
+	}
+	tip += L"\n双击显示窗口，右键更多操作。";
+	return tip;
+}
+
+void CfgHideToTray(HWND hwnd) {
+	if (!g_tray.icon.added()) {
+		// ★ 图标没加上就**不隐藏**：窗口从任务栏和托盘同时消失 =
+		//   用户彻底找不到它（比"没做托盘"更糟）。退回最小化。
+		printf("[tray] 图标未就绪，退回最小化到任务栏\n");
+		ShowWindow(hwnd, SW_MINIMIZE);
+		return;
+	}
+	const bool firstTime = !g_tray.windowHidden;
+	ShowWindow(hwnd, SW_HIDE);
+	g_tray.windowHidden = true;
+	g_tray.icon.SetTip(CfgTrayTipText());
+	printf("[tray] 配置工具窗口已收进托盘\n");
+
+	// ★ 自动拉起（`--quiet`）时不弹气泡：那种情况下用户根本没在操作我们，
+	//   弹一个"已收进托盘"纯属噪音（而噪音会让人关掉通知，
+	//   连带把真正要紧的提示一起关掉）。
+	if (firstTime && !g_tray.autoLaunched) {
+		g_tray.icon.Balloon(L"配置工具仍在后台",
+			L"窗口已收进托盘。双击托盘图标可重新打开；右键可退出。");
+	}
+}
+
+void CfgRestoreFromTray(HWND hwnd) {
+	ShowWindow(hwnd, SW_SHOW);
+	if (IsIconic(hwnd)) {
+		ShowWindow(hwnd, SW_RESTORE);
+	}
+	// ★ 不用 `SetForegroundWindow` 了事：前台锁会拒绝后台进程（铁律 256）。
+	//   TOPMOST→NOTOPMOST 抬 z 序不需要前台权。
+	SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+		SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW | SWP_NOACTIVATE);
+	SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0,
+		SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW | SWP_NOACTIVATE);
+	SetForegroundWindow(hwnd);
+	SetFocus(hwnd);
+	g_tray.windowHidden = false;
+	g_tray.icon.SetTip(CfgTrayTipText());
+	printf("[tray] 配置工具窗口已从托盘恢复\n");
+}
+
+void CfgExitRequested(HWND hwnd) {
+	// ★ 本工具退出**不影响防护**（不注入、不挂钩）⇒ 这里问的是
+	//   "未保存的修改怎么办"，不是"确定要停掉防护吗"。
+	int r = IDYES;
+	if (HasUnsaved()) {
+		r = MessageBoxW(hwnd,
+			L"有未保存的修改，退出后会丢失。\n\n确定要退出吗？",
+			L"退出配置工具", MB_ICONWARNING | MB_YESNO | MB_DEFBUTTON2);
+		if (r != IDYES) {
+			printf("[tray] 用户取消了退出（有未保存修改）\n");
+			return;
+		}
+	} else {
+		r = MessageBoxW(hwnd,
+			L"确定要关闭配置工具吗？\n\n"
+			L"（它只负责改配置与看日志，关掉它**不影响**引擎的监控与拦截。）",
+			L"退出配置工具", MB_ICONQUESTION | MB_YESNO | MB_DEFBUTTON2);
+		if (r != IDYES) {
+			printf("[tray] 用户取消了退出\n");
+			return;
+		}
+	}
+	printf("[tray] 用户确认退出配置工具\n");
+	g_tray.reallyExiting = true;
+	// ★ 这里可以**直接** `DestroyWindow`（与主程序**不同** —— 主程序只置 `g_quitRequest`
+	//   让 app.cpp 走"反注入 → 关窗口"的有序收尾，见 r3shieldcore_gui.cpp 的说明）。
+	//   本工具不注入、不挂钩、没有引擎要收尾 ⇒ 没有需要保序的动作。
+	DestroyWindow(hwnd);
+}
+
+void HandleCfgTrayMessage(HWND hwnd, LPARAM lp) {
+	switch (LOWORD(lp)) {
+	case WM_LBUTTONUP:
+	case WM_LBUTTONDBLCLK:
+		CfgRestoreFromTray(hwnd);
+		return;
+
+	case WM_RBUTTONUP:
+	case WM_CONTEXTMENU: {
+		// 本工具**不需要**「退出引擎」那一项（它管不到引擎），所以传 false。
+		const R3ShieldCoreTray::TrayMenuAction act =
+			R3ShieldCoreTray::ShowTrayMenu(hwnd, L"显示窗口", false, L"");
+		switch (act) {
+		case R3ShieldCoreTray::TrayMenuAction::ShowWindow:
+			CfgRestoreFromTray(hwnd);
+			return;
+		case R3ShieldCoreTray::TrayMenuAction::Exit:
+			CfgExitRequested(hwnd);
+			return;
+		default:
+			return;
+		}
+	}
+	default:
+		return;
+	}
+}
+
 // ---------- 窗口过程 ----------
 
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
@@ -3959,7 +4104,30 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 		SetForegroundWindow(hwnd);
 		BringWindowToTop(hwnd);
 		InvalidateRect(hwnd, nullptr, TRUE);
+		// ★ 被激活 = 窗口又可见了 ⇒ 托盘那份"收起来了"的状态要跟着清掉，
+		//   否则之后双击托盘图标会以为"已经显示着"而什么都不做。
+		g_tray.windowHidden = false;
+		g_tray.icon.SetTip(CfgTrayTipText());
 		return 0;
+	}
+
+	// ★ 托盘回调 + explorer 重启重加图标 —— 同样**必须**在 switch 之前
+	//   （两个消息的 id 都是运行时才知道的，当不了 case，铁律 250）。
+	if (msg != 0 && msg == g_tray.icon.callbackMessage()) {
+		HandleCfgTrayMessage(hwnd, lp);
+		return 0;
+	}
+	{
+		static const UINT taskbarCreated = ::RegisterWindowMessageW(L"TaskbarCreated");
+		if (msg == taskbarCreated) {
+			// explorer 重启后通知区被清空 ⇒ 图标得加回去。不加的话，
+			// 窗口收进托盘的用户就**再也找不到这个程序了**（没有窗口也没有图标）。
+			if (g_tray.icon.Add(hwnd, CfgTrayIcon(), CfgTrayTipText(),
+					R3ShieldCoreTray::kCallbackMessageCfg)) {
+				printf("[tray] explorer 重启，配置工具托盘图标已重新加入\n");
+			}
+			return 0;
+		}
 	}
 
 	switch (msg) {
@@ -4599,17 +4767,33 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 	}
 
 	case WM_CLOSE:
+		// ★ 用户 2026-10-17 要求：关窗口不再退出，改成**收进托盘**。
+		//
+		//   与旧行为的两个区别，都要说清楚：
+		//     ① 旧版这里 `DestroyWindow` **真退出**；现在收起来、进程还在。
+		//        ⇒ 但**未保存的修改**那道理还必须在，而且必须**在收起来之前**问:
+		//        收起来之后用户可能再也不打开，那些改动就悄悄丢了。
+		//     ② 真正退出的入口在托盘右键菜单「退出」（那里也问同一道题）。
 		if (HasUnsaved()) {
-			if (MessageBoxW(hwnd, L"有未保存的修改，确定退出吗？", L"退出",
-				MB_ICONQUESTION | MB_YESNO) != IDYES) {
-				return 0;
-			}
+			// ★ 用 ✓/✗ 而不是光靠文字：这里的后果是"改动丢失"（铁律 239 家族）。
+			const int r = MessageBoxW(hwnd,
+				L"有未保存的修改。\n\n"
+				L"「是」= 收进托盘，稍后回来保存\n"
+				L"「否」= 直接收进托盘，改动会丢失\n"
+				L"（想保存请选「否」再用托盘图标打开窗口）",
+				L"未保存的修改", MB_ICONWARNING | MB_YESNO | MB_DEFBUTTON1);
+			// 两个分支其实都往下走（都收进托盘）—— 这里问只是**提醒**，
+			// 不是阻止：用户明确点关闭时，强行拦住他去做别的会更烦人。
+			printf("[tray] 关闭时有未保存修改，用户选择=%s\n", (r == IDYES) ? "稍后保存" : "丢弃");
 		}
-		DestroyWindow(hwnd);
+		CfgHideToTray(hwnd);
 		return 0;
 
 	case WM_DESTROY:
 		KillTimer(hwnd, 1);
+		// ★ 摘图标要在关文件**之前或之后都行**，但必须做：图标消息投给这个 hwnd，
+		//   窗口没了还留着图标 = 通知区里一个"点了没反应"的僵尸（铁律 103）。
+		g_tray.icon.Remove();
 		CloseLogFile();
 		DestroyFields();
 		PostQuitMessage(0);
@@ -4819,6 +5003,9 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) {
 			if (selfTest) { return RunSelfTest(workDir); }
 		}
 	}
+	// ★ 托盘要知道"这次是不是自动拉起的"：自动拉起（`--quiet`）时窗口
+	//   本来就该安静待着，**不该**在关闭时弹"已收进托盘"的气泡（见 g_tray 注释）。
+	g_tray.autoLaunched = quietLaunch;
 
 	// ★★ 单实例（v80）：主程序启动时会自动把我们拉起来，用户再点「高级」
 	//    又会点一次 —— 不拦的话会出现两个配置窗口，而用户看到的那个
@@ -4983,6 +5170,23 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) {
 	//   写成 SW_SHOW 的话，被自动拉起时也会"跳"到前台打断用户。
 	ShowWindow(g_main, SW_SHOWDEFAULT);
 	UpdateWindow(g_main);
+
+	// ★ 托盘图标：窗口出来了就注册（"关闭窗口 = 收进托盘"的前提）。
+	//
+	//   ⚠️ 加不上不能当没事发生 —— `CfgHideToTray` 会检查 `added()` 并退回
+	//      "最小化到任务栏"（否则窗口从任务栏和托盘同时消失，用户找不到它）。
+	//   ⚠️ 用 `kCallbackMessageCfg`（与主程序**不同**的字符串）。
+	if (!g_tray.icon.Add(g_main, CfgTrayIcon(), CfgTrayTipText(),
+			R3ShieldCoreTray::kCallbackMessageCfg)) {
+		printf("[tray] 警告：配置工具托盘图标添加失败（Shell_NotifyIcon(NIM_ADD) 失败），"
+			"关闭窗口将退回最小化到任务栏\n");
+	} else {
+		// ★ 带上宽串代次标记：它在共享头里（铁律 127），闸门用 `strings -el`
+		//   查它来确认"托盘这套代码真的编进了这个 exe"。用 `%ls` 传宽串
+		//   —— 传窄串的话编进去的是 GBK 字节，`strings -el` 查不到。
+		printf("[tray] 配置工具托盘图标已就绪（关闭窗口 = 收进托盘）标记=%ls\n",
+			R3ShieldCoreTray::kGenerationMarker);
+	}
 
 	MSG msg = {};
 	while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
