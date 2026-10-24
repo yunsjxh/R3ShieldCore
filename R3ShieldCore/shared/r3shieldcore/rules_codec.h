@@ -392,6 +392,29 @@ static bool RemoveAt(int idx)
 	return true;
 }
 
+// 原地替换第 idx 条（**位置不变**）。
+//
+// ★★★ 为什么必须有它，而不是"先 RemoveAt 再 Add"：
+//   ① **丢数据**：`Add` 内部先 `Parse`，解析失败就不入表 —— 但调用方此时
+//      已经把旧规则删掉了。用户只是打错一个字，那条规则就**静默消失**，
+//      而提示只说"这一行解析不了"，完全没提"你原来那条没了"。
+//   ② **悄悄改优先级**：删掉第 2 条再追加到末尾 ⇒ 它变成最后一条。
+//      本引擎是 **first-match wins**，位置就是优先级 ⇒ 改个错别字
+//      能把规则的实际生效顺序改掉，而界面上看不出来。
+//   ⇒ 先 `Parse`（失败就原样返回、表一个字节都不动），成功才**赋值**。
+static bool ReplaceAt(int idx, const WCHAR* line, std::wstring& err)
+{
+	Rule r;
+	if (!Parse(line, r, err)) return false;
+	std::lock_guard<std::mutex> lk(g_mtx);
+	if (idx < 0 || idx >= (int)g_rules.size()) {
+		err = L"这条规则已经不在表里了";
+		return false;
+	}
+	g_rules[static_cast<size_t>(idx)] = r;
+	return true;
+}
+
 // ---------------------------------------------------------------- 求值
 static Verdict Eval(Face face, const WCHAR* path, const WCHAR* name, const WCHAR* fmt)
 {
@@ -464,11 +487,20 @@ static std::wstring Describe(const Rule& r)
 	return s;
 }
 
+// 载入编辑框 / 列表显示用。
+//
+// ★★★ 必须**优先返回 `src`（用户当初写的原文）**，而不是 `Describe()` 重新生成：
+//   `Describe` 把模式包成 `"..."` 或 `/.../`，**不做任何转义**。只要 pattern
+//   或替换文本里本身带 `"` 或 `/`，生成物就**无法再被 Parse** ——
+//   而界面的用法恰恰是"点一行 -> 载入编辑框 -> 改一下 -> 点更新"，
+//   于是"点一下就坏一条"。`SaveFile` 早就是 `src` 优先了，这里跟它对齐
+//   （同一个取舍只许有一处，铁律 197）。
 static bool DescribeAt(int idx, std::wstring& out)
 {
 	std::lock_guard<std::mutex> lk(g_mtx);
 	if (idx < 0 || idx >= (int)g_rules.size()) return false;
-	out = Describe(g_rules[idx]);
+	const Rule& r = g_rules[static_cast<size_t>(idx)];
+	out = r.src.empty() ? Describe(r) : r.src;
 	return true;
 }
 
@@ -476,7 +508,7 @@ static void ListAll(std::vector<std::wstring>& out)
 {
 	std::lock_guard<std::mutex> lk(g_mtx);
 	out.clear();
-	for (const Rule& r : g_rules) out.push_back(Describe(r));
+	for (const Rule& r : g_rules) out.push_back(r.src.empty() ? Describe(r) : r.src);
 }
 
 // ---------------------------------------------------------------- 输入提示

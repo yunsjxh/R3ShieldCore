@@ -14,6 +14,13 @@
 //   verify_dist_ini.exe                     # 默认校验 dist/R3ShieldCore-x64
 //   verify_dist_ini.exe <含 r3shieldcore.ini 的目录>
 //
+// ★ v91：本工具**钉住** `<目录>/r3shieldcore.ini` 这个文件（`LoadFromFile`），
+//   不走 `R3ShieldCoreConfig::Load` 的"ProgramData 优先"解析。原因见
+//   `r3shieldcore_config.h` 里 `LoadFromFile` 的注释：本机一旦有
+//   `%ProgramData%\R3 Shield Core\r3shieldcore.ini`（开发机白名单），
+//   旧写法会让这个闸门转去校验它 ⇒ 随包 ini 写坏查不出来（假绿），
+//   同时本机白名单又让"随包 never_inject 必须 0 条"假红、挡住出包。
+//
 // 退出码：0 = 全部符合预期；1 = 有不符。
 
 #include <r3shieldcore_config.h>
@@ -47,10 +54,25 @@ static const char* ModeText(const R3ShieldCore::Policy& p)
 static void CheckMainConfig(const std::filesystem::path& dir)
 {
 	R3ShieldCore::Policy policy = {};
-	R3ShieldCoreConfig::Load(policy, dir);
-	R3ShieldCoreConfig::EngineSettings eng = R3ShieldCoreConfig::LoadEngineSettings(dir);
+	// ★ v91：**钉住随包那份**。`Load` 会优先 `%ProgramData%\R3 Shield Core\`，
+	//   本机一有白名单配置，这个闸门验的就不是发布物了 ——
+	//     ① 随包 ini 写坏 ⇒ 假绿（最危险）；
+	//     ② 本机 never_inject 让"随包必须 0 条"假红 ⇒ deploy_dist.sh 出不了包。
+	//   所以闸门必须钉文件，且把**实际读的文件**印出来（铁律 99：诊断口径 ≥ 触发口径）。
+	const std::filesystem::path mainIni = dir / L"r3shieldcore.ini";
+	{
+		std::error_code ec;
+		Check("随包 r3shieldcore.ini 存在", std::filesystem::exists(mainIni, ec),
+			mainIni.string());
+	}
+	R3ShieldCoreConfig::LoadFromFile(policy, mainIni, dir);
+	R3ShieldCoreConfig::EngineSettings eng =
+		R3ShieldCoreConfig::LoadEngineSettingsFromFile(mainIni);
 
 	printf("\n-- 主配置 r3shieldcore.ini 解析结果 --\n");
+	// ★ 用 `%s` + `path::string()`（ACP/GBK，与控制台代码页一致），不用 `%ls`：
+	//   `printf("%ls")` 依赖 locale，遇到非 ASCII 路径会**整行静默截断**（铁律 252）。
+	printf("  实际读取的文件         = %s\n", mainIni.string().c_str());
 	printf("  mode                   = %s\n", ModeText(policy));
 	printf("  high_risk              = %s\n", OnOff(policy.Flags, R3ShieldCore::FlagHighRiskGuard));
 	printf("  self_protect           = %s\n", OnOff(policy.Flags, R3ShieldCore::FlagSelfProtect));
@@ -165,9 +187,12 @@ static void CheckPreset(const std::filesystem::path& distDir, const std::filesys
 		std::filesystem::copy_options::overwrite_existing, ec);
 
 	R3ShieldCore::Policy p = {};
-	R3ShieldCoreConfig::Load(p, work);
+	// ★ v91：**钉住文件**加载 —— 不能走 `Load`（它优先 ProgramData，本机一旦有
+	//   白名单配置，这里验的就变成那份了：随包写坏查不出来 + 本机白名单假红）。
+	R3ShieldCoreConfig::LoadFromFile(p, work / L"r3shieldcore.ini", work);
 	// 引擎侧设置也要真解析一遍：预设是"最小覆盖"，未列出的键必须落到内置默认。
-	R3ShieldCoreConfig::EngineSettings pe = R3ShieldCoreConfig::LoadEngineSettings(work);
+	R3ShieldCoreConfig::EngineSettings pe =
+		R3ShieldCoreConfig::LoadEngineSettingsFromFile(work / L"r3shieldcore.ini");
 
 	printf("\n-- 预设 %ls --\n", e.file);
 	printf("  mode=%s hook_file=%s terminate_contain=%s self_protect=%s neutralize_overlay=%lu\n",

@@ -2,6 +2,8 @@
 
 #include <r3shieldcore/r3shieldcore_shared.h>
 #include <filesystem>
+#include <string>
+#include <vector>
 
 //
 // 读取 exe 同目录下的 r3shieldcore.ini，填充共享内存里的策略块。
@@ -36,6 +38,28 @@ namespace R3ShieldCoreConfig
 
 	void Load(R3ShieldCore::Policy& policy, const std::filesystem::path& exeDirectory);
 
+	//
+	// ★ v91：**钉住文件**的加载入口（发布闸门 / 校验工具专用）。
+	//
+	// 为什么必须单独开一个入口：`Load` 走 `ResolveConfigPath`，而它**优先**
+	//   `%ProgramData%\R3 Shield Core\r3shieldcore.ini` —— 那是"引擎运行期该读
+	//   哪份"的正确答案，但对**发布闸门**是错的：闸门要验的是**随包那份**
+	//   (`dist/R3ShieldCore-x64/r3shieldcore.ini`)。
+	//
+	// 本机一旦存在 ProgramData 配置（本机白名单 / 开发机标配），闸门就会转去
+	//   校验它，结果是**两个方向的错**：
+	//     ① 随包 ini 写坏了**查不出来**（假绿）；
+	//     ② 本机白名单让"随包 never_inject 必须 0 条"这条断言**假红**，
+	//        进而挡住 `deploy_dist.sh` 出包（实测 11 项 FAIL）。
+	//   两者都是"判据被本机状态搬家"（铁律 255 同族）。
+	//
+	// ⇒ 把"按目录解析"与"按文件解析"分成两个入口，闸门显式用后者。
+	//   `exeDirectory` 仍要传：它决定 `log=` 缺省时的默认日志路径。
+	//
+	void LoadFromFile(R3ShieldCore::Policy& policy,
+		const std::filesystem::path& iniPath,
+		const std::filesystem::path& exeDirectory);
+
 	// 模式 → ini 里那个值（"log" / "block" / "ask" / "block_all"）。
 	// 认不出来时返回 nullptr。
 	const char* ModeIniText(ULONG mode) noexcept;
@@ -47,6 +71,43 @@ namespace R3ShieldCoreConfig
 	// 整文件重排既没必要也容易把编码搞坏。
 	// 返回 false = 文件打不开或写不进去（此时运行期切换仍然有效，只是不持久）。
 	bool SaveMode(ULONG mode, const std::filesystem::path& exeDirectory);
+
+	// ★★★ v103：批量改 ini 里的若干 `key=value`（「配置」页的开关用）。
+	//
+	// 与 `SaveMode` 同一套写法（整文件读入 → 只改命中的行 → 其余字节原样
+	// 写回，保住中文说明和换行风格）。区别只有两点：
+	//   · 一次改**多条**；
+	//   · 只改**已经存在且生效**的行，缺的键**追加**到文件末尾 ——
+	//     和 `SaveMode` 对 `mode=` 的处理一致。
+	//
+	// `entries` 每条形如 `hook_file=1`（**不含**换行）。
+	// 返回 false = 文件打不开或写不进去。此时**什么都没改成**
+	// （`std::ofstream(trunc)` 之前就返回了），调用方可以据此不去重启引擎。
+	//
+	// ★ 为什么不做成"界面自己写"：ini 的写法和路径解析（ProgramData 优先）
+	//   全在这一个文件里。界面另写一份 ⇒ 两份实现迟早漂移
+	//   （典型后果：界面写进 dist 那份，引擎读 ProgramData 那份 ⇒
+	//    "改了没生效"，而且两边都看不出错）。
+	bool SaveEntries(const std::vector<std::string>& entries,
+		const std::filesystem::path& exeDirectory);
+
+	// ★★★ v103：`SaveEntries` 的**钉文件版本**（只给单元测试 / 闸门用）。
+	//
+	// ★ 为什么必须有这个东西（2026-10-24 实测，代价是一次本机配置被写坏）：
+	//   `SaveEntries` 内部走 `ResolveConfigPath`，而它**优先返回
+	//   `%ProgramData%\R3 Shield Core\r3shieldcore.ini`**。开发机上那份是
+	//   **真实存在**的（本机注入白名单就配在里面）。
+	//   ⇒ 单测以为自己写的是临时目录，实际**改的是开发机的真配置**：
+	//      ① `HOOK_FILE=1`（大写）把 `hook_file=1` 覆盖掉；
+	//      ② 末尾多出 `brand_new_key=42`；
+	//      ③ 断言"目标行确实改了"却全部 FAIL —— 因为读回来的**临时文件**
+	//         确实一个字节没变（写去了别处）。
+	//   这和 `Load` / `LoadFromFile` 的分工是**同一个坑**（铁律 290）：
+	//   判据一旦依赖本机状态，就会同时产生"假绿"和"假红"，还会污染环境。
+	//
+	//   所以这里显式接收 iniPath。**生产代码不要调它** —— 用上面那个。
+	bool SaveEntriesToFile(const std::vector<std::string>& entries,
+		const std::filesystem::path& iniPath);
 
 	//
 	// 引擎侧（非 DLL 共享）开关。这些只影响**引擎进程自身**的主动行为，
@@ -227,4 +288,8 @@ namespace R3ShieldCoreConfig
 	};
 
 	EngineSettings LoadEngineSettings(const std::filesystem::path& exeDirectory);
+
+	// ★ v91：钉住文件的版本（与上面的 `LoadFromFile` 同一理由 —— 发布闸门要验
+	//   的**随包那份**，不能被本机 `%ProgramData%\R3 Shield Core\` 顶掉）。
+	EngineSettings LoadEngineSettingsFromFile(const std::filesystem::path& iniPath);
 }

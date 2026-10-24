@@ -48,7 +48,20 @@ SVC_NAME = "R3ShieldCoreGuard"
 SVC_EXE = "r3shieldcore_svc.exe"
 DRV_SVC = "R3ShieldCoreKernel"
 DRV_SYS = "r3shieldcore_kernel.sys"
+# ENGINE_EXE 这个名字是**历史遗留**：它指的是**主程序/界面**（`R3 ShieldCore.exe`），
+# 不是引擎。为什么不一并改名：
+#   · 安装器 `installer/r3sc_setup.c` 用它做"卸载前等进程退出"，
+#     改错会让卸载卡住或漏等（那是动不得的地方）；
+#   · `tools/check_payload_manifest.py` 会比对本文件与安装器的 ENGINE_EXE
+#     **逐字相同**，单方面改名会直接把闸门打红。
+# ⇒ 保留原义（= 主程序），另开 `REAL_ENGINE_EXE` 给"引擎进程在跑吗"这条判据用。
 ENGINE_EXE = "R3 ShieldCore.exe"
+
+# ★★★ 2026-10-24：v89 拆进程之后**真正的引擎**（服务拉起的也是它）。
+#   服务侧 `service/r3shieldcore_svc.c` 的 ENGINE_EXE 已改成这个名字；
+#   本文件如果还拿主程序名去查"引擎在跑吗"，服务明明拉起了引擎，
+#   诊断却报"引擎没在跑" —— 假 FAIL，比不报更坏（铁律 127）。
+REAL_ENGINE_EXE = "r3shieldcore-engine.exe"
 SVC_LOG = "r3shieldcore-svc.log"
 UNINST_KEY = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\R3ShieldCore"
 DEFAULT_DIR = r"C:\Program Files\R3 ShieldCore"
@@ -334,7 +347,10 @@ def main():
         line(BAD, "目录**不存在**")
         finding(10, "安装目录不存在 —— 没装成功 / 已被卸载 / **VM 上回滚了快照**")
 
-    for label, rel, critical in (("引擎  ", ENGINE_EXE, True),
+    # ★ 2026-10-24：界面与引擎**分别是两个文件**，都要在（v89 拆进程之后）。
+    #   原来这里只有一项、标着"引擎"却指向主程序 —— 引擎缺了也看不出来。
+    for label, rel, critical in (("界面  ", ENGINE_EXE, True),
+                                 ("引擎  ", REAL_ENGINE_EXE, True),
                                  ("服务  ", SVC_EXE, True),
                                  ("驱动  ", os.path.join("driver", DRV_SYS), True),
                                  ("日志  ", SVC_LOG, False)):
@@ -467,7 +483,10 @@ def main():
 
     # ---------------- 4. 引擎层 ----------------
     head("4. 引擎层（真正干活的）")
-    procs = find_processes(ENGINE_EXE)
+    # ★ 2026-10-24：查**真引擎**（`r3shieldcore-engine.exe`），不是主程序。
+    #   服务拉起的也是它 —— 两边判据必须是同一个名字，否则"服务拉起了、
+    #   诊断说没起"（或反过来）会天天误报。
+    procs = find_processes(REAL_ENGINE_EXE)
     if procs:
         for pid, sid in procs:
             u = session_user(sid)

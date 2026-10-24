@@ -6,6 +6,8 @@
 #include <cstdlib>
 #include <fstream>
 #include <iterator>
+#include <map>
+#include <set>
 #include <string>
 
 namespace
@@ -131,6 +133,14 @@ namespace R3ShieldCoreConfig
 
 	void Load(R3ShieldCore::Policy& policy, const std::filesystem::path& exeDirectory)
 	{
+		// ★ v91：只负责"解析出该读哪份"，真正解析在 LoadFromFile。
+		LoadFromFile(policy, ResolveConfigPath(exeDirectory), exeDirectory);
+	}
+
+	// ★ v91：钉住文件的版本（发布闸门专用，理由见头文件）。
+	void LoadFromFile(R3ShieldCore::Policy& policy, const std::filesystem::path& iniPath,
+		const std::filesystem::path& exeDirectory)
+	{
 		ZeroMemory(&policy, sizeof(policy));
 		policy.Mode = static_cast<ULONG>(R3ShieldCore::Mode::Log);
 		// hive 级和 NtSetInformationKey 默认挂上：这两类是原版覆盖不到的真实缺口，
@@ -179,9 +189,9 @@ namespace R3ShieldCoreConfig
 		std::filesystem::path defaultLogPath = exeDirectory / L"r3shieldcore-events.log";
 		wcsncpy_s(policy.LogPath, defaultLogPath.c_str(), _TRUNCATE);
 
-		// ★ v66：优先 `%ProgramData%\R3 Shield Core\r3shieldcore.ini`，
-		//    没有才回退 exe 同目录（见 ResolveConfigPath 的完整理由）。
-		const std::filesystem::path configPath = ResolveConfigPath(exeDirectory);
+		// ★ v91：路径由调用方钉住 —— `Load` 传 `ResolveConfigPath` 的结果
+		//    （运行期语义不变），发布闸门传**随包那份**（不被 ProgramData 顶掉）。
+		const std::filesystem::path configPath = iniPath;
 		std::ifstream file(configPath, std::ios::binary);
 		if (!file) {
 			return;
@@ -1139,13 +1149,153 @@ namespace R3ShieldCoreConfig
 		return result.good();
 	}
 
+	// ★★★ v103：「配置」页的开关写回 ini。
+	//
+	// 写法和 `SaveMode` **完全一致**（整文件 binary 读入 → 只替换命中的行 →
+	// 其余字节原样写回）。这里只是把"改一行"扩成"改 N 条，缺的追加"。
+	//
+	// ★ 为什么坚持"原样写回"而不是解析成结构再序列化：这个 ini 里有**大段
+	//   中文注释**，是用户唯一能读懂「每个开关干什么」的地方。一旦
+	//   序列化重排，注释全会丢 —— 那是比"开关点不动"更狠的一刀。
+	bool SaveEntries(const std::vector<std::string>& entries,
+		const std::filesystem::path& exeDirectory)
+	{
+		if (entries.empty()) {
+			return true;   // 没东西要改，不算失败
+		}
+		// ★ 生产路径：走 `ResolveConfigPath`（ProgramData 优先）。
+		//   单测**不能**走这里 —— 会改到本机真实配置，见头文件的说明。
+		return SaveEntriesToFile(entries, ResolveConfigPath(exeDirectory));
+	}
+
+	bool SaveEntriesToFile(const std::vector<std::string>& entries,
+		const std::filesystem::path& iniPath)
+	{
+		if (entries.empty()) {
+			return true;   // 没东西要改，不算失败
+		}
+
+		const std::filesystem::path configPath = iniPath;
+
+		std::ifstream input(configPath, std::ios::binary);
+		if (!input) {
+			return false;
+		}
+		std::string content((std::istreambuf_iterator<char>(input)),
+			std::istreambuf_iterator<char>());
+		input.close();
+
+		// 待替换表：key（小写）→ 新行（不含 CR/LF）。
+		// ★ v103：**只读查询表** —— 全程不删条目，重复键才会被每一处都替换。
+		std::map<std::string, std::string> pending;
+		// ★ v103：记"哪些键在文件里出现过"。末尾追加只看它，
+		//   保证"已替换过的键不会被再追加一遍"。
+		std::set<std::string> replaceHits;
+		for (const std::string& e : entries) {
+			const size_t eq = e.find('=');
+			if (eq == std::string::npos || eq == 0) {
+				continue;   // 形状不对就跳过，**不猜**
+			}
+			pending[ToLower(Trim(e.substr(0, eq)))] = e;
+		}
+		if (pending.empty()) {
+			return false;
+		}
+
+		std::string output;
+		output.reserve(content.size() + 64);
+
+		size_t position = 0;
+		while (position < content.size()) {
+			size_t lineEnd = content.find('\n', position);
+			if (lineEnd == std::string::npos) {
+				lineEnd = content.size();
+			}
+			std::string line = content.substr(position, lineEnd - position);
+
+			std::string body = line;
+			bool hadCarriageReturn = false;
+			if (!body.empty() && body.back() == '\r') {
+				body.pop_back();
+				hadCarriageReturn = true;
+			}
+
+			std::string trimmed = Trim(body);
+			if (!trimmed.empty() && trimmed[0] != '#' && trimmed[0] != ';') {
+				const size_t separator = trimmed.find('=');
+				if (separator != std::string::npos) {
+					const std::string key = ToLower(Trim(trimmed.substr(0, separator)));
+					auto it = pending.find(key);
+					if (it != pending.end()) {
+						line = it->second + (hadCarriageReturn ? "\r" : "");
+						// ★★★ v103 修缺陷：这里**只记账，不能 erase**。
+						//
+						//   第一版写的是 `pending.erase(it)`，注释说"这样重复键
+						//   就能全部改成同一个值"—— **恰恰相反**。
+						//
+						//   `pending` 当时同时干两件事：
+						//     ① 提供"这个键的新行是什么"；
+						//     ② 记录"哪些键还没在文件里找到"（后面用来追加）。
+						//   erase 把 ① 一起干掉了 ⇒ 第二次遇到同一个键时
+						//   `find` 返回 end，那一行**原样保留旧值**。
+						//   实测（单测"重复键的第一处也改了"）：
+						//     改完新值只出现 1 次，`D:\old\b.exe` 还留着。
+						//   而这条恰恰是注释想保证的行为 —— 注释和实现对不上，
+						//   说明写的时候没跑过重复键的用例。
+						//
+						//   ⇒ 拆成两个容器：`pending` 只存"新行"（只读），
+						//     `replaceHits` 只记"命中过谁"（决定要不要追加）。
+						//     重复键因此会被**每一处**都替换，且不会追加第二遍。
+						replaceHits.insert(key);
+					}
+				}
+			}
+
+			output += line;
+			if (lineEnd < content.size()) {
+				output += '\n';
+			}
+			position = lineEnd + 1;
+		}
+
+		// 文件里没有的键 ⇒ 追加（和 `SaveMode` 对 `mode=` 的处理一致）。
+		// ★ v103：只追加**没命中过**的键 —— `pending` 是全量查询表，
+		//   直接遍历会把已经替换过的键再追加一遍（新值出现两次）。
+		bool appended = false;
+		for (const auto& kv : pending) {
+			if (replaceHits.find(kv.first) != replaceHits.end()) {
+				continue;
+			}
+			if (!appended) {
+				if (!output.empty() && output.back() != '\n') {
+					output += '\n';
+				}
+				appended = true;
+			}
+			output += kv.second + "\n";
+		}
+
+		std::ofstream result(configPath, std::ios::binary | std::ios::trunc);
+		if (!result) {
+			return false;
+		}
+		result.write(output.data(), static_cast<std::streamsize>(output.size()));
+		result.flush();
+		return result.good();
+	}
+
 	EngineSettings LoadEngineSettings(const std::filesystem::path& exeDirectory)
+	{
+		// ★ v91：只负责"解析出该读哪份"，真正解析在 LoadEngineSettingsFromFile。
+		return LoadEngineSettingsFromFile(ResolveConfigPath(exeDirectory));
+	}
+	// ★ v91：钉住文件的版本（发布闸门专用，理由见头文件）。
+	EngineSettings LoadEngineSettingsFromFile(const std::filesystem::path& iniPath)
 	{
 		EngineSettings settings;
 
-		// ★ v66：优先 `%ProgramData%\R3 Shield Core\r3shieldcore.ini`，
-		//    没有才回退 exe 同目录（见 ResolveConfigPath 的完整理由）。
-		const std::filesystem::path configPath = ResolveConfigPath(exeDirectory);
+		// ★ v91：路径由调用方钉住（同 `LoadFromFile`）。
+		const std::filesystem::path configPath = iniPath;
 		std::ifstream file(configPath, std::ios::binary);
 		if (!file) {
 			return settings;

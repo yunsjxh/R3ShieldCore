@@ -48,8 +48,26 @@ import zlib
 # ★ 刻意**不含** dist 里的运行期产物（*.log / _dskill_out.txt）：
 #   那些是跑过引擎留下的，打进安装包只会让每次构建的产物都不一样。
 # ---------------------------------------------------------------------------
+# ★★★ 2026-10-24 补 `r3shieldcore-engine.exe`（v89 拆进程后引擎是独立 exe）。
+#
+#   它一直没进这份清单，而 `build_installer.sh` 那份**有** —— 两份就此漂开，
+#   闸门 tools/check_payload_manifest.py 报了 1 项 FAIL。
+#
+#   后果比「清单不一致」严重得多：用本清单生成的 RCDATA payload 装出来的包
+#   **不含引擎** ⇒ 服务 R3ShieldCoreGuard 按 binPath 拉起时文件不存在
+#   ⇒ 开机后防护本体根本没起，而界面还能正常打开（它只是客户端），
+#   看起来装好了、也能用，实际全程无防护。
+#
+#   ⚠️ 位置必须与 build_installer.sh 的 DIST_FILES **同序**（紧跟主程序）：
+#      顺序决定资源 ID，错位会改变安装包字节（闸门会报顺序不一致）。
+#
+#   ⚠️ 本段注释**必须留在 DIST_FILES 块外**：闸门的 extract_block_list 会把
+#      `[` 到 `]` 之间的内容整体交给 `re.findall(r'"([^"\n]+)"', body)`，
+#      块内任何带引号的中文说明都会被当成一个「文件名」抓进去（实测报了
+#      "清单里有 3 个文件在磁盘上不存在"）。放在块外才是纯注释。
 DIST_FILES = [
     "R3 ShieldCore.exe",
+    "r3shieldcore-engine.exe",
     "r3shieldcore_svc.exe",
     "64/r3shieldcore-lib.dll",
     "32/r3shieldcore-lib.dll",

@@ -100,7 +100,14 @@ set "SVC_NAME=R3ShieldCoreGuard"
 set "SVC_EXE=r3shieldcore_svc.exe"
 set "DRV_SVC=R3ShieldCoreKernel"
 set "DRV_SYS=r3shieldcore_kernel.sys"
+rem ENGINE_EXE 是**历史遗留**名字：它指的是主程序/界面（R3 ShieldCore.exe），
+rem 不是引擎。不直接改名有两个硬理由：安装器 r3sc_setup.c 用它做"卸载前等
+rem 进程退出"，改错会让卸载卡住；tools/check_payload_manifest.py 要求本文件
+rem 与安装器的 ENGINE_EXE 逐字相同，单方面改名会打红闸门。
 set "ENGINE_EXE=R3 ShieldCore.exe"
+rem v89 拆进程之后**真正的引擎**，服务拉起的就是它。
+rem 拿主程序名去查"引擎在跑吗"会报假 FAIL —— 服务明明起了，诊断说没起。
+set "REAL_ENGINE_EXE=r3shieldcore-engine.exe"
 set "SVC_LOG=r3shieldcore-svc.log"
 set "SVCKEY=HKLM\SYSTEM\CurrentControlSet\Services\%SVC_NAME%"
 set "DRVKEY=HKLM\SYSTEM\CurrentControlSet\Services\%DRV_SVC%"
@@ -113,6 +120,7 @@ set "DEST="
 set "DEST_SRC="
 set "DIR_OK=0"
 set "F_ENG=0"
+set "F_ENGINE=0"
 set "F_SVC=0"
 set "F_DRV=0"
 set "F_LOG=0"
@@ -254,15 +262,18 @@ if exist "!DEST!\" (
 )
 
 if "!DIR_OK!"=="1" (
-    call :chkfile "引擎" "!DEST!\%ENGINE_EXE%" 1 F_ENG
+    call :chkfile "界面" "!DEST!\%ENGINE_EXE%" 1 F_ENG
+    call :chkfile "引擎" "!DEST!\%REAL_ENGINE_EXE%" 1 F_ENGINE
     call :chkfile "服务" "!DEST!\%SVC_EXE%" 1 F_SVC
     call :chkfile "驱动" "!DEST!\driver\%DRV_SYS%" 1 F_DRV
     call :chkfile "日志" "!DEST!\%SVC_LOG%" 0 F_LOG
 )
 
 rem 关键文件不齐 → 把目录真实内容列出来（否则只能靠猜）
-set "ALLF=!F_ENG!!F_SVC!!F_DRV!"
-if "!DIR_OK!"=="1" if not "!ALLF!"=="111" (
+rem ★ 2026-10-24：加上 F_ENGINE —— 少了它，"引擎文件不在"这件事
+rem 不会触发下面的 dir 全量列举，排查时只能靠猜。
+set "ALLF=!F_ENG!!F_ENGINE!!F_SVC!!F_DRV!"
+if "!DIR_OK!"=="1" if not "!ALLF!"=="1111" (
     echo.
     echo   ---- 目录实际内容（dir /a "!DEST!"）----
     dir /a "!DEST!"
@@ -553,6 +564,8 @@ rem ---------------- 5. 结论 ----------------
 if "!DIR_OK!"=="0" call :first "安装目录不存在 —— 没装成功 / 已被卸载 / VM 上回滚了快照"
 if "!DIR_OK!"=="1" (
     if "!F_ENG!"=="0" call :first "安装目录里缺 %ENGINE_EXE% —— 文件没装全（看上面的 dir /a 和 Defender 提示）"
+    rem v89：引擎是独立 exe，缺了它服务拉起来的是"空气"（binPath 指向的文件不存在）
+    if "!F_ENGINE!"=="0" call :first "安装目录里缺 %REAL_ENGINE_EXE% —— 引擎没装全，开机防护起不来"
     if "!F_SVC!"=="0" call :first "安装目录里缺 %SVC_EXE% —— 文件没装全"
     if "!F_DRV!"=="0" call :first "安装目录里缺 driver\%DRV_SYS% —— 文件没装全"
 )
@@ -769,7 +782,7 @@ rem  ★ 用 ENG_READ 区分"真没在跑"和"tasklist 读不出"（铁律 100）。
 set "ENG_N=0"
 set "ENG_PIDS="
 set "ENG_READ=0"
-for /f "tokens=2 delims=," %%P in ('tasklist /nh /fo csv /fi "imagename eq %ENGINE_EXE%" ^| findstr /i /c:"%ENGINE_EXE%"') do (
+for /f "tokens=2 delims=," %%P in ('tasklist /nh /fo csv /fi "imagename eq %REAL_ENGINE_EXE%" ^| findstr /i /c:"%REAL_ENGINE_EXE%"') do (
     set /a ENG_N+=1
     set "ENG_PIDS=!ENG_PIDS! %%~P"
 )

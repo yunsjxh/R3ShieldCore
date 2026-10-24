@@ -18,7 +18,11 @@
 #include <filesystem>
 #include <string>
 
-class EngineControl;
+// ★ v89：引擎变成独立进程，这里从"直接调 EngineControl"改成"走加密 IPC"。
+namespace R3ShieldCoreEngine
+{
+	class Client;
+}
 
 //
 // ★ v81：配置工具（`r3shieldcore-cfg.exe`）⇄ 引擎 的**管道服务端**。
@@ -77,7 +81,7 @@ namespace R3ShieldCoreCfgIpcServer
 	//     服务线程只负责"把请求挂起来 + 等结论"。
 	//
 	//   主循环没在跑（正在收尾）时服务线程会超时并回 `ERR`，不会挂死。
-	void PollSync(EngineControl& engineControl) noexcept;
+	void PollSync(R3ShieldCoreEngine::Client& engineClient) noexcept;
 
 	// 诊断用计数（服务线程写、主循环读；只增不改，用 Interlocked）。
 	struct Stats

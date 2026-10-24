@@ -127,6 +127,7 @@ IEXPRESS="/c/Windows/System32/iexpress.exe"
 # ---------------------------------------------------------------------------
 DIST_FILES=(
     "R3 ShieldCore.exe"
+    "r3shieldcore-engine.exe"
     "r3shieldcore_svc.exe"
     "64/r3shieldcore-lib.dll"
     "32/r3shieldcore-lib.dll"

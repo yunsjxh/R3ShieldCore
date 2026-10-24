@@ -1735,13 +1735,118 @@ static void apply_page(int page)
     InvalidateRect(g_hWnd, NULL, TRUE);
 }
 
+/* ------------------------------------------------------------------
+ * v103：自绘标题栏（与主程序 / 配置工具同一套）
+ *
+ *  安装程序是**纯 C + MSYS2 gcc** 的那条工具链，用不了 C++ 的
+ *  ui_material / ui_controls。所以这里只做"结构上一致"：
+ *    · 去掉系统标题栏，窗口矩形 = 客户区（客户区尺寸一点没变）；
+ *    · 右上角三颗按钮，几何和字号**照抄**主程序（24~26px、间距 2、靠右）；
+ *    · 字形用几何画（不依赖字体，理由同主程序：YaHei 没有 U+2715）；
+ *    · 横幅那条深蓝就是标题栏 ⇒ 字形用白色。
+ *  banner 是父窗口自己画的（STATIC 只覆盖文字那一块），所以按钮画在上层。
+ * ------------------------------------------------------------------ */
+#define CAP_BTN_W   24
+#define CAP_BTN_H   24
+#define CAP_BTN_GAP 2
+#define CAP_TOP     12
+#define CAP_CLUSTER_W (CAP_BTN_W * 3 + CAP_BTN_GAP * 2)
+
+static int g_capHover = -1;
+
+static void cap_rect(int i, RECT* r)
+{
+    int left = WND_W - MARGIN - CAP_CLUSTER_W;
+    int x = left + i * (CAP_BTN_W + CAP_BTN_GAP);
+    r->left = x; r->top = CAP_TOP;
+    r->right = x + CAP_BTN_W; r->bottom = CAP_TOP + CAP_BTN_H;
+}
+
+static int hit_cap(POINT p)
+{
+    int i;
+    for (i = 0; i < 3; ++i) {
+        RECT r;
+        cap_rect(i, &r);
+        if (PtInRect(&r, p)) return i;
+    }
+    return -1;
+}
+
+static void draw_caps(HDC dc)
+{
+    int i;
+    int zoomed = IsZoomed(g_hWnd) ? 1 : 0;
+    for (i = 0; i < 3; ++i) {
+        RECT r;
+        int cx, cy;
+        HBRUSH br;
+        cap_rect(i, &r);
+        cx = (r.left + r.right) / 2;
+        cy = (r.top + r.bottom) / 2;
+
+        if (g_capHover == i) {
+            /* 悬停：横幅深蓝上浮一层浅蓝（GDI 不做半透明，用实色更稳） */
+            HBRUSH hb = CreateSolidBrush(i == 2 ? RGB(200, 48, 52) : RGB(58, 96, 152));
+            HPEN hp = CreatePen(PS_SOLID, 1, i == 2 ? RGB(200, 48, 52) : RGB(58, 96, 152));
+            HGDIOBJ ob = SelectObject(dc, hb);
+            HGDIOBJ op = SelectObject(dc, hp);
+            RoundRect(dc, r.left, r.top, r.right, r.bottom, 10, 10);
+            SelectObject(dc, ob);
+            SelectObject(dc, op);
+            DeleteObject(hb);
+            DeleteObject(hp);
+        }
+
+        br = CreateSolidBrush(RGB(255, 255, 255));
+        if (i == 0) {                       /* 最小化 */
+            RECT q = { cx - 5, cy, cx + 6, cy + 1 };
+            FillRect(dc, &q, br);
+        } else if (i == 1 && !zoomed) {     /* 最大化 */
+            RECT q;
+            q.left = cx - 4; q.top = cy - 4; q.right = cx + 5; q.bottom = cy - 3;
+            FillRect(dc, &q, br);
+            q.top = cy + 4; q.bottom = cy + 5;
+            FillRect(dc, &q, br);
+            q.left = cx - 4; q.right = cx - 3; q.top = cy - 4; q.bottom = cy + 5;
+            FillRect(dc, &q, br);
+            q.left = cx + 4; q.right = cx + 5;
+            FillRect(dc, &q, br);
+        } else if (i == 1) {                /* 还原 */
+            RECT q;
+            q.left = cx - 6; q.top = cy - 6; q.right = cx + 3; q.bottom = cy - 5;
+            FillRect(dc, &q, br);
+            q.left = cx - 6; q.right = cx - 5; q.top = cy - 6; q.bottom = cy + 3;
+            FillRect(dc, &q, br);
+            q.left = cx - 3; q.right = cx + 5; q.top = cy - 3; q.bottom = cy - 2;
+            FillRect(dc, &q, br);
+            q.left = cx - 3; q.right = cx + 5; q.top = cy + 4; q.bottom = cy + 5;
+            FillRect(dc, &q, br);
+            q.left = cx - 3; q.right = cx - 2; q.top = cy - 3; q.bottom = cy + 5;
+            FillRect(dc, &q, br);
+            q.left = cx + 4; q.right = cx + 5;
+            FillRect(dc, &q, br);
+        } else {                            /* 关闭：45° 阶梯，每步 2x1 */
+            int k;
+            for (k = -4; k <= 4; ++k) {
+                RECT q;
+                q.left = cx + k; q.top = cy + k; q.right = cx + k + 2; q.bottom = cy + k + 1;
+                FillRect(dc, &q, br);
+                q.top = cy - k; q.bottom = cy - k + 1;
+                FillRect(dc, &q, br);
+            }
+        }
+        DeleteObject(br);
+    }
+}
+
 static void create_controls(HWND h)
 {
     /* 横幅（用静态控件占位 + WM_CTLCOLORSTATIC 画背景） */
     mk(h, L"STATIC", APP_TITLE, SS_LEFT,
-       MARGIN, 14, WND_W - 2 * MARGIN, 28, IDC_HDR_TITLE, g_fontTitle);
+       MARGIN, 14, WND_W - 2 * MARGIN - CAP_CLUSTER_W - 8, 28, IDC_HDR_TITLE, g_fontTitle);
     mk(h, L"STATIC", L"", SS_LEFT,
-       MARGIN + 2, 44, WND_W - 2 * MARGIN, 20, IDC_HDR_SUB, g_fontSub);
+       MARGIN + 2, 44, WND_W - 2 * MARGIN - CAP_CLUSTER_W - 8, 20, IDC_HDR_SUB, g_fontSub);
 
     /* --- 第 0 页 --- */
     mk(h, L"STATIC", L"", SS_LEFT,
@@ -1925,6 +2030,94 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
         apply_page(PAGE_WELCOME);
         return 0;
 
+    /* v103：自绘标题栏（写法与主程序一致，说明见 r3shieldcore_gui.cpp） */
+    case WM_NCCALCSIZE:
+        if (wp == TRUE) {
+            NCCALCSIZE_PARAMS* params = (NCCALCSIZE_PARAMS*)lp;
+            if (params && IsZoomed(h)) {
+                MONITORINFO mi;
+                mi.cbSize = sizeof(mi);
+                if (GetMonitorInfoW(MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST), &mi)) {
+                    params->rgrc[0] = mi.rcWork;
+                }
+            }
+            return 0;
+        }
+        break;
+
+    case WM_NCHITTEST: {
+        POINT pt;
+        RECT cl;
+        int b;
+        int z;
+        pt.x = (short)LOWORD(lp);
+        pt.y = (short)HIWORD(lp);
+        ScreenToClient(h, &pt);
+        GetClientRect(h, &cl);
+        z = IsZoomed(h) ? 1 : 0;
+        b = z ? 0 : 6;
+        if (b > 0) {
+            int lft = pt.x < b;
+            int rgt = pt.x >= cl.right - b;
+            int top = pt.y < b;
+            int bot = pt.y >= cl.bottom - b;
+            if (top && lft) return HTTOPLEFT;
+            if (top && rgt) return HTTOPRIGHT;
+            if (bot && lft) return HTBOTTOMLEFT;
+            if (bot && rgt) return HTBOTTOMRIGHT;
+            if (lft) return HTLEFT;
+            if (rgt) return HTRIGHT;
+            if (top) return HTTOP;
+            if (bot) return HTBOTTOM;
+        }
+        /* 横幅 = 标题栏拖动区（STATIC 对命中测试是透明的） */
+        if (pt.y < BANNER_H) {
+            if (hit_cap(pt) >= 0) return HTCLIENT;
+            return HTCAPTION;
+        }
+        return HTCLIENT;
+    }
+
+    case WM_MOUSEMOVE: {
+        POINT pt;
+        int over;
+        pt.x = (short)LOWORD(lp);
+        pt.y = (short)HIWORD(lp);
+        over = hit_cap(pt);
+        if (over != g_capHover) {
+            RECT strip;
+            g_capHover = over;
+            strip.left = WND_W - MARGIN - CAP_CLUSTER_W - 4;
+            strip.top = 0;
+            strip.right = WND_W;
+            strip.bottom = BANNER_H;
+            InvalidateRect(h, &strip, FALSE);
+        }
+        break;   /* 继续走默认处理，不影响其它逻辑 */
+    }
+
+    case WM_MOUSELEAVE:
+        if (g_capHover != -1) {
+            g_capHover = -1;
+            InvalidateRect(h, NULL, FALSE);
+        }
+        break;
+
+    case WM_LBUTTONDOWN: {
+        POINT pt;
+        int cb;
+        pt.x = (short)LOWORD(lp);
+        pt.y = (short)HIWORD(lp);
+        cb = hit_cap(pt);
+        if (cb == 0) { ShowWindow(h, SW_MINIMIZE); return 0; }
+        if (cb == 1) {
+            ShowWindow(h, IsZoomed(h) ? SW_RESTORE : SW_MAXIMIZE);
+            return 0;
+        }
+        if (cb == 2) { PostMessageW(h, WM_CLOSE, 0, 0); return 0; }
+        break;
+    }
+
     case WM_PAINT: {
         PAINTSTRUCT ps;
         HDC dc = BeginPaint(h, &ps);
@@ -1933,6 +2126,7 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
             FillRect(dc, &r, g_brBanner);
             r.top = BANNER_H; r.bottom = BANNER_H + 1;
             FillRect(dc, &r, (HBRUSH)GetStockObject(GRAY_BRUSH));
+            draw_caps(dc);   /* v103：标题栏三颗按钮（STATIC 不覆盖这块） */
         }
         EndPaint(h, &ps);
         return 0;
@@ -2533,7 +2727,6 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, PWSTR cmdline, int nShow)
     {
         INITCOMMONCONTROLSEX icc;
         WNDCLASSEXW wc;
-        RECT r;
         DWORD style;
         int x, y, ww, wh;
         HWND h;
@@ -2566,11 +2759,10 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, PWSTR cmdline, int nShow)
         if (!wc.hIcon) wc.hIcon = LoadIconW(NULL, IDI_APPLICATION);
         RegisterClassExW(&wc);
 
-        style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_CLIPCHILDREN;
-        r.left = 0; r.top = 0; r.right = WND_W; r.bottom = WND_H;
-        AdjustWindowRectEx(&r, style, FALSE, 0);
-        ww = r.right - r.left;
-        wh = r.bottom - r.top;
+        /* v103：无系统标题栏 ⇒ 窗口矩形就是客户区，尺寸**一点没变** */
+        style = WS_POPUP | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_CLIPCHILDREN;
+        ww = WND_W;
+        wh = WND_H;
         x = (GetSystemMetrics(SM_CXSCREEN) - ww) / 2;
         y = (GetSystemMetrics(SM_CYSCREEN) - wh) / 2;
 

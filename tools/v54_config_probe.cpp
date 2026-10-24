@@ -30,7 +30,11 @@ int wmain(int argc, wchar_t** argv)
 	wprintf(L"部署目录: %s\n\n", dir.c_str());
 
 	// ---- A) 配置解析 ----
-	const R3ShieldCoreConfig::EngineSettings s = R3ShieldCoreConfig::LoadEngineSettings(dir);
+	// ★ v91：钉住 `<部署目录>/r3shieldcore.ini` —— 本探针要回答的是"**这个部署目录**
+	//   的 ini 有没有被解析出来"，走 `LoadEngineSettings` 会被本机
+	//   `%ProgramData%\R3 Shield Core\` 那份顶掉（结论就变成在验本机配置了）。
+	const R3ShieldCoreConfig::EngineSettings s =
+		R3ShieldCoreConfig::LoadEngineSettingsFromFile(dir / L"r3shieldcore.ini");
 	wprintf(L"=== A. LoadEngineSettings ===\n");
 	wprintf(L"  ReplayHistoryLog   = %d   （期望 1）\n", s.ReplayHistoryLog ? 1 : 0);
 	wprintf(L"  PersistStats       = %d   （期望 1）\n", s.PersistStats ? 1 : 0);

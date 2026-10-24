@@ -20,7 +20,8 @@
 ================
   1. `%TEMP%\\R3ShieldCore-dryrun-report.txt` 出现；
   2. 含 `DRYRUN-OK`；
-  3. 含 5 行 `OK_*`（引擎 / 64 位 DLL / 32 位 DLL / 驱动 / ini 都真的解压出来了）；
+  3. 含 6 行 `OK_*`（主程序 / **引擎进程** / 64 位 DLL / 32 位 DLL / 驱动 / ini
+     都真的解压出来了）；
   4. 自解压目录（`%TEMP%\\IXP*.TMP`）被自动清掉；
   5. 自解压进程自己退出。
 
@@ -43,7 +44,8 @@ EXE = os.path.join(REPO, 'dist', 'R3ShieldCore-Setup-iexpress-DRYRUN.exe')
 TMP = os.environ.get('TEMP') or os.environ.get('TMP') or '/tmp'
 RPT = os.path.join(TMP, 'R3ShieldCore-dryrun-report.txt')
 
-REQUIRED = ['DRYRUN-OK', 'OK_ENGINE', 'OK_LIB64', 'OK_LIB32', 'OK_DRIVER', 'OK_INI']
+REQUIRED = ['DRYRUN-OK', 'OK_ENGINE', 'OK_ENGINEPROC', 'OK_LIB64', 'OK_LIB32',
+            'OK_DRIVER', 'OK_INI']
 
 
 def fail(msg):

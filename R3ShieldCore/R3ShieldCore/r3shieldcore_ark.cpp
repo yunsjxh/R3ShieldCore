@@ -585,8 +585,25 @@ namespace
 			}
 		}
 
-		const ArkActions::Outcome outcome = ArkActions::Perform(
-			pid, action, g_config.SelfPid, g_config.LocalDllBase);
+		// ★ v89：内部退出走引擎（界面进程没有引擎 DLL，算不出导出偏移）。
+		ArkActions::Outcome outcome = {};
+		if (action == ArkActions::Action::InternalExit && g_config.SelfExitViaIpc) {
+			SelfExitResult r = {};
+			if (g_config.SelfExitViaIpc(pid, g_config.SelfExitContext, &r)) {
+				outcome.Code = static_cast<ArkActions::Result>(r.Code);
+				outcome.Win32Error = r.Win32Error;
+				outcome.ElapsedMs = r.ElapsedMs;
+				outcome.DllPresent = r.DllPresent;
+				outcome.DllSameBuild = r.DllSameBuild;
+			}
+			else {
+				// 引擎没应答：和"本地执行失败"分开报（这里是通信问题）。
+				outcome.Code = ArkActions::Result::Failed;
+			}
+		}
+		else {
+			outcome = ArkActions::Perform(pid, action, g_config.SelfPid, g_config.LocalDllBase);
+		}
 
 		ActionRecord record = {};
 		record.Pid = pid;

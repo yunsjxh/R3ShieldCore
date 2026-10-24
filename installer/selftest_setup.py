@@ -85,7 +85,12 @@ def _tmp(name):
 
 # 清单（必须和 gen_payload_rc.py 的 DIST_FILES 一致）
 DIST_FILES = [
-    "R3 ShieldCore.exe", "r3shieldcore_svc.exe", "64/r3shieldcore-lib.dll", "32/r3shieldcore-lib.dll",
+    # ★ 2026-10-24 补 r3shieldcore-engine.exe（v89 拆进程后的独立引擎）。
+    #   三份 DIST_FILES 是手写拷贝，这一份之前漏了它 —— 闸门
+    #   tools/check_payload_manifest.py 判据 A 要求三份**逐项同序**。
+    #   顺序必须与 build_installer.sh / gen_payload_rc.py 一致：紧跟主程序。
+    "R3 ShieldCore.exe", "r3shieldcore-engine.exe",
+    "r3shieldcore_svc.exe", "64/r3shieldcore-lib.dll", "32/r3shieldcore-lib.dll",
     "r3shieldcore.ini", "r3shieldcore-block.ini", "r3shieldcore-blockall.ini",
     "r3shieldcore-blockallsafe.ini", "r3shieldcore-safe-first.ini",
     "start.bat", "stop.bat", "unlock-acl.bat", "verify-v26.bat", "netcheck-diag.bat",
@@ -918,8 +923,14 @@ def test_install_uninstall(t):
 
     def is_runtime_artifact(fn):
         """引擎/服务跑起来之后自己写的文件 —— 不算"安装出来的文件"。"""
+        # ★ 2026-10-24：补 `r3shieldcore-engine-console.log`（v89 拆进程后
+        #   引擎自己开的控制台）。此前只认 `engine-console-` 前缀，漏了这一个；
+        #   `deploy_dist.sh` 的清理清单**同时**漏了它 —— 两边各写一份名字，
+        #   就必然会有一处忘记同步（铁律 197）。
         return (fn in ("r3shieldcore-console.log", "r3shieldcore-events.log",
-                       "r3shieldcore-svc.log")
+                       "r3shieldcore-svc.log",
+                       "r3shieldcore-engine-console.log",
+                       "r3shieldcore-cfg-console.log")
                 or fn.startswith("engine-console-"))
 
     actual = set()

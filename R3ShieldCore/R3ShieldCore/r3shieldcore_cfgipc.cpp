@@ -6,7 +6,7 @@
 #include <r3shieldcore/cfg_ipc.h>
 #include <r3shieldcore/text_conv.h>
 
-#include "engine_control.h"
+#include "engine_client.h"
 #include "r3shieldcore_gui.h"
 #include "r3shieldcore_stats.h"
 
@@ -450,8 +450,19 @@ namespace
 
 			InterlockedIncrement(&g_accepted);
 			InterlockedExchange(&g_clientConnected, 1);
-			printf("[ipc] 配置工具已连接\n");
-			fflush(stdout);
+			// ★★ v101：节流。
+			//   配置工具是**一次连接取一批**的用法（`CfgIpc::Call` 每次
+			//   开一次管道），所以"连上/断开"天然会成对反复出现 ——
+			//   2026-10-24 现场刷了 121 对，把日志淹了。
+			//   前 3 对 + 每 50 对留一条，足够看清"配置工具来过"，
+			//   又不至于把 `[btn]` / `[procwatch]` 那些真正有用的行埋掉。
+			{
+				const LONG n = g_accepted;
+				if (n <= 3 || (n % 50) == 0) {
+					printf("[ipc] 配置工具已连接（第 %ld 次）\n", n);
+					fflush(stdout);
+				}
+			}
 
 			ServeOneClient();
 
@@ -459,8 +470,13 @@ namespace
 			DisconnectNamedPipe(g_pipe);
 			CloseHandle(g_pipe);
 			g_pipe = INVALID_HANDLE_VALUE;
-			printf("[ipc] 配置工具已断开\n");
-			fflush(stdout);
+			{
+				const LONG n = g_accepted;
+				if (n <= 3 || (n % 50) == 0) {
+					printf("[ipc] 配置工具已断开（第 %ld 次）\n", n);
+					fflush(stdout);
+				}
+			}
 		}
 
 		printf("[ipc] 管道服务已停止\n");
@@ -554,7 +570,7 @@ namespace R3ShieldCoreCfgIpcServer
 		}
 	}
 
-	void PollSync(EngineControl& engineControl) noexcept
+	void PollSync(R3ShieldCoreEngine::Client& engineClient) noexcept
 	{
 		if (!g_syncLockReady) {
 			return;
@@ -596,7 +612,7 @@ namespace R3ShieldCoreCfgIpcServer
 		const char* modeText = R3ShieldCoreConfig::ModeIniText(fresh.Mode);
 
 		if (modeChanged) {
-			if (engineControl.SetMode(static_cast<R3ShieldCore::Mode>(fresh.Mode))) {
+			if (engineClient.SetMode(static_cast<R3ShieldCore::Mode>(fresh.Mode))) {
 				g_options.Policy->Mode = fresh.Mode;          // 让后续 CONFIG 报新值
 				R3ShieldCoreGui::SetMode(static_cast<R3ShieldCore::Mode>(fresh.Mode));
 				applied = "mode";

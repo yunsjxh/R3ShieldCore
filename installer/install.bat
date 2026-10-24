@@ -142,6 +142,13 @@ if not exist "%STAGE%\R3 ShieldCore.exe" (
     echo [错误] 解压后没找到 "R3 ShieldCore.exe" —— payload 结构不对。
     goto :FAIL
 )
+REM ★ v89：引擎是**独立进程**。少了 r3shieldcore-engine.exe，界面能起来但
+REM   永远连不上引擎 —— 表面上"窗口正常"，实际**一点防护都没有**。
+REM   所以这里和主程序一样当成硬前提，缺了直接失败（不要静默装下去）。
+if not exist "%STAGE%\r3shieldcore-engine.exe" (
+    echo [错误] 解压后没找到 "r3shieldcore-engine.exe" —— 引擎进程缺失，界面将无防护。
+    goto :FAIL
+)
 echo        OK
 
 REM ------------------------------------------------------------
@@ -194,6 +201,7 @@ set "RPT=%TEMP%\R3ShieldCore-dryrun-report.txt"
     echo DEST=%DEST%
     echo DRV_SVC=%DRV_SVC%
     echo ENGINE=%STAGE%\R3 ShieldCore.exe
+echo ENGINEPROC=%STAGE%\r3shieldcore-engine.exe
     echo LIB64=%STAGE%\64\r3shieldcore-lib.dll
     echo LIB32=%STAGE%\32\r3shieldcore-lib.dll
     echo DRIVER=%STAGE%\driver\r3shieldcore_kernel.sys
@@ -203,8 +211,9 @@ set "RPT=%TEMP%\R3ShieldCore-dryrun-report.txt"
 )
 REM ★ 存在性断言写成 `echo X>>"%RPT%"`（>> 前不留空格）：
 REM   `echo X >>"%RPT%"` 里的那个空格会被当成正文写进文件。
-echo --- 关键文件存在性（下面应出现 5 行 OK_*）--->>"%RPT%"
+echo --- 关键文件存在性（下面应出现 6 行 OK_*）--->>"%RPT%"
 if exist "%STAGE%\R3 ShieldCore.exe"               echo OK_ENGINE>>"%RPT%"
+if exist "%STAGE%\r3shieldcore-engine.exe"      echo OK_ENGINEPROC>>"%RPT%"
 if exist "%STAGE%\64\r3shieldcore-lib.dll"        echo OK_LIB64>>"%RPT%"
 if exist "%STAGE%\32\r3shieldcore-lib.dll"        echo OK_LIB32>>"%RPT%"
 if exist "%STAGE%\driver\r3shieldcore_kernel.sys" echo OK_DRIVER>>"%RPT%"
@@ -232,6 +241,8 @@ mkdir "%DEST%\64" >nul 2>&1
 mkdir "%DEST%\32" >nul 2>&1
 
 copy /y "%STAGE%\R3 ShieldCore.exe"            "%DEST%\"            >nul
+REM ★ 引擎进程必须和主程序**同目录**：界面按"自己所在目录"去找它（engine_client.h）
+copy /y "%STAGE%\r3shieldcore-engine.exe"     "%DEST%\"            >nul
 copy /y "%STAGE%\64\r3shieldcore-lib.dll"      "%DEST%\64\"         >nul
 copy /y "%STAGE%\32\r3shieldcore-lib.dll"      "%DEST%\32\"         >nul
 

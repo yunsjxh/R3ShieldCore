@@ -70,6 +70,21 @@
 #
 set -u
 
+# ======================================================================
+# ★★★ PATH 兜底（必须在**任何外部命令之前**）
+# ======================================================================
+# 本脚本会被**提权 cmd** 直接拉起 —— 脚本自己打印的就是那条命令
+# （`"...\bash.exe" "...\tools\spoof_e2e.sh" --run-engine`）。
+# 那种上下文里 bash 是**非登录、非交互**的 ⇒ 不读 /etc/profile ⇒
+# PATH 里**没有 /usr/bin** ⇒ 下面第一句 `dirname` 就 `command not found`，
+# 接着 `cd: null directory`、`scripts_env.sh 未找到`，整个脚本连门都进不去。
+# （实测：从 `C:\Windows\System32>` 跑，报的就是这三行。）
+# ⇒ 在这里把 /usr/bin 补进来；已经有了就不动（不覆盖用户/构建链的设置）。
+case ":$PATH:" in
+    *":/usr/bin:"*) ;;
+    *) PATH="/usr/bin:$PATH"; export PATH ;;
+esac
+
 R3SC_ENV=""; _d="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 while [ "$_d" != "/" ] && [ -n "$_d" ]; do
     if [ -f "$_d/scripts_env.sh" ]; then R3SC_ENV="$_d/scripts_env.sh"; break; fi
