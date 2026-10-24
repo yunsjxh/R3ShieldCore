@@ -59,7 +59,8 @@ mkdir -p "$OBJDIR_REL"
 #   剪贴板面的规则脚本接在 `RejectOrSpoof` 里，那是本文件匿名 namespace 里的
 #   函数，不开口子就**测不到**（"规则没生效"与"开关没打开"长得一样）。
 CFLAGS="-nologo -c -O2 -MT -std:c++20 -EHsc -W3 -source-charset:utf-8 \
--DNDEBUG -DWIN32 -D_WINDOWS -DUNICODE -D_UNICODE -DREGUARD_GUARD_UT -DCLIPGUARD_GUARD_UT"
+-DNDEBUG -DWIN32 -D_WINDOWS -DUNICODE -D_UNICODE -DREGUARD_GUARD_UT -DCLIPGUARD_GUARD_UT \
+-DSCREENGUARD_GUARD_UT -DINPUTHOOK_GUARD_UT"
 
 INCS="-IR3ShieldCore/shared -IR3ShieldCore/R3ShieldCoreLib/libraries \
 -IR3ShieldCore/R3ShieldCoreLib -IR3ShieldCore/shared/libraries \
@@ -75,6 +76,13 @@ echo "=== 编译 guard 层底座（$ARCH）==="
 "$CL" $CFLAGS $INCS -Fo"$OBJDIR_REL/token_theft_guard.obj" "$LIB_SRC_REL/token_theft_guard.cpp" || exit 1
 # ★ v78：clipboard_guard.cpp 也要编（剪贴板面的规则脚本接在它的 RejectOrSpoof 里）。
 "$CL" $CFLAGS $INCS -Fo"$OBJDIR_REL/clipboard_guard.obj" "$LIB_SRC_REL/clipboard_guard.cpp" || exit 1
+# ★ v129：屏幕 / 输入钩子两个隐私面 —— 验「block 下不拦」必须走完整 Evaluate。
+#   摄像头面**不在**这里：camera_guard.cpp 依赖 Media Foundation（17 处 MF 符号），
+#   而本机 `mfplat.lib` 加进链接会出问题（见 MEMORY-4 的铁律 215）。
+#   摄像头那处改动与这三个**完全同构**，由 `tools/check_privacy_face.sh` 的
+#   静态判据 + 变异负对照兜住。
+"$CL" $CFLAGS $INCS -Fo"$OBJDIR_REL/screen_guard.obj" "$LIB_SRC_REL/screen_guard.cpp" || exit 1
+"$CL" $CFLAGS $INCS -Fo"$OBJDIR_REL/input_hook_guard.obj" "$LIB_SRC_REL/input_hook_guard.cpp" || exit 1
 "$CL" $CFLAGS $INCS -Fo"$OBJDIR_REL/guard_stub.obj" "tools/guard_stub.cpp" || exit 1
 
 FAILED=0
@@ -95,6 +103,8 @@ run_one() {
         "$OBJDIR_REL/registry_guard.obj" \
         "$OBJDIR_REL/r3shieldcore_rules.obj" \
         "$OBJDIR_REL/clipboard_guard.obj" \
+        "$OBJDIR_REL/screen_guard.obj" \
+        "$OBJDIR_REL/input_hook_guard.obj" \
         "$OBJDIR_REL/guard_stub.obj" \
         "$MH_LIB_REL" \
         kernel32.lib advapi32.lib user32.lib gdi32.lib || { FAILED=1; return; }
@@ -130,6 +140,11 @@ TESTS=(
     #   不需要额外 obj —— 但**必须**单测：它们"画出来对不对"只能靠截图，
     #   而"解析对不对"完全可以在毫秒级钉死（铁律 24/28）。
     "v79_quiz_md_ut|"
+    # ★ v129：block 模式下**隐私面不拦、破坏类照拦**。
+    #   走完整 `Evaluate`（不是只调 RejectOrSpoof）—— 验的是"要不要走到拒绝"。
+    #   四条用例里三条是负对照（block_all 仍拦 / log 不变 / 写 Run 仍拦），
+    #   否则"把 block 改成什么都不拦"会让前三条**全绿**（铁律 148 同款空真判据）。
+    "v129_privacy_ut|"
 )
 
 DECLARED=${#TESTS[@]}

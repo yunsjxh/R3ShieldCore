@@ -342,6 +342,16 @@ namespace
 		const bool canAsk = allowAsk && (mode == static_cast<ULONG>(R3ShieldCore::Mode::Ask));
 		if (!canAsk) {
 			if (mode == static_cast<ULONG>(R3ShieldCore::Mode::Block)) {
+				// ★ v129：隐私面在 block 下**不硬拒**。
+				//   剪贴板 Read 是**每次 Ctrl+V 都会走**的热路径，硬拒的表现
+				//   就是"粘贴失效" —— 这是 block 预设最致命的一处误伤。
+				//   只记录 + 标 WouldBlock；真要拦用 mode=block_all。
+				if (R3ShieldCore::IsPrivacyFace(
+						static_cast<R3ShieldCore::ObjectType>(event.ObjectType))) {
+					event.Decision = static_cast<ULONG>(R3ShieldCore::Decision::WouldBlock);
+					return Action::Record;
+				}
+
 				// ★ v70：本应拒绝 ⇒ 看是否改走"替换"（不支持的格式仍回落拒绝）。
 				return RejectOrSpoof(event, format);
 			}
@@ -695,6 +705,24 @@ namespace ClipboardGuardTest
 		if (v.hit && v.act == RScript::Act::ReplaceText) {
 			wcsncpy_s(out, outChars, v.text.c_str(), _TRUNCATE);
 		}
+	}
+
+	// ★ v129：**走完整 Evaluate** 的入口。
+	//
+	// 为什么不能只调 `RejectOrSpoofForTest`：v129 改的是"block 模式下
+	// **要不要走到** RejectOrSpoof" —— 只调 RejectOrSpoof 等于假设它被调到了，
+	// 那正好是这次要验的东西（铁律：验行为不验字面）。
+	//
+	// `mode` 不在这里传 —— 它从 `GuardStub::SetMode()` 写进 Policy，
+	// 与生产路径同源（Policy->Mode）。
+	int EvaluateForTest(ULONG op, UINT format, int* decisionOut, int* flagsOut) noexcept
+	{
+		R3ShieldCore::Event event = {};
+		const Action action = Evaluate(static_cast<R3ShieldCore::ClipboardOp>(op),
+			event, /*allowAsk=*/false, format);
+		if (decisionOut) *decisionOut = static_cast<int>(event.Decision);
+		if (flagsOut)    *flagsOut = static_cast<int>(event.Flags);
+		return static_cast<int>(action);
 	}
 }
 #endif // CLIPGUARD_GUARD_UT

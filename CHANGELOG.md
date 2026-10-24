@@ -11,6 +11,86 @@
 
 ## [未发布]
 
+### 修复 — `mode=block` 终于能日常用了（v129）
+
+用户原话：「**把 block 版本改成一个真正能用的版本，真正做到那种不影响用户使用
+但是可以有效拦截部分违规操作的层次**」。
+
+#### 问题：block 预设"能用"是个假象
+
+`mode=block` 的语义原来是"命中高危就拒"，但**高危**里混着两类完全不同的东西：
+
+| 类型 | 例子 | 硬拒的表现 |
+|---|---|---|
+| 破坏类 | 改引导区 / 装服务 / 写 System32 / 装驱动 | 拦住了，正确 |
+| 知情类 | 读剪贴板 / 截屏 / 开摄像头 / 装输入钩子 | **功能坏了** |
+
+知情类的判据本来就是"需要用户知情"（见 `ObjectType` 注释），不是"会破坏数据"。
+硬拒它们的表现不是"被拦了"，而是：
+
+- **剪贴板 `Read` 是每次 Ctrl+V 都走的热路径** ⇒ 拒了 = 粘贴直接失效
+- 截屏 ⇒ 拒了 = 截图工具黑屏
+- 摄像头/麦克风 ⇒ 拒了 = 视频通话打不开
+- 输入钩子 ⇒ 拒了 = 输入法打不出字 / 游戏按键失灵
+
+也就是说：block 预设装上去，第一个小时就会让人以为"系统坏了"。
+
+#### 改法：按后果类型分流
+
+新增 `R3ShieldCore::IsPrivacyFace(ObjectType)`（`r3shieldcore_shared.h`），
+四个隐私面（`Camera` / `InputHook` / `Screen` / `Clipboard`）在 **block 下不硬拒**，
+改为 `Decision::WouldBlock` + `Action::Record` —— 日志里看得见、系统不打断。
+
+四处 guard 用**同一段判断**（不各写一份，抄两份必漂）：
+`camera_guard.cpp` / `clipboard_guard.cpp` / `screen_guard.cpp` / `input_hook_guard.cpp`。
+
+破坏类（注册表持久化 / 系统文件 / 驱动 / 服务 / 计划任务 / COM 劫持 / 令牌窃取 /
+跨进程注入）**不在此列**，block 下照拦。真要连隐私面一起拦，用 `mode=block_all`。
+
+#### 验证：7 条行为判据（含 3 条负对照）+ 形态判据 + 2 个变异
+
+新增 `tools/v129_privacy_ut.cpp`（进 `build_guard_ut.sh`），**走完整 `Evaluate`**
+（不是只调 `RejectOrSpoof` —— 那等于假设"该走到拒绝"这件事成立，正是要验的东西）：
+
+| # | 用例 | 期望 | 作用 |
+|---|---|---|---|
+| ① | block + 读剪贴板 | Record + WouldBlock | 新行为 |
+| ② | block_all + 读剪贴板 | Block + Blocked | 负对照：全拦不受影响 |
+| ③ | log + 读剪贴板 | Record + WouldBlock | 负对照：旧行为不变 |
+| ④ | block + 写 Run 键 | Block + Blocked | **负对照：破坏类照拦** |
+| ⑤ | block + BitBlt 截屏 | Record | 新行为 |
+| ⑥ | block + 全局键盘钩子 | Record | 新行为 |
+| ⑦ | （①②③④⑤⑥ 合计） | 7 passed / 0 failed | |
+
+④ 是最关键的一条：如果有人把 v129 实现成"block 干脆什么都不拦"，
+①②③⑤⑥ 会**全部继续通过**，只有 ④ 变红。它证明这次改动是**分流**，不是**放水**。
+
+摄像头面**没有**行为单测：`camera_guard.cpp` 依赖 Media Foundation（17 处 MF 符号），
+而本机 `mfplat.lib` 加进链接会出问题（MEMORY-4 铁律 215）。它那处改动与另外三个
+**完全同构**，由 `tools/check_privacy_face.sh` 的形态判据兜住：
+
+- 四个面都必须有 `IsPrivacyFace(` 的**调用形态**（不是裸名字，注释/定义会喂饱计数）
+  且后面 6 行内必须有 `WouldBlock`
+- 破坏类（Registry/File/Driver/Process/Thread）**不能**出现在隐私名单里
+- 一条负对照（不存在的标记搜不到）
+
+★ 两个**变异测试**都做了：删掉 camera 的调用点 ⇒ 红；把 `Registry` 塞进隐私名单 ⇒ 红。
+
+`check_dist_sync.sh` 补一段：形态判据 + **双架构 DLL 比四处 guard + shared.h 都新**
+（防"改了源码没重编"）。★ 第一版产物判据查 `strings | grep IsPrivacyFace` ——
+**错的**：`inline` 函数被内联展开，DLL 里根本没有这个符号，两个架构全报 FAIL。
+
+#### 顺带发现的两个既有问题（本次未改）
+
+1. **`RegistryGuardTest::EvaluateKey()` 的 `mode` 形参是死参数** ——
+   `Evaluate` 实际读 `Policy->Mode`（`registry_guard.cpp:1196`）。
+   单测第一版只把 `kBlock` 传给形参，④ 实际跑在 ③ 留下的 log 模式下，
+   得到 WouldBlock 而不是 Blocked。**是这条负对照自己抓出来的。**
+2. **`v72_guard_ut` 有 2 条负对照在 HEAD 上就是红的**
+   （`无关键 -> 不 Spoofed` / `protect_reg 名单为空 -> 不 Spoofed`）。
+   已用 `git stash` 把本次改动全部暂存后复跑确认：**与本版无关，是既有失败**。
+   闸门因此长期不是全绿 —— 建议单独修。
+
 ### 验证 — 「真能替换吗？全都换一遍」（v128 补验）
 
 用户原话：「**真能替换吗？你试试，全都换一遍**」。

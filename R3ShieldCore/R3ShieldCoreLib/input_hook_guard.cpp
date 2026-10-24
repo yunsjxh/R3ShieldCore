@@ -277,6 +277,16 @@ namespace
 		const bool canAsk = allowAsk && (mode == static_cast<ULONG>(R3ShieldCore::Mode::Ask));
 		if (!canAsk) {
 			if (mode == static_cast<ULONG>(R3ShieldCore::Mode::Block)) {
+				// ★ v129：隐私面在 block 下**不硬拒**。
+				//   输入钩子是"知情类"：输入法、游戏、远程控制、屏幕取词
+				//   全都要装钩子，硬拒的表现是"打字没反应 / 游戏按键失灵"。
+				//   只记录 + 标 WouldBlock；真要拦用 mode=block_all。
+				if (R3ShieldCore::IsPrivacyFace(
+						static_cast<R3ShieldCore::ObjectType>(event.ObjectType))) {
+					event.Decision = static_cast<ULONG>(R3ShieldCore::Decision::WouldBlock);
+					return Action::Record;
+				}
+
 				event.Decision = static_cast<ULONG>(R3ShieldCore::Decision::Blocked);
 				event.Flags |= R3ShieldCore::FlagEventBlocked;
 				if (R3ShieldCore::ChannelHeader* channel = R3ShieldCoreChannel::Channel()) {
@@ -1212,3 +1222,27 @@ namespace InputHookGuard
 		return true;
 	}
 }
+
+// ==================================================================
+// ★ v129：单测专用入口（宏 INPUTHOOK_GUARD_UT 打开）
+// ==================================================================
+//
+// 同 screen_guard.cpp 尾部那一段：`Evaluate` 在匿名 namespace 里，
+// 而 v129 要验的是"block 模式下**要不要走到拒绝**"（不是拒绝本身）。
+#ifdef INPUTHOOK_GUARD_UT
+namespace InputHookGuardTest
+{
+	// idHook 传 WH_KEYBOARD_LL / WH_KEYBOARD；threadId=0 表示全局钩子
+	// （Win32 定义：dwThreadId==0 ⇒ 系统注入到所有同类 GUI 线程）。
+	int EvaluateForTest(ULONG op, int idHook, ULONG threadId, bool rawSink,
+		int* decisionOut, ULONG* flagsOut) noexcept
+	{
+		R3ShieldCore::Event event = {};
+		const Action action = Evaluate(static_cast<R3ShieldCore::HookOp>(op),
+			event, /*allowAsk=*/false, idHook, threadId, rawSink);
+		if (decisionOut) *decisionOut = static_cast<int>(event.Decision);
+		if (flagsOut)    *flagsOut = event.Flags;
+		return static_cast<int>(action);
+	}
+}
+#endif // INPUTHOOK_GUARD_UT
