@@ -199,7 +199,7 @@ bash tools/test_gui_preview.sh advanced ark    # advanced 正路 + ark 负对照
 >
 > ★ 该夹具是**两步式**的：`--prepare`（不需要管理员）搭工作区 + 写三格配置，
 > `--run-engine`（**需要管理员终端**）真跑。因为引擎清单是
-> `requireAdministrator`，而 非提权的 shell 提不了权。
+> `requireAdministrator`，而非提权的 shell 提不了权。
 >
 > ★ `--run-engine` 还**分两级**：级 1「冒烟闸门」（~9s）先单独证掉**安全前提**
 > —— 白名单真的限住了注入范围（判据 = 引擎自报 `注入新进程: N 个` 的合计，
@@ -215,7 +215,7 @@ bash tools/test_gui_preview.sh advanced ark    # advanced 正路 + ark 负对照
 > ANSI 落盘），脚本靠 `iconv` 转码才能 grep 中文。实测 **MSYS2 的 bash 没有 iconv，
 > PortableGit / Git Bash 的有**（脚本会自检并明确报错）。
 >
-> ★ 自动化脚本（要跑它，用 `tools/run_elevated.exe`：`Start-Process` 起
+> ★ 自动化脚本要跑它，用 `tools/run_elevated.exe`：`Start-Process` 起
 > shell / 解释器 / 系统工具会被命令校验拦掉，但**普通 exe 可以** —— 用 runas 拉起
 > 这个转发器（**只弹一次 UAC**），它再拉起 bash，子进程继承提权令牌。
 > ⚠️ `Start-Process -ArgumentList` 要传**一个自带引号的整串**，传数组会按空格拆坏参数。

@@ -20,11 +20,14 @@ BOM = b'\xef\xbb\xbf'
 #   （例如 driver/）会被**完全漏掉**，而检查器同样漏掉 ⇒ 两边一起静默通过。
 DEFAULT_GLOBS = ['**/*.ps1']
 
-EXCLUDE_DIRS = ('_t', 'obj', 'verdir', '.git', '.dev-assist', 'node_modules')
+EXCLUDE_DIRS = ('_t', 'obj', 'verdir', '.git', 'node_modules')
 
 
 def _excluded(path):
-    parts = path.replace('\\', '/').split('/')
+    parts = [p for p in path.replace('\\', '/').split('/') if p not in ('', '.', '..')]
+    # 点开头的目录（.git / 编辑器目录 / 本地工具目录）一律跳过 —— 不逐个点名。
+    if any(p.startswith('.') for p in parts):
+        return True
     return any(d in parts for d in EXCLUDE_DIRS)
 
 
