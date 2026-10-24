@@ -104,11 +104,14 @@ DEFAULT_GLOBS = ['**/*.ps1']
 
 # 只排除真正的产物/缓存目录；dist 不排除 —— 那里面是要发给用户的脚本，
 # 恰恰最该被检查。
-EXCLUDE_DIRS = ('_t', 'obj', 'verdir', '.git', '.dev-assist', 'node_modules')
+EXCLUDE_DIRS = ('_t', 'obj', 'verdir', '.git', 'node_modules')
 
 
 def _excluded(path):
-    parts = path.replace('\\', '/').split('/')
+    parts = [p for p in path.replace('\\', '/').split('/') if p not in ('', '.', '..')]
+    # 点开头的目录（.git / 编辑器目录 / 本地工具目录）一律跳过 —— 不逐个点名。
+    if any(p.startswith('.') for p in parts):
+        return True
     return any(d in parts for d in EXCLUDE_DIRS)
 
 

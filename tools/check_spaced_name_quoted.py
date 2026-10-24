@@ -81,7 +81,7 @@ EXCLUDE_DIRS = {
 }
 EXCLUDE_PATH_PREFIXES = (
     "dist/R3ShieldCore-x64-v", "dist/R3ShieldCore-x64-v", "dist/build",
-    ".dev-assist/backup", ".backup-",
+    ".backup-",
 )
 
 # ---------------------------------------------------------------------------
@@ -182,7 +182,8 @@ def iter_scripts() -> list[Path]:
         dirnames[:] = [
             n for n in dirnames
             if n not in EXCLUDE_DIRS
-            and not n.startswith(".backup")
+            # 点开头的目录（.git / 编辑器目录 / 本地工具目录）一律跳过 —— 不逐个点名。
+            and not n.startswith(".")
             and not (d / n).relative_to(REPO).as_posix().startswith(EXCLUDE_PATH_PREFIXES)
         ]
         for name in filenames:

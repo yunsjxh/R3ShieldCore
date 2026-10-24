@@ -66,28 +66,27 @@ done
 # ⚠️ 必须 cd 进项目根并用**相对路径**（项目根可能含中文，绝对路径会 C1083）。
 cd "$PROJECT_ROOT" || exit 1
 
-# ★★★ 2026-10-24：沙箱会往 shell 注入 `rm` 函数，而 `SAFE_DELETE_BIN_DIR`
+# ★★★ 2026-10-24：宿主环境会往 shell 注入 `rm` 函数，它指向的 safe-bin 目录
 #   是 **Windows 反斜杠绝对路径** ⇒ MSYS 当成相对 cwd 的路径 ⇒ 每次 `rm` 都在 D 盘
 #   做无效查找，脚本卡在下面 2b) 的清理上**几分钟不动、CPU 0%**。
 #   `command rm`（原来那两道修）**只绕开了函数、没绕开 PATH**：真正的 /usr/bin/rm
 #   在被污染的 PATH 里仍要逐个目录查找。⇒ 必须把 safe-bin 段整体从 PATH 剔除。
+#   ★ 判据只用 PATH 段里的 `safe-bin`，**不判断任何宿主变量名**。
 unset -f rm unlink rmdir 2>/dev/null || true
-if [ -n "${SAFE_DELETE_BIN_DIR:-}" ]; then
-    _old_path="$PATH"
-    PATH=""
-    _rest="$_old_path:"
-    while [ -n "$_rest" ]; do
-        _seg="${_rest%%:*}"
-        _rest="${_rest#*:}"
-        case "$_seg" in
-            *safe-bin*) continue ;;
-            "") continue ;;
-        esac
-        if [ -z "$PATH" ]; then PATH="$_seg"; else PATH="$PATH:$_seg"; fi
-    done
-    export PATH
-    unset _old_path _rest _seg
-fi
+_old_path="$PATH"
+PATH=""
+_rest="$_old_path:"
+while [ -n "$_rest" ]; do
+    _seg="${_rest%%:*}"
+    _rest="${_rest#*:}"
+    case "$_seg" in
+        *safe-bin*) continue ;;
+        "") continue ;;
+    esac
+    if [ -z "$PATH" ]; then PATH="$_seg"; else PATH="$PATH:$_seg"; fi
+done
+export PATH
+unset _old_path _rest _seg
 hash -r 2>/dev/null || true
 
 if [ "$CHECK_ONLY" = "1" ]; then

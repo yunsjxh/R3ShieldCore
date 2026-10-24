@@ -35,30 +35,29 @@ esac
 
 cd "$PROJECT_ROOT" || exit 1
 
-# ★★★ 2026-10-24：和 `build.sh` 同一处修复 —— 宿主的沙箱会往 shell 里注入
-#   `rm() { "${SAFE_DELETE_BIN_DIR}/rm" "$@"; }`，而那个变量是
+# ★★★ 2026-10-24：和 `build.sh` 同一处修复 —— 宿主环境会往 shell 里注入
+#   `rm() { "${SAFE_DELETE_BIN_DIR}/rm" "$@"; }`，而那个变量指向
 #   **Windows 反斜杠绝对路径**（`D:\Program Files\...\safe-bin`），MSYS 把它
 #   当成相对 cwd 的路径 ⇒ 每次 `rm` 都要在 D 盘做无效查找 + 目录遍历。
 #   后果：脚本卡在下面那句 `rm -f "$RES_OBJ"` 上**几分钟不动、CPU 0%**，
 #   看起来像"编译卡死"。`unset -f` 单独不够（PATH 里那一段还在），
 #   必须**把 PATH 里的 safe-bin 段整体剔除**再 `hash -r`。
+#   ★ 判据只用 PATH 段里的 `safe-bin`，**不判断任何宿主变量名**。
 unset -f rm unlink rmdir 2>/dev/null || true
-if [ -n "${SAFE_DELETE_BIN_DIR:-}" ]; then
-    _old_path="$PATH"
-    PATH=""
-    _rest="$_old_path:"
-    while [ -n "$_rest" ]; do
-        _seg="${_rest%%:*}"
-        _rest="${_rest#*:}"
-        case "$_seg" in
-            *safe-bin*) continue ;;
-            "") continue ;;
-        esac
-        if [ -z "$PATH" ]; then PATH="$_seg"; else PATH="$PATH:$_seg"; fi
-    done
-    export PATH
-    unset _old_path _rest _seg
-fi
+_old_path="$PATH"
+PATH=""
+_rest="$_old_path:"
+while [ -n "$_rest" ]; do
+    _seg="${_rest%%:*}"
+    _rest="${_rest#*:}"
+    case "$_seg" in
+        *safe-bin*) continue ;;
+        "") continue ;;
+    esac
+    if [ -z "$PATH" ]; then PATH="$_seg"; else PATH="$PATH:$_seg"; fi
+done
+export PATH
+unset _old_path _rest _seg
 hash -r 2>/dev/null || true
 
 OUT_DIR="dist/R3ShieldCore-x64"

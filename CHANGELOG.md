@@ -1332,7 +1332,7 @@ rm() { "${SAFE_DELETE_BIN_DIR}/rm" "$@"; }
 
 ```sh
 unset -f rm unlink rmdir        # ① 去掉函数 —— 单独不够
-# ② 把 PATH 里所有 *safe-bin* 段整体剔除
+# ② 把 PATH 里所有 *safe-bin* 段整体剔除（判据只用段名，不看宿主变量）
 # ③ hash -r
 ```
 
@@ -1568,13 +1568,13 @@ SetMode(2) → 成功
 
 **① 白名单写在 `%ProgramData%\R3 Shield Core\r3shieldcore.ini`，不写进 dist 那份**
 ```
-never_inject=D:\Program Files\HostApp\
-never_inject=C:\Users\user\.dev-assist\
+never_inject=D:\Program Files\<IDE 安装目录>\
+never_inject=C:\Users\<用户名>\.<IDE 数据目录>\
 ```
 - 为什么用**目录 + 结尾 `\`** 而不是单个 exe：IDE 主进程有 9 个实例，同目录
   `resources\` 下还有 `sandbox-cli` / `editor_sdk` / `betterleaks` 等辅助进程，
-  被 hook 一样会崩。匹配是"前缀 + 路径边界"，`...\HostApp\` 命中整棵，
-  但**不**命中 `...\HostApp2\`（不给"改个目录名就免注入"留后门）。
+  被 hook 一样会崩。匹配是"前缀 + 路径边界"，`...\<IDE>\` 命中整棵，
+  但**不**命中 `...\<IDE>2\`（不给"改个目录名就免注入"留后门）。
 - 为什么**不写进** `dist/R3ShieldCore-x64/r3shieldcore.ini`：那份是仓库里的**发布物**，
   写进去等于把"作者本机装了什么工具"提交上去 —— `verify_dist_ini` 有一条
   断言专门拦这件事（"never_inject 随包默认为空"），2026-10-04 已经踩过一次。
@@ -3519,7 +3519,7 @@ ENGINE_BASE="$(basename "${ENGINE:-R3 ShieldCore.exe}")"
   > ★ A/B 两格是 `mode=block` 而不是 `mode=test` —— 正因为 v69 把注入范围与拦截行为
   > **解耦**了。否则这两格要么验不了替换、要么只能全局注入 block（会 hook 编辑器）。
 
-- **两步式**（因为引擎清单是 `requireAdministrator`，而 非提权的 shell 提不了权）：
+- **两步式**（因为引擎清单是 `requireAdministrator`，而非提权的 shell 提不了权）：
   - `--prepare`：**不需要管理员** —— 查产物 / 验基线 / 搭工作区 / 写三格配置，打印下一步。
   - `--run-engine`：**需要管理员终端** —— 真跑三格 + 出结论。
   - `--collect`：只重新解析上一次的落盘结果（`--run-engine` 跑完也调同一份断言）。

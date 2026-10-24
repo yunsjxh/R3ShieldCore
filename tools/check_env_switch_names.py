@@ -39,7 +39,7 @@ PS1_SETTER_RX = re.compile(r'\$env:([A-Za-z0-9_]+)\s*=')
 BAT_SETTER_RX = re.compile(r'^\s*set\s+([A-Za-z0-9_]+)\s*=', re.M)
 SH_SETTER_RX = re.compile(r'^\s*(?:export\s+)?([A-Z][A-Z0-9_]{3,})=', re.M)
 
-SKIP_DIRS = {'.git', 'dist', 'obj', '_t', 'backup', '.dev-assist',
+SKIP_DIRS = {'.git', 'dist', 'obj', '_t', 'backup',
              'Debug', 'Release', 'verification', 'demo', 'docs'}
 
 # Only names that look like this project's switches.  Without this the .bat/.sh
@@ -49,7 +49,9 @@ PROJECT_SWITCH_RX = re.compile(r'^(?:REG|REGG)UARD_[A-Z0-9_]+$')
 
 def walk(exts):
     for root, dirs, files in os.walk('.'):
-        dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+        # 点开头的目录（.git / 编辑器目录 / 本地工具目录）一律跳过 —— 不逐个点名，
+        # 否则脚本里就会留下"作者本机装了什么工具"的线索。
+        dirs[:] = [d for d in dirs if d not in SKIP_DIRS and not d.startswith('.')]
         for f in files:
             if f.endswith(exts):
                 yield os.path.join(root, f)

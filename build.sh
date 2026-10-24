@@ -70,7 +70,7 @@ cd "$PROJECT_ROOT" || { echo "找不到项目目录: $PROJECT_ROOT"; exit 1; }
 #     构建在 `compile_all` 编完最后一个 .cpp 之后**永久卡住**，
 #     日志停在那一个文件名上，不动、不报错、CPU 为 0。
 #
-#   真因：某些宿主环境（HostTool CLI 的 shell 包装）会注入
+#   真因：某些宿主环境（宿主 CLI 的 shell 包装）会注入
 #       rm() { "${SAFE_DELETE_BIN_DIR}/rm" "$@"; }
 #     而 `SAFE_DELETE_BIN_DIR` 是**Windows 反斜杠绝对路径**
 #     （`D:\Program Files\...\safe-bin`）。MSYS bash 把 `which rm` 解析成
@@ -90,23 +90,23 @@ cd "$PROJECT_ROOT" || { echo "找不到项目目录: $PROJECT_ROOT"; exit 1; }
 #     第二个碎片会被 MSYS 解析成 `${cwd}/  行 Program Files/...`，
 #     `which rm` 照样命中它。所以必须**同时把 PATH 里这条剔除**。
 unset -f rm unlink rmdir 2>/dev/null || true
-if [ -n "${SAFE_DELETE_BIN_DIR:-}" ]; then
-    # 用 bash 内建参数替换剔除，不依赖外部命令（此时 PATH 还不可信）
-    _old_path="$PATH"
-    PATH=""
-    _rest="$_old_path:"
-    while [ -n "$_rest" ]; do
-        _seg="${_rest%%:*}"
-        _rest="${_rest#*:}"
-        case "$_seg" in
-            *safe-bin*) continue ;;
-            "") continue ;;
-        esac
-        if [ -z "$PATH" ]; then PATH="$_seg"; else PATH="$PATH:$_seg"; fi
-    done
-    export PATH
-    unset _old_path _rest _seg
-fi
+# ★ 这里**不判断任何宿主变量名**：判据就是 PATH 段里有没有 `safe-bin`，
+#   无条件重建一遍 PATH。宿主把变量改名/删掉都逃不掉，脚本也不再留它的名字。
+# 用 bash 内建参数替换剔除，不依赖外部命令（此时 PATH 还不可信）
+_old_path="$PATH"
+PATH=""
+_rest="$_old_path:"
+while [ -n "$_rest" ]; do
+    _seg="${_rest%%:*}"
+    _rest="${_rest#*:}"
+    case "$_seg" in
+        *safe-bin*) continue ;;
+        "") continue ;;
+    esac
+    if [ -z "$PATH" ]; then PATH="$_seg"; else PATH="$PATH:$_seg"; fi
+done
+export PATH
+unset _old_path _rest _seg
 hash -r 2>/dev/null || true
 
 FAILED=0
