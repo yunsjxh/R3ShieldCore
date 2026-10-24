@@ -1,6 +1,8 @@
 #pragma once
 
 #include <r3shieldcore/r3shieldcore_shared.h>
+#include <string>
+#include <vector>
 
 //
 // 简易 Win32 主窗口面板。
@@ -82,6 +84,31 @@ namespace R3ShieldCoreGui
 	// injectedTotal = 累计注入进程数。
 	void Update(ULONG injectedTotal) noexcept;
 
+	// ★★★ v103：「配置」页应用完、引擎重启之后，把新的真值喂回界面。
+	//
+	// 同时会**清掉待提交寄存区** —— 那是"开关不弹回旧值"的唯一正确时机
+	// （早清 ⇒ 引擎还没重启完，开关先弹回旧值；不清 ⇒ 界面显示的值
+	// 与引擎里的真实值不一致，界面在撒谎）。
+	//
+	// ★ `options.LogPath` 会被**深拷贝**进界面自己的缓冲，调用方传
+	//   栈上局部量也安全（v103 之前这里只拷指针，是个潜伏的野指针）。
+	void SetOptions(const Options& options) noexcept;
+
+	// ★ v91：引擎是否连上（主循环每轮喂一次）。
+	//
+	// 为什么必须有：界面是 **WINDOWS 子系统**（没有控制台），`printf` 全进日志，
+	// 而日志在运行期是**独占**打不开的 ⇒ 任何"静默失败"用户都看不到。
+	// 实测事故：上一次会话留下的僵尸引擎占着单实例互斥体与管道 ⇒ 新界面连不上
+	// ⇒ 点「切换模式」只写一行日志，用户看到的就是"点了完全没反应、徽章不变"。
+	// 现在徽章会直接显示「未连接」。
+	void SetEngineConnected(bool connected) noexcept;
+
+	// ★ v91：窗口内的一次性提示（默认 8 秒）。
+	//
+	// 占用标题栏**副标题那一行**（同矩形，不与标题/按钮打架），红字。
+	// 用于"模式切换失败：引擎未连接"这类必须让用户看见、但又只出现在日志里的结论。
+	void ShowNotice(const std::wstring& text, ULONGLONG durationMs = 8000) noexcept;
+
 	// 界面线程 → 引擎线程：把「点了切换模式按钮」这件事传出去。
 	// 返回 true 表示这次取到了一个待处理的请求（取走即清空）。
 	// 引擎线程调用，不阻塞。
@@ -95,6 +122,20 @@ namespace R3ShieldCoreGui
 	// 和模式切换、UIAccess 接管一样，界面线程只置位，真正的收尾由 app.cpp
 	// 主循环做（反注入 → 关窗口 → 退出进程），界面线程绝不直接退进程。
 	bool TakeQuitRequest() noexcept;
+
+	// ★★★ v103：界面线程 → 引擎线程：用户在「配置」页按下了
+	// 「应用并重启引擎」。
+	//
+	// 为什么必须走这条路，而不是界面自己写 ini：
+	//   · 写 ini 和**重启引擎**是主程序的活（只有它知道 exe 目录、
+	//     才知道怎么干净地停引擎并反注入）；
+	//   · 界面线程上做文件 I/O + 停引擎，会把整屏重绘卡住
+	//     （v101 就是栽在"在 UI 线程上做重活"）。
+	//
+	// `lines` 每条形如 `hook_file=1`，**只含与当前值不同的项**。
+	// 取走即清空；返回值 false 表示没有待处理的请求。
+	bool TakeConfigApplyRequest(std::vector<std::wstring>& lines,
+		bool& arkPresent, bool& arkEnabled) noexcept;
 
 	// 引擎线程 → 界面：告诉窗口当前模式已经变成什么了（刷新徽章）。
 	void SetMode(R3ShieldCore::Mode mode) noexcept;

@@ -23,6 +23,26 @@ namespace
 	{
 		ZeroMemory(&p, sizeof(p));
 	}
+
+	//
+	// ★ v91：单测必须**钉住文件**，不能走 `R3ShieldCoreConfig::Load`。
+	//
+	// `Load` 会按 `ResolveConfigPath` **优先**读
+	//   `%ProgramData%\R3 Shield Core\r3shieldcore.ini` —— 那是运行期正确的语义，
+	// 但对单测是灾难：开发机上一旦有那份配置（本机注入白名单是开发机标配），
+	// 每个用例读到的都是**它**而不是用例自己写的临时 ini ⇒ 53 个断言集体假红
+	// （实测：config_ut 从 0 失败变成大片 FAIL），而且**看着像解析器坏了**。
+	// 这正是铁律 255 那类"判据被本机状态搬家"。所以这里统一走钉文件的入口。
+	//
+	void LoadPinned(R3ShieldCore::Policy& p, const std::filesystem::path& dir)
+	{
+		R3ShieldCoreConfig::LoadFromFile(p, dir / L"r3shieldcore.ini", dir);
+	}
+
+	R3ShieldCoreConfig::EngineSettings LoadEngineSettingsPinned(const std::filesystem::path& dir)
+	{
+		return R3ShieldCoreConfig::LoadEngineSettingsFromFile(dir / L"r3shieldcore.ini");
+	}
 }
 
 int main()
@@ -39,7 +59,7 @@ int main()
 
 	int failed = 0;
 	R3ShieldCore::Policy policy = {};
-	R3ShieldCoreConfig::Load(policy, dir);
+	LoadPinned(policy, dir);
 	failed += !Check("missing config keeps file hook disabled",
 		(policy.Flags & R3ShieldCore::FlagHookFile) == 0);
 	failed += !Check("missing config keeps safe LOG defaults",
@@ -59,7 +79,7 @@ int main()
 		ini << "inject_shell_thin=0\n";
 	}
 	ResetPolicy(policy);
-	R3ShieldCoreConfig::Load(policy, dir);
+	LoadPinned(policy, dir);
 	failed += !Check("inject_shell_thin=0 disables thin inject",
 		(policy.Flags2 & R3ShieldCore::FlagInjectShellThin) == 0);
 	failed += !Check("inject_shell_thin=0 does not disturb hook_raw_disk",
@@ -70,7 +90,7 @@ int main()
 		ini << "inject_shell_thin=1\n";
 	}
 	ResetPolicy(policy);
-	R3ShieldCoreConfig::Load(policy, dir);
+	LoadPinned(policy, dir);
 	failed += !Check("inject_shell_thin=1 enables thin inject",
 		(policy.Flags2 & R3ShieldCore::FlagInjectShellThin) != 0);
 
@@ -80,7 +100,7 @@ int main()
 		ini << "inject_shell_thin=1   # 瘦注入\n";
 	}
 	ResetPolicy(policy);
-	R3ShieldCoreConfig::Load(policy, dir);
+	LoadPinned(policy, dir);
 	failed += !Check("inject_shell_thin inline comment stripped -> 1",
 		(policy.Flags2 & R3ShieldCore::FlagInjectShellThin) != 0);
 
@@ -90,7 +110,7 @@ int main()
 		ini << "inject_shell_thin=off\n";
 	}
 	ResetPolicy(policy);
-	R3ShieldCoreConfig::Load(policy, dir);
+	LoadPinned(policy, dir);
 	failed += !Check("inject_shell_thin=off disables thin inject",
 		(policy.Flags2 & R3ShieldCore::FlagInjectShellThin) == 0);
 
@@ -99,7 +119,7 @@ int main()
 		ini << "inject_shell_thin=on\n";
 	}
 	ResetPolicy(policy);
-	R3ShieldCoreConfig::Load(policy, dir);
+	LoadPinned(policy, dir);
 	failed += !Check("inject_shell_thin=on enables thin inject",
 		(policy.Flags2 & R3ShieldCore::FlagInjectShellThin) != 0);
 
@@ -108,7 +128,7 @@ int main()
 		ini << "hook_raw_disk=1\n";
 	}
 	ResetPolicy(policy);
-	R3ShieldCoreConfig::Load(policy, dir);
+	LoadPinned(policy, dir);
 	// ★ 交叉检查：改 hook_raw_disk 不能顺手把瘦注入关掉（两条独立的位）
 	failed += !Check("hook_raw_disk=1 keeps thin-inject untouched (independent bits)",
 		(policy.Flags2 & R3ShieldCore::FlagInjectShellThin) != 0);
@@ -119,7 +139,7 @@ int main()
 		ini << "hook_raw_disk=0\n";
 	}
 	ResetPolicy(policy);
-	R3ShieldCoreConfig::Load(policy, dir);
+	LoadPinned(policy, dir);
 	failed += !Check("hook_raw_disk=0 disables raw-disk hook",
 		(policy.Flags2 & R3ShieldCore::FlagHookRawDisk) == 0);
 	failed += !Check("hook_raw_disk=0 does not disturb hook_file flag",
@@ -130,7 +150,7 @@ int main()
 		ini << "hook_raw_disk=1\n";
 	}
 	ResetPolicy(policy);
-	R3ShieldCoreConfig::Load(policy, dir);
+	LoadPinned(policy, dir);
 	failed += !Check("hook_raw_disk=1 enables raw-disk hook",
 		(policy.Flags2 & R3ShieldCore::FlagHookRawDisk) != 0);
 
@@ -138,7 +158,7 @@ int main()
 		std::ofstream ini(dir / L"r3shieldcore.ini", std::ios::binary | std::ios::trunc);
 		ini << "hook_file=1\n";
 	}
-	R3ShieldCoreConfig::Load(policy, dir);
+	LoadPinned(policy, dir);
 	failed += !Check("hook_file=1 enables file hook",
 		(policy.Flags & R3ShieldCore::FlagHookFile) != 0);
 
@@ -146,7 +166,7 @@ int main()
 		std::ofstream ini(dir / L"r3shieldcore.ini", std::ios::binary | std::ios::trunc);
 		ini << "hook_file=0\n";
 	}
-	R3ShieldCoreConfig::Load(policy, dir);
+	LoadPinned(policy, dir);
 	failed += !Check("hook_file=0 disables file hook",
 		(policy.Flags & R3ShieldCore::FlagHookFile) == 0);
 
@@ -162,7 +182,7 @@ int main()
 		ini << "exclude=D:\\x  ; 行内分号注释\n";
 	}
 	ResetPolicy(policy);
-	R3ShieldCoreConfig::Load(policy, dir);
+	LoadPinned(policy, dir);
 	failed += !Check("inline comment: mode=block # ... parses as block",
 		policy.Mode == static_cast<ULONG>(R3ShieldCore::Mode::Block));
 	failed += !Check("inline comment: hook_file=1 # ... enables file hook",
@@ -181,7 +201,7 @@ int main()
 		// 缺文件 → 取内置默认 2（询问）。
 		// ④⑤ 会结束目标进程，默认必须"先问"，不能静默杀正常全屏程序。
 		std::filesystem::remove(dir / L"r3shieldcore.ini", ec);
-		R3ShieldCoreConfig::EngineSettings e = R3ShieldCoreConfig::LoadEngineSettings(dir);
+		R3ShieldCoreConfig::EngineSettings e = LoadEngineSettingsPinned(dir);
 		failed += !Check("neutralize_overlay: missing config defaults to 2 (ask)",
 			e.NeutralizeOverlayLevel == 2 && e.NeutralizeOverlayEnabled());
 
@@ -204,7 +224,7 @@ int main()
 			std::ofstream ini(dir / L"r3shieldcore.ini", std::ios::binary | std::ios::trunc);
 			ini << c.text;
 			ini.close();
-			R3ShieldCoreConfig::EngineSettings e = R3ShieldCoreConfig::LoadEngineSettings(dir);
+			R3ShieldCoreConfig::EngineSettings e = LoadEngineSettingsPinned(dir);
 			failed += !Check((std::string("neutralize_overlay: ") + c.what).c_str(),
 				e.NeutralizeOverlayLevel == c.expect);
 		}
@@ -213,7 +233,7 @@ int main()
 	// ---- v41：注入扫描间隔 inject_interval_ms（盲区大小）----
 	{
 		std::filesystem::remove(dir / L"r3shieldcore.ini", ec);
-		R3ShieldCoreConfig::EngineSettings e = R3ShieldCoreConfig::LoadEngineSettings(dir);
+		R3ShieldCoreConfig::EngineSettings e = LoadEngineSettingsPinned(dir);
 		failed += !Check("inject_interval_ms: missing config defaults to 10 (短盲区)",
 			e.InjectionIntervalMs == 10);
 
@@ -235,7 +255,7 @@ int main()
 			std::ofstream ini(dir / L"r3shieldcore.ini", std::ios::binary | std::ios::trunc);
 			ini << c.text;
 			ini.close();
-			R3ShieldCoreConfig::EngineSettings e = R3ShieldCoreConfig::LoadEngineSettings(dir);
+			R3ShieldCoreConfig::EngineSettings e = LoadEngineSettingsPinned(dir);
 			failed += !Check((std::string("inject_interval_ms: ") + c.what).c_str(),
 				e.InjectionIntervalMs == c.expect);
 		}
@@ -258,7 +278,7 @@ int main()
 		ini.close();
 
 		ResetPolicy(policy);
-		R3ShieldCoreConfig::Load(policy, dir);
+		LoadPinned(policy, dir);
 
 		failed += !Check("protect_reg: 3 条有效前缀被读进来（注释/空值被跳过）",
 			policy.ProtectRegCount == 3);
@@ -284,7 +304,7 @@ int main()
 	{
 		// 缺文件 → 内置默认：级别 2（记录 + 界面），间隔 1000ms。
 		std::filesystem::remove(dir / L"r3shieldcore.ini", ec);
-		R3ShieldCoreConfig::EngineSettings e = R3ShieldCoreConfig::LoadEngineSettings(dir);
+		R3ShieldCoreConfig::EngineSettings e = LoadEngineSettingsPinned(dir);
 		failed += !Check("high_risk_process_alert: missing config defaults to 2",
 			e.HighRiskProcessAlert == 2);
 		failed += !Check("high_risk_process_alert: default 2 means enabled",
@@ -313,7 +333,7 @@ int main()
 			std::ofstream ini(dir / L"r3shieldcore.ini", std::ios::binary | std::ios::trunc);
 			ini << c.text;
 			ini.close();
-			R3ShieldCoreConfig::EngineSettings e = R3ShieldCoreConfig::LoadEngineSettings(dir);
+			R3ShieldCoreConfig::EngineSettings e = LoadEngineSettingsPinned(dir);
 			failed += !Check((std::string("high_risk_process_alert: ") + c.what).c_str(),
 				e.HighRiskProcessAlert == c.expect);
 		}
@@ -335,7 +355,7 @@ int main()
 			std::ofstream ini(dir / L"r3shieldcore.ini", std::ios::binary | std::ios::trunc);
 			ini << c.text;
 			ini.close();
-			R3ShieldCoreConfig::EngineSettings e = R3ShieldCoreConfig::LoadEngineSettings(dir);
+			R3ShieldCoreConfig::EngineSettings e = LoadEngineSettingsPinned(dir);
 			failed += !Check((std::string("high_risk_process_scan_ms: ") + c.what).c_str(),
 				e.HighRiskProcessScanMs == c.expect);
 		}
@@ -347,7 +367,7 @@ int main()
 			ini << "high_risk_process_alert=0\n";
 			ini << "high_risk_process_scan_ms=5000\n";
 			ini.close();
-			R3ShieldCoreConfig::EngineSettings e = R3ShieldCoreConfig::LoadEngineSettings(dir);
+			R3ShieldCoreConfig::EngineSettings e = LoadEngineSettingsPinned(dir);
 			failed += !Check("alert=0 不影响 scan_ms（两个键独立）",
 				e.HighRiskProcessAlert == 0 && e.HighRiskProcessScanMs == 5000);
 			failed += !Check("alert=0 时 HighRiskProcessAlertEnabled() 为 false",
@@ -370,7 +390,7 @@ int main()
 	{
 		// 缺文件 → 内置默认。
 		std::filesystem::remove(dir / L"r3shieldcore.ini", ec);
-		R3ShieldCoreConfig::EngineSettings e = R3ShieldCoreConfig::LoadEngineSettings(dir);
+		R3ShieldCoreConfig::EngineSettings e = LoadEngineSettingsPinned(dir);
 		failed += !Check("ark_enabled: missing config defaults to true（随包默认开）",
 			e.ArkEnabled);
 		failed += !Check("ark_scan_ms: missing config defaults to 2000",
@@ -400,7 +420,7 @@ int main()
 				std::ofstream ini(dir / L"r3shieldcore.ini", std::ios::binary | std::ios::trunc);
 				ini << c.text;
 				ini.close();
-				R3ShieldCoreConfig::EngineSettings e2 = R3ShieldCoreConfig::LoadEngineSettings(dir);
+				R3ShieldCoreConfig::EngineSettings e2 = LoadEngineSettingsPinned(dir);
 				failed += !Check((std::string("ark_enabled: ") + c.what).c_str(),
 					e2.ArkEnabled == c.expect);
 			}
@@ -422,7 +442,7 @@ int main()
 			std::ofstream ini(dir / L"r3shieldcore.ini", std::ios::binary | std::ios::trunc);
 			ini << c.text;
 			ini.close();
-			R3ShieldCoreConfig::EngineSettings e2 = R3ShieldCoreConfig::LoadEngineSettings(dir);
+			R3ShieldCoreConfig::EngineSettings e2 = LoadEngineSettingsPinned(dir);
 			failed += !Check((std::string("ark_scan_ms: ") + c.what).c_str(),
 				e2.ArkScanMs == c.expect);
 		}
@@ -442,7 +462,7 @@ int main()
 			std::ofstream ini(dir / L"r3shieldcore.ini", std::ios::binary | std::ios::trunc);
 			ini << c.text;
 			ini.close();
-			R3ShieldCoreConfig::EngineSettings e2 = R3ShieldCoreConfig::LoadEngineSettings(dir);
+			R3ShieldCoreConfig::EngineSettings e2 = LoadEngineSettingsPinned(dir);
 			failed += !Check((std::string("ark_refresh_ms: ") + c.what).c_str(),
 				e2.ArkRefreshMs == c.expect);
 		}
@@ -457,7 +477,7 @@ int main()
 			ini << "ark_scan_ms=3000\n";
 			ini << "ark_refresh_ms=750\n";
 			ini.close();
-			R3ShieldCoreConfig::EngineSettings e2 = R3ShieldCoreConfig::LoadEngineSettings(dir);
+			R3ShieldCoreConfig::EngineSettings e2 = LoadEngineSettingsPinned(dir);
 			failed += !Check("ark 三键各自独立（0 / 3000 / 750 互不影响）",
 				!e2.ArkEnabled && e2.ArkScanMs == 3000 && e2.ArkRefreshMs == 750);
 		}
@@ -483,7 +503,7 @@ int main()
 		// ---- 缺文件：默认**不**限定注入范围，也**不**带 FlagTestMode ----
 		std::filesystem::remove(dir / L"r3shieldcore.ini", ec);
 		ResetPolicy(policy);
-		R3ShieldCoreConfig::Load(policy, dir);
+		LoadPinned(policy, dir);
 		failed += !Check("test_inject_only: missing config -> count 0（默认全局注入）",
 			policy.TestInjectCount == 0);
 		failed += !Check("test_inject_only: missing config -> FlagTestMode 关",
@@ -495,7 +515,7 @@ int main()
 			ini << "mode=test\n";
 			ini.close();
 			ResetPolicy(policy);
-			R3ShieldCoreConfig::Load(policy, dir);
+			LoadPinned(policy, dir);
 			failed += !Check("mode=test -> Mode 落到 Log（不新增 Mode 枚举值）",
 				policy.Mode == static_cast<ULONG>(R3ShieldCore::Mode::Log));
 			failed += !Check("mode=test -> FlagTestMode 置位（引擎据此要求名单非空）",
@@ -514,7 +534,7 @@ int main()
 			ini << "mode=block\n";
 			ini.close();
 			ResetPolicy(policy);
-			R3ShieldCoreConfig::Load(policy, dir);
+			LoadPinned(policy, dir);
 			failed += !Check("mode=block 覆盖 mode=test -> Mode 为 Block",
 				policy.Mode == static_cast<ULONG>(R3ShieldCore::Mode::Block));
 			failed += !Check("mode=block 覆盖 mode=test -> FlagTestMode 被清掉（mode= 权威）",
@@ -529,7 +549,7 @@ int main()
 			ini << "test_inject_only=probe.exe\n";
 			ini.close();
 			ResetPolicy(policy);
-			R3ShieldCoreConfig::Load(policy, dir);
+			LoadPinned(policy, dir);
 			failed += !Check("解耦：mode=block + 名单 -> 名单照样被读进来（count 1）",
 				policy.TestInjectCount == 1);
 			failed += !Check("解耦：mode=block 不置 FlagTestMode",
@@ -550,7 +570,7 @@ int main()
 			ini << "test_inject_only=D:\\dev\\my target.exe   # 说明\n"; // 路径 + 行内注释
 			ini.close();
 			ResetPolicy(policy);
-			R3ShieldCoreConfig::Load(policy, dir);
+			LoadPinned(policy, dir);
 			failed += !Check("test_inject_only: 4 条有效（空值/纯空白被跳过）",
 				policy.TestInjectCount == 4);
 			failed += !Check("test_inject_only: 第 1 条 = a.exe",
@@ -577,7 +597,7 @@ int main()
 			}
 			ini.close();
 			ResetPolicy(policy);
-			R3ShieldCoreConfig::Load(policy, dir);
+			LoadPinned(policy, dir);
 			failed += !Check("test_inject_only: 超过上限被截断到 MaxTestInjectPaths（不越界）",
 				policy.TestInjectCount == R3ShieldCore::MaxTestInjectPaths);
 			failed += !Check("test_inject_only: 截断后最后一条是第 15 个（顺序不乱）",
@@ -595,7 +615,7 @@ int main()
 			ini << "never_inject=D:\\never\\blocked.exe\n";
 			ini.close();
 			ResetPolicy(policy);
-			R3ShieldCoreConfig::Load(policy, dir);
+			LoadPinned(policy, dir);
 			failed += !Check("白名单/黑名单各自独立：count 各为 1",
 				policy.TestInjectCount == 1 && policy.NeverInjectCount == 1);
 			failed += !Check("白名单/黑名单内容没串（白名单 = only.exe）",
@@ -622,7 +642,7 @@ int main()
 		// ---- 缺文件：默认关 ----
 		std::filesystem::remove(dir / L"r3shieldcore.ini", ec);
 		ResetPolicy(policy);
-		R3ShieldCoreConfig::Load(policy, dir);
+		LoadPinned(policy, dir);
 		failed += !Check("spoof_clipboard: missing config -> 默认关",
 			(policy.Flags2 & R3ShieldCore::FlagSpoofClipboard) == 0);
 
@@ -632,7 +652,7 @@ int main()
 			ini << "spoof_clipboard=1\n";
 			ini.close();
 			ResetPolicy(policy);
-			R3ShieldCoreConfig::Load(policy, dir);
+			LoadPinned(policy, dir);
 			failed += !Check("spoof_clipboard=1 -> 置位",
 				(policy.Flags2 & R3ShieldCore::FlagSpoofClipboard) != 0);
 		}
@@ -641,7 +661,7 @@ int main()
 			ini << "spoof_clipboard=0\n";
 			ini.close();
 			ResetPolicy(policy);
-			R3ShieldCoreConfig::Load(policy, dir);
+			LoadPinned(policy, dir);
 			failed += !Check("spoof_clipboard=0 -> 不置位",
 				(policy.Flags2 & R3ShieldCore::FlagSpoofClipboard) == 0);
 		}
@@ -652,7 +672,7 @@ int main()
 			ini << "spoof_clipboard=off\n";
 			ini.close();
 			ResetPolicy(policy);
-			R3ShieldCoreConfig::Load(policy, dir);
+			LoadPinned(policy, dir);
 			failed += !Check("spoof_clipboard: on/off 别名可用且最后一行权威",
 				(policy.Flags2 & R3ShieldCore::FlagSpoofClipboard) == 0);
 		}
@@ -661,7 +681,7 @@ int main()
 			ini << "spoof_clipboard=1 # 打开剪贴板替换\n";   // 行内注释
 			ini.close();
 			ResetPolicy(policy);
-			R3ShieldCoreConfig::Load(policy, dir);
+			LoadPinned(policy, dir);
 			failed += !Check("spoof_clipboard: 行内注释被切掉后仍为 1",
 				(policy.Flags2 & R3ShieldCore::FlagSpoofClipboard) != 0);
 		}
@@ -673,7 +693,7 @@ int main()
 			ini << "spoof_screen=1\n";
 			ini.close();
 			ResetPolicy(policy);
-			R3ShieldCoreConfig::Load(policy, dir);
+			LoadPinned(policy, dir);
 			failed += !Check("交叉：只开 spoof_screen -> 剪贴板替换仍为关（负对照）",
 				(policy.Flags2 & R3ShieldCore::FlagSpoofClipboard) == 0);
 			failed += !Check("交叉：只开 spoof_screen -> 截屏替换确实开了",
@@ -684,7 +704,7 @@ int main()
 			ini << "spoof_clipboard=1\n";
 			ini.close();
 			ResetPolicy(policy);
-			R3ShieldCoreConfig::Load(policy, dir);
+			LoadPinned(policy, dir);
 			failed += !Check("交叉：只开 spoof_clipboard -> 截屏替换仍为关（负对照）",
 				(policy.Flags2 & R3ShieldCore::FlagSpoofScreen) == 0);
 			failed += !Check("交叉：只开 spoof_clipboard -> 剪贴板替换确实开了",
@@ -696,7 +716,7 @@ int main()
 			ini << "spoof_clipboard=1\n";
 			ini.close();
 			ResetPolicy(policy);
-			R3ShieldCoreConfig::Load(policy, dir);
+			LoadPinned(policy, dir);
 			failed += !Check("交叉：两个都开 -> 两个位都亮",
 				(policy.Flags2 & R3ShieldCore::FlagSpoofScreen) != 0
 				&& (policy.Flags2 & R3ShieldCore::FlagSpoofClipboard) != 0);
@@ -724,7 +744,7 @@ int main()
 		// ---- 缺文件：默认关 ----
 		std::filesystem::remove(dir / L"r3shieldcore.ini", ec);
 		ResetPolicy(policy);
-		R3ShieldCoreConfig::Load(policy, dir);
+		LoadPinned(policy, dir);
 		failed += !Check("spoof_reg: missing config -> 默认关",
 			(policy.Flags2 & R3ShieldCore::FlagSpoofRegistry) == 0);
 
@@ -734,7 +754,7 @@ int main()
 			ini << "spoof_reg=1\n";
 			ini.close();
 			ResetPolicy(policy);
-			R3ShieldCoreConfig::Load(policy, dir);
+			LoadPinned(policy, dir);
 			failed += !Check("spoof_reg=1 -> 置位",
 				(policy.Flags2 & R3ShieldCore::FlagSpoofRegistry) != 0);
 		}
@@ -743,7 +763,7 @@ int main()
 			ini << "spoof_reg=0\n";
 			ini.close();
 			ResetPolicy(policy);
-			R3ShieldCoreConfig::Load(policy, dir);
+			LoadPinned(policy, dir);
 			failed += !Check("spoof_reg=0 -> 不置位",
 				(policy.Flags2 & R3ShieldCore::FlagSpoofRegistry) == 0);
 		}
@@ -754,7 +774,7 @@ int main()
 			ini << "spoof_reg=off\n";
 			ini.close();
 			ResetPolicy(policy);
-			R3ShieldCoreConfig::Load(policy, dir);
+			LoadPinned(policy, dir);
 			failed += !Check("spoof_reg: on/off 别名可用且最后一行权威",
 				(policy.Flags2 & R3ShieldCore::FlagSpoofRegistry) == 0);
 		}
@@ -763,7 +783,7 @@ int main()
 			ini << "spoof_reg=1 # 打开注册表值替换\n";   // 行内注释
 			ini.close();
 			ResetPolicy(policy);
-			R3ShieldCoreConfig::Load(policy, dir);
+			LoadPinned(policy, dir);
 			failed += !Check("spoof_reg: 行内注释被切掉后仍为 1",
 				(policy.Flags2 & R3ShieldCore::FlagSpoofRegistry) != 0);
 		}
@@ -776,7 +796,7 @@ int main()
 			ini << "spoof_clipboard=1\n";
 			ini.close();
 			ResetPolicy(policy);
-			R3ShieldCoreConfig::Load(policy, dir);
+			LoadPinned(policy, dir);
 			failed += !Check("交叉：只开 screen+clipboard -> 注册表替换仍为关（负对照）",
 				(policy.Flags2 & R3ShieldCore::FlagSpoofRegistry) == 0);
 		}
@@ -785,7 +805,7 @@ int main()
 			ini << "spoof_reg=1\n";
 			ini.close();
 			ResetPolicy(policy);
-			R3ShieldCoreConfig::Load(policy, dir);
+			LoadPinned(policy, dir);
 			failed += !Check("交叉：只开 spoof_reg -> 截屏替换仍为关（负对照）",
 				(policy.Flags2 & R3ShieldCore::FlagSpoofScreen) == 0);
 			failed += !Check("交叉：只开 spoof_reg -> 剪贴板替换仍为关（负对照）",
@@ -800,7 +820,7 @@ int main()
 			ini << "spoof_reg=1\n";
 			ini.close();
 			ResetPolicy(policy);
-			R3ShieldCoreConfig::Load(policy, dir);
+			LoadPinned(policy, dir);
 			failed += !Check("交叉：三个都开 -> 三个位都亮",
 				(policy.Flags2 & R3ShieldCore::FlagSpoofScreen) != 0
 				&& (policy.Flags2 & R3ShieldCore::FlagSpoofClipboard) != 0
@@ -835,7 +855,7 @@ int main()
 		// ---- 缺文件：默认关 ----
 		std::filesystem::remove(dir / L"r3shieldcore.ini", ec);
 		ResetPolicy(policy);
-		R3ShieldCoreConfig::Load(policy, dir);
+		LoadPinned(policy, dir);
 		failed += !Check("spoof_reg_enum: missing config -> 默认关",
 			(policy.Flags2 & R3ShieldCore::FlagSpoofRegistryEnum) == 0);
 
@@ -845,7 +865,7 @@ int main()
 			ini << "spoof_reg_enum=1\n";
 			ini.close();
 			ResetPolicy(policy);
-			R3ShieldCoreConfig::Load(policy, dir);
+			LoadPinned(policy, dir);
 			failed += !Check("spoof_reg_enum=1 -> 置位",
 				(policy.Flags2 & R3ShieldCore::FlagSpoofRegistryEnum) != 0);
 		}
@@ -854,7 +874,7 @@ int main()
 			ini << "spoof_reg_enum=0\n";
 			ini.close();
 			ResetPolicy(policy);
-			R3ShieldCoreConfig::Load(policy, dir);
+			LoadPinned(policy, dir);
 			failed += !Check("spoof_reg_enum=0 -> 不置位",
 				(policy.Flags2 & R3ShieldCore::FlagSpoofRegistryEnum) == 0);
 		}
@@ -865,7 +885,7 @@ int main()
 			ini << "spoof_reg_enum=off\n";
 			ini.close();
 			ResetPolicy(policy);
-			R3ShieldCoreConfig::Load(policy, dir);
+			LoadPinned(policy, dir);
 			failed += !Check("spoof_reg_enum: on/off 别名可用且最后一行权威",
 				(policy.Flags2 & R3ShieldCore::FlagSpoofRegistryEnum) == 0);
 		}
@@ -874,7 +894,7 @@ int main()
 			ini << "spoof_reg_enum=1 # 打开注册表枚举隐藏\n";   // 行内注释
 			ini.close();
 			ResetPolicy(policy);
-			R3ShieldCoreConfig::Load(policy, dir);
+			LoadPinned(policy, dir);
 			failed += !Check("spoof_reg_enum: 行内注释被切掉后仍为 1",
 				(policy.Flags2 & R3ShieldCore::FlagSpoofRegistryEnum) != 0);
 		}
@@ -888,7 +908,7 @@ int main()
 			ini << "spoof_reg=1\n";
 			ini.close();
 			ResetPolicy(policy);
-			R3ShieldCoreConfig::Load(policy, dir);
+			LoadPinned(policy, dir);
 			failed += !Check("交叉：只开 screen+clipboard+reg -> 枚举隐藏仍为关（负对照）",
 				(policy.Flags2 & R3ShieldCore::FlagSpoofRegistryEnum) == 0);
 		}
@@ -897,7 +917,7 @@ int main()
 			ini << "spoof_reg_enum=1\n";
 			ini.close();
 			ResetPolicy(policy);
-			R3ShieldCoreConfig::Load(policy, dir);
+			LoadPinned(policy, dir);
 			failed += !Check("交叉：只开 spoof_reg_enum -> 截屏替换仍为关（负对照）",
 				(policy.Flags2 & R3ShieldCore::FlagSpoofScreen) == 0);
 			failed += !Check("交叉：只开 spoof_reg_enum -> 剪贴板替换仍为关（负对照）",
@@ -915,7 +935,7 @@ int main()
 			ini << "spoof_reg_enum=1\n";
 			ini.close();
 			ResetPolicy(policy);
-			R3ShieldCoreConfig::Load(policy, dir);
+			LoadPinned(policy, dir);
 			failed += !Check("交叉：四个都开 -> 四个位都亮",
 				(policy.Flags2 & R3ShieldCore::FlagSpoofScreen) != 0
 				&& (policy.Flags2 & R3ShieldCore::FlagSpoofClipboard) != 0
@@ -957,7 +977,7 @@ int main()
 		// ---- 缺文件：默认关 ----
 		std::filesystem::remove(dir / L"r3shieldcore.ini", ec);
 		ResetPolicy(policy);
-		R3ShieldCoreConfig::Load(policy, dir);
+		LoadPinned(policy, dir);
 		failed += !Check("spoof_camera: missing config -> 默认关",
 			(policy.Flags2 & R3ShieldCore::FlagSpoofCamera) == 0);
 
@@ -967,7 +987,7 @@ int main()
 			ini << "spoof_camera=1\n";
 			ini.close();
 			ResetPolicy(policy);
-			R3ShieldCoreConfig::Load(policy, dir);
+			LoadPinned(policy, dir);
 			failed += !Check("spoof_camera=1 -> 置位",
 				(policy.Flags2 & R3ShieldCore::FlagSpoofCamera) != 0);
 		}
@@ -976,7 +996,7 @@ int main()
 			ini << "spoof_camera=0\n";
 			ini.close();
 			ResetPolicy(policy);
-			R3ShieldCoreConfig::Load(policy, dir);
+			LoadPinned(policy, dir);
 			failed += !Check("spoof_camera=0 -> 不置位",
 				(policy.Flags2 & R3ShieldCore::FlagSpoofCamera) == 0);
 		}
@@ -987,7 +1007,7 @@ int main()
 			ini << "spoof_camera=off\n";
 			ini.close();
 			ResetPolicy(policy);
-			R3ShieldCoreConfig::Load(policy, dir);
+			LoadPinned(policy, dir);
 			failed += !Check("spoof_camera: on/off 别名可用且最后一行权威",
 				(policy.Flags2 & R3ShieldCore::FlagSpoofCamera) == 0);
 		}
@@ -996,7 +1016,7 @@ int main()
 			ini << "spoof_camera=1 # 打开摄像头帧替换\n";   // 行内注释
 			ini.close();
 			ResetPolicy(policy);
-			R3ShieldCoreConfig::Load(policy, dir);
+			LoadPinned(policy, dir);
 			failed += !Check("spoof_camera: 行内注释被切掉后仍为 1",
 				(policy.Flags2 & R3ShieldCore::FlagSpoofCamera) != 0);
 		}
@@ -1007,7 +1027,7 @@ int main()
 			ini << "hook_camera=1\n";
 			ini.close();
 			ResetPolicy(policy);
-			R3ShieldCoreConfig::Load(policy, dir);
+			LoadPinned(policy, dir);
 			failed += !Check("交叉：只开 hook_camera -> 帧替换仍为关（负对照，铁律 199）",
 				(policy.Flags2 & R3ShieldCore::FlagSpoofCamera) == 0);
 		}
@@ -1022,7 +1042,7 @@ int main()
 			ini << "spoof_reg_enum=1\n";
 			ini.close();
 			ResetPolicy(policy);
-			R3ShieldCoreConfig::Load(policy, dir);
+			LoadPinned(policy, dir);
 			failed += !Check("交叉：只开前四个 -> 摄像头帧替换仍为关（负对照）",
 				(policy.Flags2 & R3ShieldCore::FlagSpoofCamera) == 0);
 		}
@@ -1031,7 +1051,7 @@ int main()
 			ini << "spoof_camera=1\n";
 			ini.close();
 			ResetPolicy(policy);
-			R3ShieldCoreConfig::Load(policy, dir);
+			LoadPinned(policy, dir);
 			failed += !Check("交叉：只开 spoof_camera -> 截屏替换仍为关（负对照）",
 				(policy.Flags2 & R3ShieldCore::FlagSpoofScreen) == 0);
 			failed += !Check("交叉：只开 spoof_camera -> 剪贴板替换仍为关（负对照）",
@@ -1052,7 +1072,7 @@ int main()
 			ini << "spoof_camera=1\n";
 			ini.close();
 			ResetPolicy(policy);
-			R3ShieldCoreConfig::Load(policy, dir);
+			LoadPinned(policy, dir);
 			failed += !Check("交叉：五个都开 -> 五个位都亮",
 				(policy.Flags2 & R3ShieldCore::FlagSpoofScreen) != 0
 				&& (policy.Flags2 & R3ShieldCore::FlagSpoofClipboard) != 0
@@ -1074,6 +1094,203 @@ int main()
 			R3ShieldCore::FlagSpoofCamera != R3ShieldCore::FlagSpoofRegistry);
 		failed += !Check("FlagSpoofCamera 与 FlagSpoofRegistryEnum 不是同一位",
 			R3ShieldCore::FlagSpoofCamera != R3ShieldCore::FlagSpoofRegistryEnum);
+	}
+
+	// ============================================================
+	//  v103：SaveEntries —— 配置页「应用」按钮的写盘通道
+	// ============================================================
+	//
+	//  ★ 为什么单独测它：这是**唯一**能从界面改 ini 的入口，而它做的事
+	//    很危险 —— 整文件读入、改几行、整文件写回。写错一个字节就会
+	//    把用户那份带大段中文注释的 ini 毁掉（注释和 CRLF 都要原样保住）。
+	//
+	//  测点（对应用户会在界面上碰到的情况）：
+	//    ① 改一个已存在的键 ⇒ 只有那一行变，其余字节（注释 / 空行 / CRLF）不动；
+	//    ② 同一个键在文件里出现两次 ⇒ **两处都改**（旧文件真有重复的 never_inject）；
+	//    ③ 键不存在 ⇒ 追加到末尾，不覆盖别的行；
+	//    ④ 多条一起改 ⇒ 全部生效，且互不干扰；
+	//    ⑤ 空 entries ⇒ 返回 true 且**不改文件**（"没东西可改"不是失败）；
+	//    ⑥ 形状不对的条目（没有 `=`）⇒ 被跳过，不写垃圾；
+	//    ⑦ ini 打不开 ⇒ 返回 false，且**不创建/不截断**任何文件；
+	//    ⑧ 键名大小写不敏感（`HOOK_FILE=1` 也要能命中 `hook_file`）。
+	{
+		const std::filesystem::path saveDir = dir / L"save_entries";
+		std::filesystem::create_directories(saveDir, ec);
+		const std::filesystem::path iniPath = saveDir / L"r3shieldcore.ini";
+
+		// 一份"像用户手写的那种" ini：带中文注释、空行、CRLF、重复键。
+		// 直接用 \r\n —— 这是本项目 ini 的真实行尾（Windows 记事本 / VS 都这么存）。
+		const std::string original =
+			"# R3 ShieldCore 配置\r\n"
+			"# 这一行是注释，改配置时不能被吃掉\r\n"
+			"\r\n"
+			"mode=log\r\n"
+			"hook_file=0\r\n"
+			"; 下面这条重复了，旧版工具留下的\r\n"
+			"never_inject=D:\\old\\a.exe\r\n"
+			"never_inject=D:\\old\\b.exe\r\n"
+			"\r\n"
+			"test_inject_only=\r\n";
+
+		auto WriteOriginal = [&]()
+		{
+			std::ofstream out(iniPath, std::ios::binary | std::ios::trunc);
+			out.write(original.data(), static_cast<std::streamsize>(original.size()));
+		};
+
+		auto ReadAll = [&]() -> std::string
+		{
+			std::ifstream in(iniPath, std::ios::binary);
+			return std::string((std::istreambuf_iterator<char>(in)),
+				std::istreambuf_iterator<char>());
+		};
+
+		// ---- ① 改一个已存在的键 ----
+		WriteOriginal();
+		{
+			const bool ok = R3ShieldCoreConfig::SaveEntriesToFile({ "hook_file=1" }, iniPath);
+			failed += !Check("SaveEntries：改已有键返回 true", ok);
+			const std::string after = ReadAll();
+			failed += !Check("SaveEntries：目标行确实改成了 hook_file=1",
+				after.find("hook_file=1") != std::string::npos);
+			failed += !Check("SaveEntries：旧值 hook_file=0 不再出现",
+				after.find("hook_file=0") == std::string::npos);
+			failed += !Check("SaveEntries：中文注释原样保留",
+				after.find("# 这一行是注释，改配置时不能被吃掉") != std::string::npos);
+			failed += !Check("SaveEntries：mode=log 没被顺手改掉",
+				after.find("mode=log") != std::string::npos);
+			failed += !Check("SaveEntries：CRLF 行尾保留（不变成纯 LF）",
+				after.find("\r\n") != std::string::npos);
+			// 字节数只该因为 0→1 而不变（同长度替换）
+			failed += !Check("SaveEntries：同长度替换后文件大小不变（说明没重排）",
+				after.size() == original.size());
+		}
+
+		// ---- ② 重复键全部改 ----
+		WriteOriginal();
+		{
+			const bool ok = R3ShieldCoreConfig::SaveEntriesToFile(
+				{ "never_inject=D:\\new\\only.exe" }, iniPath);
+			failed += !Check("SaveEntries：改重复键返回 true", ok);
+			const std::string after = ReadAll();
+			failed += !Check("SaveEntries：重复键的第一处也改了（新值出现 2 次）",
+				[&after]()
+				{
+					size_t count = 0;
+					const std::string needle = "never_inject=D:\\new\\only.exe";
+					size_t p = after.find(needle);
+					while (p != std::string::npos) { ++count; p = after.find(needle, p + 1); }
+					return count;
+				}() == 2);
+			failed += !Check("SaveEntries：两处旧值都不在了",
+				after.find("D:\\old\\a.exe") == std::string::npos
+				&& after.find("D:\\old\\b.exe") == std::string::npos);
+		}
+
+		// ---- ③ 缺键追加 ----
+		WriteOriginal();
+		{
+			const bool ok = R3ShieldCoreConfig::SaveEntriesToFile({ "brand_new_key=42" }, iniPath);
+			failed += !Check("SaveEntries：追加缺键返回 true", ok);
+			const std::string after = ReadAll();
+			failed += !Check("SaveEntries：缺键被追加进去了",
+				after.find("brand_new_key=42") != std::string::npos);
+			failed += !Check("SaveEntries：追加后原有的值都还在",
+				after.find("mode=log") != std::string::npos
+				&& after.find("hook_file=0") != std::string::npos);
+			failed += !Check("SaveEntries：追加时没把注释挤掉",
+				after.find("# 这一行是注释，改配置时不能被吃掉") != std::string::npos);
+		}
+
+		// ---- ④ 多条一起改 ----
+		WriteOriginal();
+		{
+			const bool ok = R3ShieldCoreConfig::SaveEntriesToFile(
+				{ "hook_file=1", "hook_reads=1", "mode=block_all" }, iniPath);
+			failed += !Check("SaveEntries：多条一起改返回 true", ok);
+			const std::string after = ReadAll();
+			failed += !Check("SaveEntries：多条全部生效",
+				after.find("hook_file=1") != std::string::npos
+				&& after.find("hook_reads=1") != std::string::npos
+				&& after.find("mode=block_all") != std::string::npos);
+			failed += !Check("SaveEntries：多条的旧值都清干净",
+				after.find("hook_file=0") == std::string::npos
+				&& after.find("mode=log") == std::string::npos);
+		}
+
+		// ---- ⑤ 空 entries ----
+		WriteOriginal();
+		{
+			const bool ok = R3ShieldCoreConfig::SaveEntriesToFile({}, iniPath);
+			failed += !Check("SaveEntries：空 entries 返回 true（不是失败）", ok);
+			failed += !Check("SaveEntries：空 entries 时文件一个字节都没动",
+				ReadAll() == original);
+		}
+
+		// ---- ⑥ 形状不对的条目被跳过 ----
+		WriteOriginal();
+		{
+			const bool ok = R3ShieldCoreConfig::SaveEntriesToFile(
+				{ "no_equals_sign_here", "=no_key" }, iniPath);
+			failed += !Check("SaveEntries：全是坏条目 ⇒ 返回 false（没有可写的）", !ok);
+			failed += !Check("SaveEntries：坏条目没被写成垃圾行",
+				ReadAll() == original);
+		}
+
+		// ---- ⑦ ini 不存在 ⇒ false 且不创建文件 ----
+		{
+			const std::filesystem::path missingDir = dir / L"save_entries_missing";
+			std::filesystem::create_directories(missingDir, ec);
+			const std::filesystem::path missingIni = missingDir / L"r3shieldcore.ini";
+			const bool ok = R3ShieldCoreConfig::SaveEntriesToFile({ "hook_file=1" }, missingIni);
+			failed += !Check("SaveEntries：ini 不存在时返回 false（不偷偷新建）", !ok);
+			failed += !Check("SaveEntries：ini 不存在时也没创建空文件",
+				!std::filesystem::exists(missingIni));
+		}
+
+		// ---- ⑧ 键名大小写不敏感 ----
+		WriteOriginal();
+		{
+			const bool ok = R3ShieldCoreConfig::SaveEntriesToFile({ "HOOK_FILE=1" }, iniPath);
+			failed += !Check("SaveEntries：大写键名也能命中（返回 true）", ok);
+			const std::string after = ReadAll();
+			failed += !Check("SaveEntries：大写键名命中后，原行被替换成传入的写法",
+				after.find("HOOK_FILE=1") != std::string::npos);
+			failed += !Check("SaveEntries：小写旧行 hook_file=0 已消失",
+				after.find("hook_file=0") == std::string::npos);
+		}
+
+		// ---- 还原，免得影响后面的用例 ----
+		WriteOriginal();
+
+		// ★★★ 环境自检：确认这一节**从头到尾没碰本机真实配置**。
+		//
+		//   加这条的理由很直接 —— 2026-10-24 第一版测试就是走的
+		//   `SaveEntries(entries, dir)`，它内部解析到
+		//   `%ProgramData%\R3 Shield Core\r3shieldcore.ini`（开发机上真实存在），
+		//   于是"测试临时目录"里的断言全 FAIL，而**开发机的真配置被改坏**
+		//   （`HOOK_FILE=1` 覆盖了 `hook_file=1`，末尾多出 `brand_new_key=42`）。
+		//   两个后果都很难发现：FAIL 看着像实现有 bug，污染则完全静默。
+		//
+		//   ⇒ 钉文件入口（SaveEntriesToFile）是根本修法；这条自检是**哨兵**：
+		//     以后谁把调用改回 `SaveEntries`，这里立刻红。
+		{
+			const bool prodIniTouched =
+				std::filesystem::exists("C:\\ProgramData\\R3 Shield Core\\r3shieldcore.ini")
+				&& [&]()
+				{
+					std::ifstream in("C:\\ProgramData\\R3 Shield Core\\r3shieldcore.ini",
+						std::ios::binary);
+					if (!in) { return false; }
+					const std::string body((std::istreambuf_iterator<char>(in)),
+						std::istreambuf_iterator<char>());
+					// 只要本机那份里出现这两个测试专用标记，就说明被写进去了。
+					return body.find("brand_new_key=42") != std::string::npos
+						|| body.find("D:\\new\\only.exe") != std::string::npos;
+				}();
+			failed += !Check("环境自检：本机 %ProgramData% 的 ini 没有被测试写脏",
+				!prodIniTouched);
+		}
 	}
 
 	std::filesystem::remove_all(dir, ec);

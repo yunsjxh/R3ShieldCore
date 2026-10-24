@@ -1,6 +1,8 @@
 #include "stdafx.h"
 #include "functions.h"
-#include "engine_control.h"
+// ★ v89：`engine_control.h`（同进程 LoadLibrary）已被 `engine_client.h` 取代。
+//   引擎现在是独立进程，界面这一侧只跟**加密管道**打交道。
+#include "engine_client.h"
 #include "r3shieldcore_config.h"
 #include "r3shieldcore_gui.h"
 #include "r3shieldcore_log_replay.h"
@@ -28,6 +30,69 @@
 
 namespace
 {
+	// ★★★ v100：**机器级引擎熔断**（自动化脚本不得运行引擎的强制执行点）
+	//
+	// 背景（2026-10-23 事故，必须记住）：
+	//   项目早就有铁律"自动化脚本不得运行引擎"—— 因为引擎会**全局注入**（白名单之外
+	//   的一切，含 `cl.exe` 这类构建工具），并且在 `mode=ask` /
+	//   `neutralize_overlay>=2` 下会**弹出置顶且抢前台焦点的询问窗**
+	//   （`WS_EX_TOPMOST` + `SetForegroundWindow`，见 `r3shieldcore_sentinel.cpp`）。
+	//
+	//   ★ 注意：**白名单 `never_inject=` 挡不住这件事**。它只决定"往哪个进程
+	//     注入 DLL"，而弹窗是**引擎进程自己创建的窗口**，与注入无关。
+	//     所以"编辑器已经在白名单里" ≠ "误跑引擎不会影响编辑器"。
+	//
+	//   但那条铁律只写在文档里，**代码里没有任何强制**。于是只要有人
+	//   （包括自动化探针）双击一次界面，界面就按默认行为拉起引擎，
+	//   于是：编辑器无法输入（焦点被弹窗反复抢走）、`cl.exe` 每次操作
+	//   等 30 秒询问超时 ⇒ 构建挂 19 分钟停不下来，最后只能重启机器。
+	//
+	//   ⇒ 把"不许跑"从**约定**变成**机制**：
+	//     标记文件存在 ⇒ 界面**不连也不拉起**引擎，引擎自己也拒绝启动。
+	//
+	// 为什么用标记文件而不是编译宏：
+	//   · 编译宏只保护"用某个开关编出来的那份"，而事故恰恰是随手用了
+	//     `BuildCheck` 那份（免提权、专为探针编的）；
+	//   · 标记文件是**机器级**的：不管谁编的、从哪个目录启动、双击还是探针，
+	//     在这台机器上一律起不来。换机器不受影响。
+	//
+	// 关掉它（仅限确实要在这台机器上做注入验证时）：
+	//   删掉 %ProgramData%\R3 Shield Core\NO_ENGINE 这一个文件即可。
+	//   也可以在单次运行里用环境变量临时放行（见 EngineAllowedByEnv）。
+	bool IsEngineKilledByMachineFlag(std::wstring* reasonOut) noexcept
+	{
+		// ① 环境变量：给"我明确知道自己在做什么"的一次性放行留口子。
+		wchar_t allow[8] = {};
+		if (GetEnvironmentVariableW(L"R3SHIELDCORE_ALLOW_ENGINE", allow,
+			_countof(allow)) > 0 && allow[0] == L'1') {
+			return false;
+		}
+
+		// ② 标记文件：%ProgramData%\R3 Shield Core\NO_ENGINE
+		wchar_t programData[MAX_PATH * 2] = {};
+		const DWORD n = GetEnvironmentVariableW(L"ProgramData", programData,
+			_countof(programData));
+		if (n == 0 || n >= _countof(programData)) {
+			return false;   // 拿不到 ProgramData 就不拦（别把正常启动搞挂）
+		}
+
+		std::wstring flag = programData;
+		if (!flag.empty() && flag.back() != L'\\') {
+			flag += L'\\';
+		}
+		flag += L"R3 Shield Core\\NO_ENGINE";
+
+		const DWORD attr = GetFileAttributesW(flag.c_str());
+		if (attr == INVALID_FILE_ATTRIBUTES || (attr & FILE_ATTRIBUTE_DIRECTORY)) {
+			return false;
+		}
+
+		if (reasonOut) {
+			*reasonOut = flag;
+		}
+		return true;
+	}
+
 	// exe 所在目录（直接调 Win32，不走会抛异常的 wil 包装）。
 	std::wstring ModuleDirectory() noexcept
 	{
@@ -80,6 +145,22 @@ namespace
 		//    LNK2019，却**悄悄弄丢了引擎横幅**（printf 从此写不出去），
 		//    直到加上 `[diag]` 这一行才暴露。
 		auto rebind = [](const std::wstring& path, FILE* stream) {
+			// ★★★ v100 教训（**别再试 `_wfsopen` + `_dup2`**）：
+			//
+			//   我一度把它换成 `_wfsopen(..., _SH_DENYNO)` + `_dup2(_fileno(fresh),
+			//   _fileno(stream))`，想让界面日志"运行期也能被读"。结果**日志整个
+			//   写不出来**：GUI 子系统下 `_fileno(stdout) == -2`（没有 fd），
+			//   `_dup2` 的目标 fd 是 -2 ⇒ 必然失败 ⇒ 打印
+			//   `[diag] redirect pid=... stdout=1 stderr=-1 fallback=1`。
+			//
+			//   根因：`printf` 写的是 `stdout` 这个 **FILE\***，它内部记着自己的 fd。
+			//   `_dup2` 只改**进程 fd 表**，不改那个 FILE* 的 fd 字段 ⇒ 流依旧无效。
+			//   能把流**重新绑定**到新文件的只有 `freopen` 家族 —— 而它不接受
+			//   共享模式参数。
+			//
+			//   ⇒ 结论：界面侧**只能用 `_wfreopen_s`**。想要"运行期可读"，
+			//     正确做法是别碰 stdout：引擎侧已经用 `_wfsopen(_SH_DENYNO)` +
+			//     自己的 `g_logFile` 写日志（不经过 stdout），那份是可读的。
 			FILE* reopened = nullptr;
 			if (_wfreopen_s(&reopened, path.c_str(), L"a", stream) != 0) {
 				return 1;
@@ -210,6 +291,85 @@ namespace
 		}
 	}
 
+	// ★★★ v103：把「引擎真值」铺进界面的 `Options`。
+	//
+	// 抽成函数是为了让**两处**共用同一份口径（铁律 127）：
+	//   · 启动时喂一次（`R3ShieldCoreGui::Start` 之前）；
+	//   · 「配置」页应用完、引擎重启之后再喂一次（`RefreshOptionsFromPolicy`）。
+	// 抄两份的话迟早漂移，而漂移的后果是"拨了开关、重启完又弹回去"，
+	// 用户会当成"开关还是点不动"。
+	void FillGuiOptions(R3ShieldCoreGui::Options& guiOptions,
+		const R3ShieldCore::Policy& policy,
+		const R3ShieldCoreConfig::EngineSettings& engineSettings)
+	{
+		guiOptions.Mode = static_cast<R3ShieldCore::Mode>(policy.Mode);
+		guiOptions.HookReads = (policy.Flags & R3ShieldCore::FlagHookReads) != 0;
+		guiOptions.HookHive = (policy.Flags & R3ShieldCore::FlagHookHive) != 0;
+		guiOptions.HookSetInfo = (policy.Flags & R3ShieldCore::FlagHookSetInfo) != 0;
+		guiOptions.HookFile = (policy.Flags & R3ShieldCore::FlagHookFile) != 0;
+		guiOptions.HookProcess = (policy.Flags & R3ShieldCore::FlagHookProcess) != 0;
+		guiOptions.HookThread = (policy.Flags & R3ShieldCore::FlagHookThread) != 0;
+		guiOptions.HookSelfThread = (policy.Flags & R3ShieldCore::FlagHookSelfThread) != 0;
+		guiOptions.HookDriver = (policy.Flags & R3ShieldCore::FlagHookDriver) != 0;
+		guiOptions.HighRisk = (policy.Flags & R3ShieldCore::FlagHighRiskGuard) != 0;
+		guiOptions.LogPath = policy.LogPath;
+		guiOptions.ExcludePathCount = policy.ExcludePathCount;
+		guiOptions.NeverInjectPathCount = policy.NeverInjectCount;   // ★ v51
+		guiOptions.PromptTimeoutMs = policy.PromptTimeoutMs;
+		// ★ v61：高危进程提示级别 —— 界面用它决定底部栏要不要多画一行。
+		guiOptions.HighRiskProcessAlert = engineSettings.HighRiskProcessAlert;
+		// ★ v62：ARK 页开关与间隔 —— 配置页改它要写 ini 并重启（v103 已可直接改）。
+		guiOptions.ArkEnabled = engineSettings.ArkEnabled;
+		guiOptions.ArkScanMs = engineSettings.ArkScanMs;
+		// ★ v63：界面刷新间隔（与扫描间隔是两件事，见 r3shieldcore_config.h）。
+		guiOptions.ArkRefreshMs = engineSettings.ArkRefreshMs;
+		// ★ v78：「高级」页显示规则的三个总闸 —— 取自**引擎真正读到的那份
+		//   Policy**（不是界面自己再解析一遍 ini）。默认全关。
+		guiOptions.SpoofReg = (policy.Flags2 & R3ShieldCore::FlagSpoofRegistry) != 0;
+		guiOptions.SpoofClipboard = (policy.Flags2 & R3ShieldCore::FlagSpoofClipboard) != 0;
+		guiOptions.SpoofRegEnum = (policy.Flags2 & R3ShieldCore::FlagSpoofRegistryEnum) != 0;
+	}
+
+	// ★★★ v103：配置应用完（引擎已重启）之后，让界面**重新读一遍真值**。
+	//
+	// ★ 为什么在 app.cpp 重读 ini 而不是问引擎要 Policy：
+	//   引擎连上之后共享内存里的 Policy 才是权威，但读它要走
+	//   `R3ShieldCoreEngine` 的会话 —— 这里只是"界面显示"，
+	//   重读 ini 得到的值与引擎从同一份文件读到的**必然一致**
+	//   （引擎重启时就是读的这一份）。少一次 IPC 往返，也不会因为
+	//   引擎刚起来还没填好 Policy 而读到全零。
+	//
+	// `arkOverride`：`ark_enabled` 是**界面侧**设置（不属于 Policy），
+	// 刚写完 ini 时 `LoadEngineSettings` 也会读到新值，所以一般不必传；
+	// 传它是为了显式钉住"这次用户改的就是它"。
+	void RefreshOptionsFromPolicy(const std::filesystem::path& exeDirectory,
+		const bool* arkOverride)
+	{
+		R3ShieldCore::Policy policy = {};
+		// ★ 用 `LoadFromFile` 钉住**具体文件**，不用 `Load()`
+		//   （铁律 290：`Load()` 优先 ProgramData，闸门/调试时会假绿假红）。
+		R3ShieldCoreConfig::LoadFromFile(policy,
+			R3ShieldCoreConfig::ResolveConfigPath(exeDirectory), exeDirectory);
+
+		R3ShieldCoreConfig::EngineSettings settings =
+			R3ShieldCoreConfig::LoadEngineSettings(exeDirectory);
+		if (arkOverride != nullptr) {
+			settings.ArkEnabled = *arkOverride;
+		}
+
+		R3ShieldCoreGui::Options updated = {};
+		FillGuiOptions(updated, policy, settings);
+		// ★ `LogPath` 是 `const WCHAR*` 指向 `policy.LogPath` 内部缓冲 ——
+		//   而 `policy` 是**栈上局部量**。交给 GUI 之前必须指到一块活着的内存。
+		//   ⇒ 用 GUI 自己的存储：`SetOptions` 会把 `LogPath` 拷进静态缓冲。
+		R3ShieldCoreGui::SetOptions(updated);
+
+		printf("[config] 界面选项已刷新（hook_file=%d hook_reads=%d ark=%d）\n",
+			updated.HookFile ? 1 : 0, updated.HookReads ? 1 : 0,
+			updated.ArkEnabled ? 1 : 0);
+		fflush(stdout);
+	}
+
 	// 界面点了「切换模式」按钮之后真正落地。
 	//
 	// 三件事，顺序无所谓但一件都不能少：
@@ -220,11 +380,58 @@ namespace
 	// ★ v69 注意：切换**不会**动 `test_inject_only=`（`SaveMode` 只改 `mode=`
 	//   一行）。这是**安全的**：注入白名单与 `mode=` 解耦（只要名单非空就生效），
 	//   所以"测试模式里点了切换 ⇒ 重启后退化成全局注入"这件事**不会发生**。
-	void ApplyMode(EngineControl& engineControl, R3ShieldCore::Mode mode,
+	// ★ v89：模式切换现在是一次**加密 IPC 请求**（引擎去改共享内存里的 Mode）。
+	//   签名里多一个 `dllSupports` 出参：拆进程之后，"引擎连不上"和
+	//   "DLL 不支持运行期切换"必须能分开报（铁律 97）——
+	//   前者是部署问题，后者是版本问题，用户的下一步动作完全不同。
+	void ApplyMode(R3ShieldCoreEngine::Client& engineClient, R3ShieldCore::Mode mode,
 		const std::filesystem::path& exeDirectory)
 	{
-		if (!engineControl.SetMode(mode)) {
-			printf("模式切换失败：DLL 不支持运行期切换（版本不匹配？），或共享通道未建立\n");
+		// ★ v100 诊断：主循环确实消费到了切换请求。
+		printf("[mode] ApplyMode 开始 mode=%lu 连接=%d\n",
+			static_cast<unsigned long>(mode), engineClient.Connected() ? 1 : 0);
+		fflush(stdout);
+
+		bool engineReplied = false;
+		const bool ok = engineClient.SetMode(mode, &engineReplied);
+		// ★ 用 WideCharToMultiByte 转窄串，不用 `%ls` ——
+		//   窄 printf 的 `%ls` 依赖 locale，中文日志会整行静默截断（铁律 252）。
+		{
+			const std::wstring& werr = engineClient.LastError();
+			char errBuf[512] = {};
+			if (!werr.empty()) {
+				WideCharToMultiByte(CP_ACP, 0, werr.c_str(), -1, errBuf,
+					sizeof(errBuf) - 1, nullptr, nullptr);
+			}
+			printf("[mode] SetMode 返回 ok=%d engineReplied=%d 错误=%s\n", ok ? 1 : 0,
+				engineReplied ? 1 : 0, errBuf);
+			fflush(stdout);
+		}
+		if (!ok) {
+			// ★ v91：失败原因**必须同时进窗口**，不能只 `printf`。
+			//   界面是 WINDOWS 子系统（没有控制台），printf 全进日志文件；
+			//   而日志在运行期是独占打开的 ⇒ 用户永远看不到这行字，
+			//   现象就是"点了切换完全没反应、徽章不变"（2026-10-23 实测）。
+			std::wstring notice;
+			if (engineReplied) {
+				notice = L"模式切换失败：DLL 不支持运行期切换（版本不匹配？）";
+			}
+			else if (!engineClient.Connected()) {
+				notice = L"模式切换失败：引擎未连接（" + engineClient.LastError() + L"）";
+			}
+			else {
+				notice = L"模式切换失败：引擎没有应答（" + engineClient.LastError() + L"）";
+			}
+			// ★ 不用 `printf("%ls")` —— 窄 printf 的 `%ls` 依赖 locale，
+			//   中文会整行静默截断（铁律 252）。手动转窄串。
+			{
+				char narrow[512] = {};
+				WideCharToMultiByte(CP_ACP, 0, notice.c_str(), -1, narrow,
+					sizeof(narrow) - 1, nullptr, nullptr);
+				printf("%s\n", narrow);
+				fflush(stdout);
+			}
+			R3ShieldCoreGui::ShowNotice(notice, 10000);
 			return;
 		}
 
@@ -257,23 +464,91 @@ namespace
 	}
 
 	// ----------------------------------------------------------------------
-	// ★ v61：高危进程判据的跨函数桥。
+	// ★ v89：高危进程判据的跨函数桥（改走 IPC）。
 	//
 	// `R3ShieldCoreProcWatch::Start` 要的是一个普通函数指针（CheckFn），而判据
-	// 实现在 `EngineControl::CheckHighRiskProcess`（成员函数）里。引擎进程里
-	// 只有一份 EngineControl、且它在主循环开始前构造、循环结束后才析构，
-	// 所以用一个文件静态指针 + 自由函数 thunk 把它接过去是安全的（成员函数
-	// 指针不能直接转成普通函数指针）。
+	// 现在在**引擎进程**里（`GlobalHookSessionCheckHighRiskProcess` 导出）。
+	// 这里用一个文件静态指针 + 自由函数 thunk 把它接过去。
 	//
-	// 判据本身跑在 DLL 里、只读静态表 + 参数、无可变状态 ⇒ 可被主循环线程
-	// 与注入线程安全地并发调用。
-	EngineControl* g_engineControlForProcWatch = nullptr;
+	// ★ 和拆进程之前的区别：这条路现在是**同步 IPC 请求**（一次往返，
+	//   本机管道通常 < 0.2ms），而 procwatch 默认 1000ms 才扫一轮、
+	//   每轮最多几十个候选进程 —— 开销可以忽略。
+	//   ⚠️ 但它**不是零成本**：引擎没连上时每次调用会立刻返回 nullptr
+	//      （而不是等超时），所以断线状态下扫描不会卡。
+	R3ShieldCoreEngine::Client* g_engineClientForProcWatch = nullptr;
 
 	const char* ProcWatchCheckThunk(const wchar_t* imagePath, const wchar_t* systemRoot)
 	{
-		return g_engineControlForProcWatch
-			? g_engineControlForProcWatch->CheckHighRiskProcess(imagePath, systemRoot)
-			: nullptr;
+		if (!g_engineClientForProcWatch || !imagePath) {
+			return nullptr;
+		}
+
+		// ★★ v101：引擎没答 ⇒ **熔断 5 秒**，别把剩下几百个进程挨个再问一遍。
+		//
+		//   为什么必须熔断：这是**每个进程一次**的调用。引擎一旦不答，
+		//   "一次超时 × 全机进程数"就是几十秒到十几分钟。2026-10-24 现场
+		//   就是这么把主循环整场冻住的（当时这条链路还在主线程上），
+		//   用户看到的是「切换模式 / 退出引擎 点了完全没反应」。
+		//   扫描现在已搬到专用线程（procwatch.cpp 的 `ScanThreadProc`），
+		//   熔断是为了别让那个线程白烧几百个超时 —— 也让退出时的 join 立刻返回。
+		static thread_local ULONGLONG s_suspendUntilMs = 0;
+		const ULONGLONG nowMs = GetTickCount64();
+		if (nowMs < s_suspendUntilMs) {
+			return nullptr;   // 熔断窗口内：直接判"不是高危"，**不发**请求
+		}
+
+		// ★ 返回的指针必须**活到下次调用**：procwatch 会把它当 C 字符串用。
+		//   所以存进一个 thread_local 缓冲，而不是返回临时 std::wstring 的 data()。
+		static thread_local std::string s_reason;
+		std::wstring reason;
+		bool reachable = false;
+		const bool hit = g_engineClientForProcWatch->CheckHighRiskProcess(imagePath,
+			systemRoot ? systemRoot : L"", reason, &reachable);
+		if (!reachable) {
+			// 引擎没答（断开 / 超时）⇒ 熔断 5 秒后重试。
+			// 注意这里**不能**返回"命中"：宁可这一小段时间不判，也不能
+			// 让一次断线变成几百次连续超时。
+			s_suspendUntilMs = nowMs + 5000;
+			return nullptr;
+		}
+		if (!hit) {
+			return nullptr;
+		}
+		// 引擎回的是宽串；这里转成 UTF-8 存在线程局部缓冲里。
+		s_reason.clear();
+		if (!reason.empty()) {
+			const int need = WideCharToMultiByte(CP_UTF8, 0, reason.c_str(), -1,
+				nullptr, 0, nullptr, nullptr);
+			if (need > 1) {
+				s_reason.resize(static_cast<size_t>(need - 1));
+				WideCharToMultiByte(CP_UTF8, 0, reason.c_str(), -1, s_reason.data(), need,
+					nullptr, nullptr);
+			}
+		}
+		return s_reason.c_str();
+	}
+
+	// ★ v89：ARK「内部退出」的 IPC 桥。
+	//
+	//   界面进程不再加载引擎 DLL ⇒ `ArkActions::Perform(InternalExit)` 在
+	//   本地必然报 `ExportMissing`。这里把它转给引擎进程，由引擎用
+	//   自己的 DLL 基址执行（语义与拆进程前一致）。
+	bool ArkSelfExitThunk(DWORD pid, void* context, R3ShieldCoreArk::SelfExitResult* out)
+	{
+		auto* client = static_cast<R3ShieldCoreEngine::Client*>(context);
+		if (!client || !out) {
+			return false;
+		}
+		R3ShieldCoreEngine::Client::SelfExitResult r = {};
+		if (!client->SelfExit(pid, r)) {
+			return false;
+		}
+		out->Code = r.code;
+		out->Win32Error = r.win32Error;
+		out->ElapsedMs = r.elapsedMs;
+		out->DllPresent = r.dllPresent;
+		out->DllSameBuild = r.dllSameBuild;
+		return true;
 	}
 
 	// ----------------------------------------------------------------------
@@ -648,8 +923,15 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
 				  "VFW/设备源/音频仍直接拒绝；压缩子类型如 MJPG 仍拒绝）"
 				: "关（本应拒绝的摄像头数据流直接失败）");
 		}
-		printf("挂输入钩子  : %s\n", (policy.Flags & R3ShieldCore::FlagHookInputHook)
-			? "是（SetWindowsHookEx + 原始输入；低级/全局钩子即高危）" : "否");
+		// ★ v100 措辞更正：这里开的是**监控**，不是引擎自己装钩子。
+		//   实际实现在 `R3ShieldCoreLib/input_hook_guard.cpp`：hook 的是
+		//   **别人对 `SetWindowsHookEx` / `RegisterRawInputDevices` 的调用**，
+		//   用来发现"有进程在装键盘/鼠标钩子或注册后台原始输入"。
+		//   旧文案写"挂输入钩子"，会让人以为引擎自己挂钩子 ——
+		//   2026-10-23 排查时我自己就被它误导过，以为是钩子吞了键盘输入。
+		printf("监控输入钩子: %s\n", (policy.Flags & R3ShieldCore::FlagHookInputHook)
+			? "是（hook 别人对 SetWindowsHookEx/RawInput 的调用；**引擎自己不装钩子**）"
+			: "否");
 		printf("挂截屏      : %s\n", (policy.Flags & R3ShieldCore::FlagHookScreen)
 			? "是（BitBlt/StretchBlt/GetDIBits 源为屏幕 DC + PrintWindow）" : "否");
 		// ★ v67：截屏替换状态。只在 hook_screen 开着时才有意义
@@ -774,32 +1056,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
 		// 先打开界面。UIAccess 接管实例先完成窗口创建和自身置顶，
 		// 父实例随后退出旧引擎；因此接管实例在此之前不能创建第二套 EngineControl。
 		R3ShieldCoreGui::Options guiOptions = {};
-		guiOptions.Mode = static_cast<R3ShieldCore::Mode>(policy.Mode);
-		guiOptions.HookReads = (policy.Flags & R3ShieldCore::FlagHookReads) != 0;
-		guiOptions.HookHive = (policy.Flags & R3ShieldCore::FlagHookHive) != 0;
-		guiOptions.HookSetInfo = (policy.Flags & R3ShieldCore::FlagHookSetInfo) != 0;
-		guiOptions.HookFile = (policy.Flags & R3ShieldCore::FlagHookFile) != 0;
-		guiOptions.HookProcess = (policy.Flags & R3ShieldCore::FlagHookProcess) != 0;
-		guiOptions.HookThread = (policy.Flags & R3ShieldCore::FlagHookThread) != 0;
-		guiOptions.HookSelfThread = (policy.Flags & R3ShieldCore::FlagHookSelfThread) != 0;
-		guiOptions.HookDriver = (policy.Flags & R3ShieldCore::FlagHookDriver) != 0;
-		guiOptions.HighRisk = (policy.Flags & R3ShieldCore::FlagHighRiskGuard) != 0;
-		guiOptions.LogPath = policy.LogPath;
-		guiOptions.ExcludePathCount = policy.ExcludePathCount;
-		guiOptions.NeverInjectPathCount = policy.NeverInjectCount;   // ★ v51
-		guiOptions.PromptTimeoutMs = policy.PromptTimeoutMs;
-		// ★ v61：高危进程提示级别 —— 界面用它决定底部栏要不要多画一行。
-		guiOptions.HighRiskProcessAlert = engineSettings.HighRiskProcessAlert;
-		// ★ v62：ARK 页开关与间隔 —— 配置页只做展示，改它要改 ini 并重启。
-		guiOptions.ArkEnabled = engineSettings.ArkEnabled;
-		guiOptions.ArkScanMs = engineSettings.ArkScanMs;
-		// ★ v63：界面刷新间隔（与扫描间隔是两件事，见 r3shieldcore_config.h）。
-		guiOptions.ArkRefreshMs = engineSettings.ArkRefreshMs;
-		// ★ v78：「高级」页显示规则的三个总闸 —— 取自**引擎真正读到的那份
-		//   Policy**（不是界面自己再解析一遍 ini）。默认全关。
-		guiOptions.SpoofReg = (policy.Flags2 & R3ShieldCore::FlagSpoofRegistry) != 0;
-		guiOptions.SpoofClipboard = (policy.Flags2 & R3ShieldCore::FlagSpoofClipboard) != 0;
-		guiOptions.SpoofRegEnum = (policy.Flags2 & R3ShieldCore::FlagSpoofRegistryEnum) != 0;
+		FillGuiOptions(guiOptions, policy, engineSettings);
 
 		if (R3ShieldCoreGui::Start(guiOptions)) {
 			printf("界面窗口    : 已打开（关掉窗口不退出引擎，会继续在后台记录）\n");
@@ -850,13 +1107,48 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
 			}
 		}
 
-		printf("加载引擎... ");
-		EngineControl engineControl(policy);
-		printf("完成\n");
-
-		// 统计聚合挂在事件通道上，必须在开始注入之前就位，
-		// 否则第一批事件会漏统计。
-		engineControl.SetEventObserver(&OnEventForStats, nullptr);
+		// -----------------------------------------------------------------
+		// ★★★ v89：连引擎（独立进程 + 加密管道）
+		// -----------------------------------------------------------------
+		//
+		// 拆进程之前这里是 `EngineControl engineControl(policy);` —— 同进程
+		// LoadLibrary 引擎 DLL。现在改成"连一个已经在跑（或现在拉起）的进程"。
+		//
+		// ⚠️ 连不上**不拦启动**：界面本身还有价值（看历史日志、改配置、排查），
+		//    拦掉只会让用户"什么都看不到"。但必须**明说**（铁律 97）——
+		//    底部状态栏会显示"引擎未连接"，日志里也有原因。
+		printf("连接引擎... ");
+		R3ShieldCoreEngine::Client engineClient;
+		//
+		// ★★★ v100：先过**机器级熔断**。命中就**既不连也不拉起**引擎。
+		//
+		//   这一条是为了让"自动化脚本不得运行引擎"从文档约定变成硬机制：
+		//   引擎会全局注入（含 cl.exe），ask/覆盖层反制下还会弹**置顶抢焦点**
+		//   的询问窗 ⇒ 编辑器无法输入 + 构建每次等 30 秒超时
+		//   （2026-10-23 实测：无法输入 + 构建挂 19 分钟）。
+		//   ★ 白名单 `never_inject=` 挡不住弹窗，别指望它。
+		//   标记文件见 `IsEngineKilledByMachineFlag` 的注释。
+		std::wstring engineKillFlag;
+		const bool engineKilled = IsEngineKilledByMachineFlag(&engineKillFlag);
+		bool engineConnected = false;
+		if (engineKilled) {
+			printf("已跳过（本机引擎熔断：%ls 存在）\n", engineKillFlag.c_str());
+			printf("            界面照常可用（看日志/改配置/排查），但**不会拉起引擎、不做任何注入**。\n");
+			printf("            确需在本机验证注入：删掉上面那个文件，或设 R3SHIELDCORE_ALLOW_ENGINE=1。\n");
+		}
+		else {
+			engineConnected = engineClient.Start(exeDirectory, &OnEventForStats, nullptr);
+			if (engineConnected) {
+				printf("完成（pid=%lu，加密通道 AES-256-GCM）\n",
+					static_cast<unsigned long>(engineClient.EnginePid()));
+			}
+			else {
+				printf("失败 —— %ls\n", engineClient.LastError().c_str());
+				printf("            界面继续运行，但**没有防护**；请检查 %s 是否在包里。\n",
+					"r3shieldcore-engine.exe");
+			}
+		}
+		fflush(stdout);   // 铁律 80：诊断 printf 必须紧跟 fflush
 
 		//
 		// ==================================================================
@@ -908,7 +1200,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
 		// ★ v81：配置工具接口（管道服务端）
 		// ==================================================================
 		//
-		// 为什么放在这里（EngineControl 已建好、历史已回放完，主循环之前）：
+		// 为什么放在这里（引擎已连上、历史已回放完，主循环之前）：
 		//   · CONFIG 回答的是**引擎真正读到的那份 Policy / EngineSettings**
 		//     —— 两者在上面都已就位；
 		//   · LOG 读的是 `R3ShieldCoreStats` 的环形缓冲 —— 放在回放之后，
@@ -942,8 +1234,8 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
 		}
 
 		// RAII 收尾：异常 / 提前返回也要把服务线程停掉。
-		// ⚠️ 必须**早于** `EngineControl` 析构 —— 服务线程持有
-		//    `Options.Policy` 指针，那个对象就在 `EngineControl` 的同一个
+		// ⚠️ 必须**早于**引擎连接断开 —— 服务线程持有
+		//    `Options.Policy` 指针，那个对象就在本函数的同一个
 		//    作用域里（声明顺序保证本 guard 先析构，见下面的 InjectionThreadGuard）。
 		struct CfgIpcGuard
 		{
@@ -969,150 +1261,127 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
 				engineSettings.NeutralizeOverlayLevel >= 2 ? "每级弹窗询问" : "不问直接执行");
 		}
 
-		// ★ v61：高危进程提示（引擎侧主动行为，不依赖注入覆盖）。
-		// 放在 sentinel 之后、主循环之前，同理：只在引擎进程里跑一份。
-		// 支持/不支持用 SupportsHighRiskProcessCheck() 显式区分（铁律 97）：
-		// 旧 DLL ⇒ 传 nullptr ⇒ procwatch 自己打「未启用：DLL 没有这个导出」；
-		// 新 DLL ⇒ 传 thunk ⇒ 正常扫描。
-		g_engineControlForProcWatch = &engineControl;
+		// ★ v61：高危进程提示（界面侧主动行为）。
+		//
+		// ★ v89：判据改走 IPC —— 它现在在引擎进程里（DLL 导出）。
+		//   `g_engineClientForProcWatch` 在 `engineClient` 还活着的时候有效，
+		//   收尾时先置空再让 client 析构（见下面的 Stop）。
+		g_engineClientForProcWatch = engineConnected ? &engineClient : nullptr;
 		const R3ShieldCoreProcWatch::CheckFn procWatchCheck =
-			engineControl.SupportsHighRiskProcessCheck() ? &ProcWatchCheckThunk : nullptr;
+			engineConnected ? &ProcWatchCheckThunk : nullptr;
 		R3ShieldCoreProcWatch::Start(engineSettings.HighRiskProcessAlert,
 			engineSettings.HighRiskProcessScanMs, procWatchCheck);
 
 		// ★ v62：ARK（全机进程列表 + 四种处置）。
 		//
-		// 放在 procwatch 之后、主循环之前：它同样只在引擎进程里跑一份。
-		//
-		// 它需要三样东西，都由 `EngineControl` 提供：
-		//   · `LocalEngineDllBase()` —— "内部退出"算导出偏移的参照原点；
-		//   · `SupportsSelfExit()`   —— DLL 有没有那个导出（旧 DLL 就没有，
-		//     必须能报成"功能不可用"而不是"执行失败"，铁律 97）；
-		//   · 本进程 pid —— 拒绝"动自己"。
-		//
-		// ⚠️ 顺序：必须在 `EngineControl` 构造（= 已经 LoadLibrary 了 DLL）
-		//    之后。放前面拿到的 `LocalEngineDllBase()` 会是 0，
-		//    而 0 会被 `PerformInternalExit` 判成 ExportMissing ——
-		//    症状是"内部退出永远不可用"，但看上去像 DLL 版本问题。
+		// ★★ v89 的关键变化：「内部退出」不再由界面执行。
+		//   那个动作要用"本地引擎 DLL 基址"算导出偏移，而界面进程**已经不再
+		//   LoadLibrary 那份 DLL 了**（分进程的必然结果）⇒ `LocalDllBase` 恒为 0，
+		//   内部退出会永远报 `ExportMissing`（看上去像"包太旧"，极具误导性）。
+		//   ⇒ 现在它走 `SelfExitViaIpc` 回调，由引擎进程用**它自己的**基址执行。
+		//   挂起/恢复/强杀仍然是界面进程本地做（它们不需要 DLL）。
 		{
 			R3ShieldCoreArk::Config arkConfig = {};
 			arkConfig.Level = engineSettings.ArkEnabled ? 1 : 0;
 			arkConfig.ScanIntervalMs = engineSettings.ArkScanMs;
 			arkConfig.SelfPid = GetCurrentProcessId();
-			arkConfig.LocalDllBase = engineControl.LocalEngineDllBase();
-			arkConfig.SelfExitSupported = engineControl.SupportsSelfExit();
+			// 0 = 本进程没有引擎 DLL（v89 起恒为 0）；内部退出必须走 IPC。
+			arkConfig.LocalDllBase = 0;
+			// 同包部署 ⇒ 引擎必然带那个导出；真没有的话 IPC 会回 ExportMissing，
+			// 界面照样能给出准确提示（比"猜"可靠）。
+			arkConfig.SelfExitSupported = engineConnected;
+			if (engineConnected) {
+				arkConfig.SelfExitViaIpc = &ArkSelfExitThunk;
+				arkConfig.SelfExitContext = &engineClient;
+			}
 			R3ShieldCoreArk::Start(arkConfig);
 		}
 
 		ULONG lastReportedDropped = 0;
-		ULONG drainElapsedMs = 0;
-
-		//
-		// ==================================================================
-		// ★★★ v41：新进程注入搬到**专用线程**，间隔收到毫秒级
-		// ==================================================================
-		//
-		// 为什么（**真实绕过**）：样本 `Windows XP Horror` 在 `FormCreate` 里
-		// （进程启动后几十~几百 ms）就 `CreateFileA("\\.\PhysicalDrive0")` +
-		// `WriteFile` 把 MBR 写掉。而原来注入挂在主循环上、**1000ms 才扫一轮**
-		// ⇒ 写入整个落在盲区里 ⇒ `mode=block` 没拦住。
-		//
-		// 为什么不能靠"同步注入"那条路：同步路要在**父进程**里 hook
-		// `CreateProcessInternalW`，而双击的父进程是 `explorer.exe`
-		// （提权后是 `svchost.exe`），两者都在 `ShouldSkipProcessInjection`
-		// 的 `kNeverInject[]` 里（注入 shell / 服务宿主会破坏系统）
-		// ⇒ 这条路对"用户手动运行的程序"**用不上**，只剩轮询路。
-		//
-		// 所以只能把轮询做快。空转时一轮只是一次 `NtGetNextProcess` 系统调用
-		// （立刻返回 `STATUS_NO_MORE_ENTRIES`），10ms 间隔的 CPU 开销可忽略。
-		//
-		// ⚠️ 首轮**立刻**跑（循环体在 Sleep 之前）：把"引擎启动前就在运行"的
-		//    进程一次注完，不用等一个间隔。
-		//
-		std::atomic<bool> stopInjection{ false };
-		// ★ v54：起点取持久化基值 —— 让"已注入进程"这个数字跨重启连续。
-		// （基值由前面的 EnablePersistence 从 r3shieldcore-stats.json 载入；
-		//   未启用持久化时是 0，行为与旧版一致。）
-		std::atomic<ULONG> injectedTotal{ R3ShieldCoreStats::GetInjectedBase() };
-		const ULONG injectionIntervalMs = engineSettings.InjectionIntervalMs;
-
-		// RAII 收尾：先置停止位、再 join。
-		// ⚠️ 必须**早于** `EngineControl` 析构 —— 析构会反注入并销毁会话，
-		//    线程若还在跑就会去调用一个正在拆的会话。
-		struct InjectionThreadGuard
-		{
-			std::thread thread;
-			std::atomic<bool>* stopFlag = nullptr;
-			~InjectionThreadGuard() noexcept
-			{
-				if (stopFlag) {
-					stopFlag->store(true, std::memory_order_relaxed);
-				}
-				if (thread.joinable()) {
-					thread.join();
-				}
-			}
-		};
-		InjectionThreadGuard injectionGuard;
-		injectionGuard.stopFlag = &stopInjection;
-		injectionGuard.thread = std::thread([&engineControl, &stopInjection, &injectedTotal, injectionIntervalMs] {
-			// 稍微提一点优先级：这场竞争的对象是"样本启动后到它写 MBR 之间"，
-			// 让扫描线程比普通线程更容易抢到 CPU（不至于饿死别的线程）。
-			SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
-
-			//
-			// ★★★ 让 `Sleep(5)` 真的是 5ms，而不是 15.6ms。
-			//
-			// Windows 的默认时钟粒度是 **15.6ms** —— 不提高分辨率的话，
-			// `Sleep(任意小于 15.6 的值)` 都会睡到**下一个时钟中断**，
-			// 也就是实际 ~15.6ms。那样 `inject_interval_ms` 调到 10 以下
-			// **完全没有意义**（旋钮是假的）。
-			//
-			// `NtSetTimerResolution(10000, TRUE, ...)`（10000 × 100ns = 1ms）
-			// 把粒度降到 1ms。⚠️ 这是**全系统**设置，会提高时钟中断频率
-			// （功耗/笔记本续航的代价）—— 所以只在间隔 < 16ms 时才动它：
-			// ≥16ms 时默认粒度已经够用，没必要白白增加中断。
-			//
-			if (injectionIntervalMs < 16) {
-				using NtSetTimerResolution_t = LONG(NTAPI*)(ULONG, BOOLEAN, PULONG);
-				if (HMODULE hNtdll = GetModuleHandleW(L"ntdll.dll")) {
-					if (auto setResolution = reinterpret_cast<NtSetTimerResolution_t>(
-						GetProcAddress(hNtdll, "NtSetTimerResolution"))) {
-						ULONG current = 0;
-						setResolution(10000, TRUE, &current);
-					}
-				}
-			}
-
-			while (!stopInjection.load(std::memory_order_relaxed)) {
-				int injected = 0;
-				try {
-					injected = engineControl.HandleNewProcesses();
-				}
-				catch (...) {
-					injected = 0;   // 注入失败不该把扫描线程带走
-				}
-				if (injected > 0) {
-					injectedTotal.fetch_add(static_cast<ULONG>(injected), std::memory_order_relaxed);
-				}
-				Sleep(injectionIntervalMs);
-			}
-		});
-
 		ULONG lastReportedInjected = 0;
 		ULONG saveTickCount = 0;   // ★ v54：统计落盘节流（100ms 切片计数）
 
+		//
+		// ==================================================================
+		// ★★★ v89：注入扫描已经搬去**引擎进程**
+		// ==================================================================
+		//
+		// 拆进程之前这里有一个 10ms 间隔的专用线程调 `HandleNewProcesses()`
+		// （理由见 HANDOVER：样本启动后几十~几百 ms 就写 MBR，1000ms 轮询是盲区）。
+		// 现在那个线程在 `r3shieldcore-engine.exe` 里，**节奏与优先级一模一样**
+		// （它自己 SetThreadPriority + NtSetTimerResolution，见 engine_main.cpp）。
+		//
+		// 界面这边只做一件事：每 100ms 从引擎推来的统计快照里读 `injectedTotal`。
+		// ⇒ 这个数字**跨界面重启连续**（引擎不停，计数不停），比原来更准。
+		//
+		ULONG injectedTotal = R3ShieldCoreStats::GetInjectedBase();
+
+		// ★ v89：退出时要不要**真的把引擎停掉**。
+		//   ★★★ v102 修正：只有「用户点退出引擎」和「自动化退出」置 true；
+		//   **UIAccess 接管必须置 false**（引擎是独立进程，界面重启跟它无关，
+		//   停了会让新界面连不上、还撞引擎互斥体 —— 详见下方收尾处的说明）。
+		//   而"关窗口收托盘"根本不走这里 —— 界面进程继续活着，引擎更不用说。
+		bool stopEngineOnExit = false;
+
 		while (true) {
-			// 主循环按 100ms 切片跑：模式切换按钮要立刻有反馈，
-			// 事件排空与模式处理高频运行；注入扫描保持 1 秒一次。
+			// 主循环按 100ms 切片跑：模式切换按钮要立刻有反馈。
 			Sleep(100);
+
+			// ★★★ v101：心跳搬到**循环最前面**（以前写在 TakeQuitRequest 之后）。
+			//
+			//   为什么必须搬：2026-10-24 那次主循环整场都没跑起来，而用户早就
+			//   点过退出 —— 主循环一醒就 `break` 了，于是 `[loop]` **一行都没打出来**，
+			//   结果"主循环卡死了"和"主循环起来了但第一轮就退出"在日志里
+			//   长得一模一样（铁律 97 的翻版）。
+			//   放在这里：只要循环进过一次，日志里就一定有这一行。
+			{
+				static ULONGLONG lastBeat = 0;
+				const ULONGLONG now = GetTickCount64();
+				if (lastBeat == 0 || (now - lastBeat) >= 60000) {
+					lastBeat = now;
+					printf("[loop] 主循环存活（运行 %llu 秒）\n", now / 1000);
+					fflush(stdout);
+				}
+			}
+
+			// ★★★ v102：UIAccess 接管**不停引擎** —— 这是 v89 拆进程的遗留错误。
+			//
+			//   2026-10-24 真机：用户点「超级置顶」⇒ 界面按 KSword 配方重启成
+			//   UIAccess 实例 ⇒ 新实例显示**「引擎未连接」**，而且旧引擎退出后
+			//   **一个引擎都不剩**（防护断档）。日志证据链（全部来自 dist 日志）：
+			//     · 旧实例 `UIAccess handoff complete child=14104; requesting engine shutdown`
+			//     · 旧实例 `引擎收尾: 已请求退出，引擎仍在收尾（反注入要恢复被挂起的进程）`
+			//       ⇒ 引擎 3 秒内没退掉，**仍占着单实例互斥体**
+			//     · 新实例 `连接引擎... 失败 —— 引擎已拉起但管道一直没出现（pid=25332）`
+			//     · 新引擎 `已经有一个引擎在跑（互斥体 Local\R3ShieldCoreEngine.1 已存在），本实例退出`
+			//
+			//   为什么原来写 `true`：拆进程**之前**引擎是界面进程里 LoadLibrary
+			//   出来的，UIAccess 重启 = 换进程 ⇒ 旧进程必须把引擎收掉、新进程重建。
+			//   v89 之后引擎是**独立进程**、界面只是客户端 ⇒ 那条前提不成立了：
+			//   旧界面关掉管道，引擎的管道服务端会立刻重新监听，新实例直接连上
+			//   **同一个引擎** —— 既没有防护断档，也不用等引擎反注入收尾。
+			//
+			//   ⇒ 改成 false（只断开连接，引擎继续防护），与「关窗口收托盘」同语义。
+			//   ⚠️ 判据：改完之后旧实例日志应出现「引擎收尾: 保持运行（pid=…），
+			//      界面只是断开连接」；新实例日志应出现「完成（pid=<同一个 pid>）」。
 			if (R3ShieldCoreGui::TakeUiAccessRestartRequest()) {
-				printf("UIAccess 新实例已接管，正在结束当前引擎会话。\n");
+				printf("UIAccess 新实例已接管，旧界面只断开连接"
+					"（引擎继续防护，由新实例接管同一个引擎）。\n");
+				fflush(stdout);
+				stopEngineOnExit = false;
 				break;
-			}			// 用户点了界面上的「退出引擎」。和 UIAccess 接管走同一条收尾路径：
-			// 跳出循环 → EngineControl 析构（反注入）→ R3ShieldCoreGui::Stop() → 进程退出。
+			}
+			// 用户点了界面上的「退出引擎」：跳出循环 → 通知引擎收尾（反注入）
+			// → R3ShieldCoreGui::Stop() → 进程退出。
+			//
+			// ★ v102：**注意它和上面的 UIAccess 接管已经不是同一条路了** ——
+			//   接管只断连接（引擎留着），这里才真的停引擎。两者都用 `break`
+			//   跳出同一个循环，但 `stopEngineOnExit` 的取值相反。
 			if (R3ShieldCoreGui::TakeQuitRequest()) {
+				printf("[quit] 主循环收到退出请求\n");
+				fflush(stdout);
 				printf("用户点击「退出引擎」，正在结束当前引擎会话。\n");
+				stopEngineOnExit = true;
 				break;
 			}
 
@@ -1122,6 +1391,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
 			if (ShouldAutoExit()) {
 				printf("R3SHIELDCORE_EXIT_AFTER_MS 到点，按「退出引擎」收尾"
 					"（会先恢复本引擎挂起过的进程）。\n");
+				stopEngineOnExit = true;
 				break;
 			}
 
@@ -1135,81 +1405,171 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
 		// （用户点了按钮就该尽快生效，不该等下一轮扫描）。
 		R3ShieldCoreArk::Tick();
 
-			drainElapsedMs += 100;
+			// ★ v91：把引擎连接状态喂给界面 —— 连不上时徽章显示「未连接」，
+			//   而不是继续显示一个"点了也切不动的模式"。
+			R3ShieldCoreGui::SetEngineConnected(engineClient.Connected());
+
+			// （v101：健康心跳已搬到循环最前面，见上面那段说明。）
 
 			R3ShieldCore::Mode requestedMode = R3ShieldCore::Mode::Log;
 			if (R3ShieldCoreGui::TakePendingMode(requestedMode)) {
-				ApplyMode(engineControl, requestedMode, exeDirectory);
+				printf("[loop] 进入 ApplyMode\n");
+				fflush(stdout);
+				ApplyMode(engineClient, requestedMode, exeDirectory);
+				printf("[loop] ApplyMode 返回\n");
+				fflush(stdout);
 			}
 
-			// ★ v81：处理配置工具发来的「保存后立即同步」（重读 ini + 热应用）。
+			// ★★★ v103：「配置」页的开关按下「应用并重启引擎」。
 			//
-			//   为什么必须在这里做、不能由服务线程直接做：
-			//     `SetMode` 会碰 DLL 侧共享内存、必要时还会建询问通道
-			//     （`R3ShieldCorePrompt::Create`）—— 那是主循环线程的活。
-			//     服务线程只把请求挂起来，等这里的结论（5s 超时回 ERR，不挂死）。
+			//   ★ 为什么必须在**主循环**做，不能界面自己去写：
+			//     · 写 ini 要 `ResolveConfigPath`（ProgramData 优先），
+			//       和 `SaveMode` 是同一套逻辑；
+			//     · 改完之后必须**重启引擎**才生效 —— 这些开关决定的是
+			//       注入 DLL 的 hook 面，落在共享内存的 `Policy` 块里，
+			//       引擎只在 LoadLibrary 那一刻读它。
+			//     · 重启引擎会反注入 + 恢复挂起进程，耗时以秒计 ——
+			//       放在 UI 线程就是整屏卡死（v101 的教训）。
+			{
+				std::vector<std::wstring> configLines;
+				bool arkPresent = false;
+				bool arkEnabled = false;
+				if (R3ShieldCoreGui::TakeConfigApplyRequest(configLines,
+					arkPresent, arkEnabled)) {
+					printf("[config] 收到配置应用请求：%zu 条 ini 改动 ark=%d/%d\n",
+						configLines.size(), arkPresent ? 1 : 0, arkEnabled ? 1 : 0);
+					fflush(stdout);
+
+					// wstring 的 ini 行是 ASCII 键名（`hook_file=1`），
+					// 直接窄化即可 —— 不做 locale 转换，避免 CP_ACP 把
+					// 不认识的字符变成 `?` 写进文件。
+					std::vector<std::string> entries;
+					entries.reserve(configLines.size());
+					for (const std::wstring& line : configLines) {
+						std::string narrow;
+						narrow.reserve(line.size());
+						for (const wchar_t c : line) {
+							narrow.push_back(static_cast<char>(c & 0x7F));
+						}
+						entries.push_back(narrow);
+					}
+
+					const bool saved = entries.empty()
+						? true
+						: R3ShieldCoreConfig::SaveEntries(entries, exeDirectory);
+					if (!saved) {
+						printf("[config] 写 ini 失败 —— **不重启引擎**（改了也没生效）\n");
+						fflush(stdout);
+						R3ShieldCoreGui::ShowNotice(
+							L"配置写入失败（ini 打不开或没权限），引擎未重启", 10000);
+					}
+					else {
+						printf("[config] ini 已写回，开始重启引擎\n");
+						fflush(stdout);
+						R3ShieldCoreGui::ShowNotice(
+							L"配置已写入，正在重启引擎以生效…", 8000);
+
+						// ★ 复用和「用户点退出引擎」**同一条**收尾路径之外的
+						//   最轻做法：先 Stop(true) 停掉，再由客户端重新 Start。
+						//   不 `break` 出主循环 —— 界面要留着（用户还得看结果）。
+						if (engineConnected) {
+							engineClient.Stop(true);
+							printf("[config] 旧引擎已停：%ls\n",
+								engineClient.StopReport().c_str());
+							fflush(stdout);
+						}
+						engineConnected = engineClient.Start(exeDirectory,
+							&OnEventForStats, nullptr);
+						R3ShieldCoreGui::SetEngineConnected(engineConnected);
+						if (engineConnected) {
+							printf("[config] 引擎已重启（pid=%lu）\n",
+								static_cast<unsigned long>(engineClient.EnginePid()));
+							fflush(stdout);
+							R3ShieldCoreGui::ShowNotice(
+								L"配置已生效，引擎已重启", 8000);
+						}
+						else {
+							printf("[config] 引擎重启失败：%ls\n",
+								engineClient.LastError().c_str());
+							fflush(stdout);
+							R3ShieldCoreGui::ShowNotice(
+								L"引擎重启失败：" + engineClient.LastError(), 15000);
+						}
+
+						// ★ 让界面**重新读一遍真值**：`g_pendingConfig` 的
+						//   `dirty` 由 `SetOptions` 清 —— 那是唯一正确时机
+						//   （新值已经到位的这一刻），早了会让开关先弹回旧值。
+						RefreshOptionsFromPolicy(
+							exeDirectory, arkPresent ? &arkEnabled : nullptr);
+					}
+				}
+			}
+
+			// ★ v81 → v89：处理配置工具发来的「保存后立即同步」（重读 ini + 热应用）。
+			//
+			//   拆进程之前这里直接拿 `EngineControl` 去 `SetMode`。现在引擎在
+			//   另一个进程里 ⇒ 同步请求变成一次**加密 IPC 往返**，由引擎去改
+			//   共享内存里的 Mode。语义不变，只是多了一跳。
 			//
 			//   没有请求时它只是一次原子读，开销可忽略。
-			R3ShieldCoreCfgIpcServer::PollSync(engineControl);
+			R3ShieldCoreCfgIpcServer::PollSync(engineClient);
 
-			// 高频排空，避免全开模式下后台进程的正常噪音在 1 秒内
-			// 把环形缓冲区套圈。
-			if (drainElapsedMs >= 100) {
-				drainElapsedMs = 0;
-				int drained = engineControl.DrainEvents();
-				if (drained > 0) {
-					printf("记录注册表行为: %d 条\n", drained);
-				}
+			// ★★★ v89：引擎推来的统计快照。
+			//
+			//   引擎每 200ms 推一次（`engine_main.cpp` 的 pusher 线程），界面这里
+			//   读的是**本地缓存**，不阻塞、不发请求。断线时缓存保持不变
+			//   （数字停住，而不是归零 —— 归零会被误读成"事件清零了"）。
+			const R3ShieldCoreEngineIpc::StatsPayload es = engineClient.LatestStats();
+
+			injectedTotal = es.injectedTotal;
+			if (injectedTotal > lastReportedInjected) {
+				printf("注入新进程: %lu 个\n",
+					static_cast<unsigned long>(injectedTotal - lastReportedInjected));
+				lastReportedInjected = injectedTotal;
 			}
 
-			// 注入计数由**专用线程**累加（v41），这里只按增量打印一次日志。
+			if (es.droppedEvents > 0) {
+				R3ShieldCoreStats::SetDroppedCount(es.droppedEvents);
+			}
+			if (es.droppedEvents > lastReportedDropped) {
+				printf("警告: 事件缓冲区已满，累计丢弃 %lu 条（可调大 R3ShieldCore::EventCapacity）\n",
+					static_cast<unsigned long>(es.droppedEvents));
+				lastReportedDropped = es.droppedEvents;
+			}
+
+			// 询问统计（弹窗发生在被注入的进程里，计数写在共享内存 Policy 块，
+			// 由引擎读出来推给我们）。
 			{
-				const ULONG total = injectedTotal.load(std::memory_order_relaxed);
-				if (total > lastReportedInjected) {
-					printf("注入新进程: %lu 个\n",
-						static_cast<unsigned long>(total - lastReportedInjected));
-					lastReportedInjected = total;
-				}
+				R3ShieldCoreStats::PromptStat promptStat = {};
+				promptStat.Shown = es.promptShown;
+				promptStat.Allowed = es.promptAllowed;
+				promptStat.Denied = es.promptDenied;
+				promptStat.TimedOut = es.promptTimedOut;
+				promptStat.HighRiskAsked = es.highRiskAsked;
+				promptStat.HighRiskBlocked = es.highRiskBlocked;
+				R3ShieldCoreStats::SetPromptStat(promptStat);
 			}
 
-			ULONG dropped = engineControl.DroppedEventCount();
-			if (dropped > 0) {
-				R3ShieldCoreStats::SetDroppedCount(dropped);
+			// ★ v61：把高危进程扫描统计从 procwatch 读回来推给界面（GUI 底部栏）。
+			// procwatch 的 Stats 用定长 WCHAR[]，stats 用 wstring —— 直接赋值即可。
+			{
+				const R3ShieldCoreProcWatch::Stats pw = R3ShieldCoreProcWatch::GetStats();
+				R3ShieldCoreStats::ProcWatchStat stat = {};
+				stat.Scans = pw.Scans;
+				stat.LastScanProcesses = pw.LastScanProcesses;
+				stat.HighRiskFound = pw.HighRiskFound;
+				stat.Alerts = pw.Alerts;
+				stat.DedupEntries = pw.DedupEntries;
+				stat.DedupCapacity = pw.DedupCapacity;
+				stat.LatestPid = pw.LatestPid;
+				stat.LatestName = pw.LatestName;
+				stat.LatestPath = pw.LatestPath;
+				stat.LatestReason = pw.LatestReason;
+				R3ShieldCoreStats::SetProcWatchStat(stat);
 			}
 
-			if (dropped > lastReportedDropped) {
-				printf("警告: 事件缓冲区已满，累计丢弃 %u 条（可调大 R3ShieldCore::EventCapacity）\n", dropped);
-				lastReportedDropped = dropped;
-			}
-
-			// 把询问统计从 DLL 读回来推给界面。
-			R3ShieldCoreStats::PromptStat promptStat = {};
-			engineControl.ReadPromptStats(promptStat.Shown, promptStat.Allowed,
-				promptStat.Denied, promptStat.TimedOut);
-			engineControl.ReadHighRiskStats(promptStat.HighRiskAsked,
-				promptStat.HighRiskBlocked);
-		R3ShieldCoreStats::SetPromptStat(promptStat);
-
-		// ★ v61：把高危进程扫描统计从 procwatch 读回来推给界面（GUI 底部栏）。
-		// procwatch 的 Stats 用定长 WCHAR[]，stats 用 wstring —— 直接赋值即可。
-		{
-			const R3ShieldCoreProcWatch::Stats pw = R3ShieldCoreProcWatch::GetStats();
-			R3ShieldCoreStats::ProcWatchStat stat = {};
-			stat.Scans = pw.Scans;
-			stat.LastScanProcesses = pw.LastScanProcesses;
-			stat.HighRiskFound = pw.HighRiskFound;
-			stat.Alerts = pw.Alerts;
-			stat.DedupEntries = pw.DedupEntries;
-			stat.DedupCapacity = pw.DedupCapacity;
-			stat.LatestPid = pw.LatestPid;
-			stat.LatestName = pw.LatestName;
-			stat.LatestPath = pw.LatestPath;
-			stat.LatestReason = pw.LatestReason;
-			R3ShieldCoreStats::SetProcWatchStat(stat);
-		}
-
-		// 把累计注入数喂给界面。
-		R3ShieldCoreGui::Update(injectedTotal.load(std::memory_order_relaxed));
+			// 把累计注入数喂给界面。
+			R3ShieldCoreGui::Update(injectedTotal);
 
 			//
 			// ★ v54：统计落盘兜底。
@@ -1224,26 +1584,86 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
 			++saveTickCount;
 			if (engineSettings.PersistStats && saveTickCount >= 300) {
 				saveTickCount = 0;
-				R3ShieldCoreStats::SetInjectedBase(injectedTotal.load(std::memory_order_relaxed));
+				R3ShieldCoreStats::SetInjectedBase(injectedTotal);
 				R3ShieldCoreStats::SaveNow();
 			}
 		}
 
 		// ★ v61：高危进程提示的收尾（打一行总结，重置去重表）。
-		// 放在注入线程 join 之前不依赖任何顺序 —— 它只读写自己的静态状态。
+		//
+		// ★★★ v101：**顺序在这里变成了硬约束**。
+		//   v101 起扫描跑在 procwatch 自己的线程上，而它每一步都要通过
+		//   `g_engineClientForProcWatch` 问引擎（加密 IPC）。所以：
+		//     · `Stop()` 必须**真的把那个线程 join 掉**（它内部等 8 秒）；
+		//     · 之后才能把 `g_engineClientForProcWatch` 置空、再让
+		//       `engineClient` 析构 —— 否则扫描线程会拿着野指针发请求。
+		//   下面这两行的先后顺序**不能调换**。
 		R3ShieldCoreProcWatch::Stop();
-		g_engineControlForProcWatch = nullptr;
+		g_engineClientForProcWatch = nullptr;
 
-		// ★ v62：ARK 的收尾。**必须在 GUI 停掉之后、EngineControl 析构之前**：
+		// ★ v62：ARK 的收尾。**必须在 GUI 停掉之后、引擎连接断开之前**：
 		//   · 它会调用 `ArkActions::Perform` 去**恢复**本引擎挂起过的进程
 		//     （见 r3shieldcore_ark.cpp 的 Stop）—— 这些动作不依赖会话；
 		//   · 但界面还在跑的时候停它没有意义（界面会显示一个空列表）。
 		R3ShieldCoreArk::Stop();
 
 		//
+		// ★★★ v89：断开引擎连接（最后一步"业务"收尾）。
+		//
+		//   ★ `stopEngineOnExit` 的语义是**"这次界面退出，要不要连引擎一起带走"**：
+		//       true  ⇒ 发 StopEngine，引擎反注入 + 销毁会话后自己退出；
+		//       false ⇒ 只断开管道，引擎**继续防护**。
+		//
+		//   它的取值只有 3 个来源（全在 `main()` 里）：
+		//     ① 默认 false（声明处的初值）；
+		//     ② **UIAccess 新实例接管**（`TakeUiAccessRestartRequest()` 分支）
+		//        ⇒ 必须 false，见下面的 v102 说明；
+		//     ③ 用户点了界面上的「退出引擎」（`TakeQuitRequest()` 分支）
+		//        ⇒ 必须 true，这是唯一该真停引擎的地方。
+		//
+		//   为什么 false 是一个有意义的分支（而不是"顺手写的"）：
+		//     分进程的全部意义就在这里 —— 界面只是一个显示器。
+		//     用户关窗口（收托盘）走的是另一条路，根本不进这个函数；
+		//     真正走到这里且 stopEngineOnExit=false 的，是上面 ① 和 ②。
+		//     此时引擎留着是对的：重新打开界面会直接连上它，防护中间没有断档。
+		//
+		//   ★★★ v102：② 曾经被写成 true，这就是「开启置顶之后显示引擎未连接」
+		//     的根因。v89 拆进程**之前**引擎活在界面进程里，界面为了变成
+		//     UIAccess 必须重启自己 ⇒ 只能把引擎一起停掉再重建；拆进程
+		//     **之后**引擎是独立进程、有自己的 pid 和互斥体，界面重启跟它
+		//     一点关系都没有。写成 true 的后果（实测日志）：
+		//       · 旧实例发 StopEngine，引擎要恢复被挂起的进程，3 秒内退不掉；
+		//       · 新实例这时启动，`ConnectOnly` 连不上（管道已关）；
+		//       · `LaunchEngine` 拉新引擎 ⇒ 撞上 `Local\R3ShieldCoreEngine.1`
+		//         互斥体 ⇒ 新引擎打印"已经有一个引擎在跑"后自己退出；
+		//       · 新界面报"引擎已拉起但管道一直没出现" ⇒ 界面显示**未连接**；
+		//       · 旧引擎最终退完 ⇒ 一个引擎都不剩，防护**断档**。
+		//     ⇒ 改成 false 之后，新旧实例接管的是**同一个**引擎进程，
+		//       防护零断档，界面也不会再报未连接。
+		//
+		//   顺序：必须**在 ARK 恢复挂起进程之后**（那步是本地动作，不依赖引擎），
+		//   也必须**在配置工具接口停止之前**（它可能还有一次 SYNC 在途）。
+		//
+		if (engineConnected) {
+			if (stopEngineOnExit) {
+				// ★ v90：先 Stop（它会真的等引擎退出并把结论写进 StopReport），
+				//   再按**实际结果**打印 —— 不再无条件说"已请求退出"。
+				engineClient.Stop(true);
+				printf("引擎收尾    : %ls\n", engineClient.StopReport().c_str());
+			}
+			else {
+				printf("引擎收尾    : 保持运行（pid=%lu），界面只是断开连接\n",
+					static_cast<unsigned long>(engineClient.EnginePid()));
+				fflush(stdout);
+				engineClient.Stop(false);
+			}
+			fflush(stdout);
+		}
+
+		//
 		// ★ v81：配置工具接口的收尾。
 		//
-		// 位置：在 GUI / ARK 停掉之后、`EngineControl` 析构之前。
+		// 位置：在 GUI / ARK 停掉之后、引擎连接断开之前。
 		//   · 服务线程持有 `Options.Policy` 指针（就是本作用域的 `policy`），
 		//     所以必须早于它析构 —— `CfgIpcGuard` 也会兜一次（Stop 可重复调）。
 		//   · 这里先停：正在等 SYNC 结论的配置工具会立刻拿到 ERR，
@@ -1277,11 +1697,11 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
 		// 所以即便用户只点了下「超级置顶」，这一轮的统计也不会丢。
 		//
 		if (engineSettings.PersistStats) {
-			R3ShieldCoreStats::SetInjectedBase(injectedTotal.load(std::memory_order_relaxed));
+			R3ShieldCoreStats::SetInjectedBase(injectedTotal);
 			R3ShieldCoreStats::SaveNow();
 			printf("统计已保存    : 累计事件 %llu 条，注入进程 %lu 个\n",
 				static_cast<unsigned long long>(R3ShieldCoreStats::GetSnapshot().TotalEvents),
-				static_cast<unsigned long>(injectedTotal.load(std::memory_order_relaxed)));
+				static_cast<unsigned long>(injectedTotal));
 		}
 	}
 	catch (const std::exception& e) {

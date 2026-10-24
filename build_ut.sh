@@ -177,6 +177,37 @@ run_ark_order_ut() {
 
 run_ark_order_ut
 
+# ★★★ v101：「扫描不得阻塞主线程」。
+#
+#    2026-10-24 真机：用户报「还是不行，退不出去怎么办?」。日志取证 ——
+#    界面能画能点，但 `[loop] 主循环存活` **整场 0 行**：主循环卡在
+#    `ProcWatch::Start` 里同步跑了一整轮全机扫描，而 `ScanOnce` 对
+#    **每一个进程**问一次引擎（加密 IPC）⇒ 主循环几十秒起不来 ⇒
+#    用户点的「切换模式 / 退出引擎」只置了标志、没人消费。
+#
+#    本套件用**假判据**（每次睡 120ms）复现那种延迟，钉住四条性质：
+#      Start 立刻返回 / Tick 是空实现 / 单轮预算生效 / Stop 能及时 join。
+#    为什么不用真引擎：本机**禁止运行引擎**（全局注入会 hook 编辑器），
+#    而这条性质与"引擎答什么"无关 —— 只要判据是慢的，性质就该成立。
+#
+#    procwatch.cpp 经 stdafx.h 只拉 windows.h + wil 头文件（都是 header-only），
+#    所以只链 kernel32，不需要 MinHook/R3ShieldCoreStats 那一整套。
+run_procwatch_ut() {
+    echo ""
+    echo "=== procwatch_nonblock_ut [$ARCH] ==="
+
+    "$CL" $CFLAGS $INCS -Fo"$OBJDIR_REL/r3shieldcore_procwatch.obj" \
+        "R3ShieldCore/R3ShieldCore/r3shieldcore_procwatch.cpp" || { FAILED=1; return; }
+    "$CL" $CFLAGS $INCS -Fo"$OBJDIR_REL/procwatch_nonblock_ut.obj" \
+        "tools/procwatch_nonblock_ut.cpp" || { FAILED=1; return; }
+    "$LINK" -nologo -SUBSYSTEM:CONSOLE -OUT:"tools/procwatch_nonblock_ut.exe" \
+        "$OBJDIR_REL/procwatch_nonblock_ut.obj" "$OBJDIR_REL/r3shieldcore_procwatch.obj" \
+        kernel32.lib || { FAILED=1; return; }
+    "./tools/procwatch_nonblock_ut.exe" || FAILED=1
+}
+
+run_procwatch_ut
+
 echo ""
 if [ "$FAILED" = "0" ]; then
     echo "=== 全部单元测试通过 ==="

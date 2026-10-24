@@ -149,9 +149,28 @@
 #define SVC_NAME        L"R3ShieldCoreGuard"
 #define SVC_DISPLAY     L"R3 ShieldCore 开机启动服务"
 
-/* 引擎文件名。★ 带空格 —— 服务内部引用时**每一处**都要加引号。
- *   闸门 tools/check_payload_manifest.py 会比对它和 payload 清单里的一致。 */
-#define ENGINE_EXE      L"R3 ShieldCore.exe"
+/* 要拉起的**引擎**文件名。
+ *
+ * ★★★ 2026-10-24 修：这里原来写的是 `L"R3 ShieldCore.exe"`（**主程序/界面**）。
+ *   那是 v89 **拆进程之前**的正确写法 —— 那时引擎还是界面进程里
+ *   `LoadLibrary` 出来的一段代码，没有独立 exe，服务只能拉界面。
+ *   v89 之后引擎是独立进程 `r3shieldcore-engine.exe`，界面只是它的**客户端**
+ *   ⇒ 服务再去拉界面就错了三件事：
+ *     ① 开机后起的是界面（有窗口、占内存），而**防护本体根本没起**；
+ *     ② 界面被用户关掉（或缩到托盘后误杀）⇒ 没人再拉引擎 ⇒ 防护断档；
+ *     ③ `EngineRunningInSession()` 拿这个名字判"引擎是否已在跑"，
+ *        实际判的是"界面在不在跑" ⇒ 界面开着但引擎死了，服务**永远不补拉**。
+ *   ⇒ 改成引擎名。这也让"服务 → 引擎"与"用户双击界面 → 界面连引擎"
+ *     两条路互不干扰（引擎有单实例互斥体，重复拉起会自己退出）。
+ *
+ * ★ 名字**不带空格**（`r3shieldcore-engine.exe`）—— 与主程序
+ *   `R3 ShieldCore.exe` 不同。下面 `cmd` 拼装处仍然整条加引号，
+ *   那是防御性写法（将来改名不用回来改引号），不是因为它现在需要。
+ *
+ * ★ 闸门 `tools/check_payload_manifest.py` 比对的是**安装器**
+ *   (`installer/r3sc_setup.c`) 里的同名宏 —— 那个指的是"要安装的主程序"，
+ *   与本文件这个"要拉起的进程"是**两个不同的东西**，不要一起改。 */
+#define ENGINE_EXE      L"r3shieldcore-engine.exe"
 
 #define LOG_NAME        L"r3shieldcore-svc.log"
 
@@ -186,7 +205,23 @@
  *      本进程（SYSTEM）令牌 + 改会话号。每一步都记日志。
  *   版本号要动 —— 行为变了，光看文件名分不出新旧（铁律 61：体积相同
  *   证明不了内容相同）。 */
-#define VERSION_STR     L"1.2.0"
+/* ★ 1.3.0（2026-10-24）：把拉起的对象从**主程序**改成**引擎**。
+ *
+ *   原来 `ENGINE_EXE` 写的是 `R3 ShieldCore.exe` —— 那是 v89 拆进程**之前**
+ *   的正确写法（引擎当时是界面进程里 LoadLibrary 出来的一段代码）。
+ *   v89 之后引擎独立成 `r3shieldcore-engine.exe`，界面只是客户端，
+ *   于是服务拉界面变成"开机起了个窗口、防护本体没起"。
+ *
+ *   本版本改动只有这一处名字，但影响面是三条：
+ *     ① 开机后真正起来的是防护本体，而不是一个需要人点的窗口；
+ *     ② `EngineRunningInSession()` 从"判界面在不在"变成"判引擎在不在"，
+ *        "界面开着但引擎死了 ⇒ 服务永远不补拉"这个洞随之消失；
+ *     ③ 用户双击界面不再和服务抢"谁先起引擎" —— 引擎有单实例互斥体，
+ *        重复拉起自己退出，服务下一轮判据会看到它已经在跑。
+ *
+ *   ⚠️ 升级安装时**必须**重新注册服务（`installer/install.bat` 会做），
+ *      否则 SCM 里跑的还是旧二进制，看文件名/版本都分不出来。 */
+#define VERSION_STR     L"1.3.0"
 
 /* ------------------------------------------------------------------ */
 /* 日志（UTF-8 + BOM，独立文件，不碰引擎的 console log）                */
@@ -907,8 +942,14 @@ static BOOL LaunchInSession(DWORD session, BOOL useCurrentToken)
         *slash = L'\0';
     }
 
-    /* ★ 引擎名带空格 —— 命令行必须**整条加引号**，否则 CreateProcess 会把
-     *   路径拆成两截（铁律 115）。 */
+    /* 命令行**整条加引号**。
+     *
+     * ★ 引擎名现在不带空格（`r3shieldcore-engine.exe`），严格说加不加引号都行；
+     *   但仍然加 —— 理由是"引号是防御性的，不是条件性的"：哪天有人把引擎
+     *   改回带空格的名字（或者给路径里塞了空格），这里不用回来改第二遍。
+     *   反过来的写法（"名字不带空格所以不加引号"）会在改名那一刻**静默**裂开：
+     *   CreateProcess 把路径拆成两截，err=2「找不到文件」，而日志里看不出
+     *   是引号问题（铁律 115 的形态）。 */
     wchar_t cmd[MAX_PATH + 8];
     if (swprintf_s(cmd, _countof(cmd), L"\"%s\"", engine) < 0) {
         if (env != NULL) {

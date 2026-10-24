@@ -71,6 +71,13 @@ namespace R3ShieldCoreProcWatch
 		ULONG DedupCapacity = 0;      // 去重表容量
 		bool  SnapshotFailed = false; // 最近一轮 CreateToolhelp32Snapshot 是否失败
 
+		// ★ v101：最近一轮因「单轮时间预算」或「正在退出」提前收尾。
+		//   为什么需要这个字段：单轮要对每个进程问一次引擎（加密 IPC），
+		//   引擎没响应时每问一次就是一个超时。没有预算的话一轮能拖几十秒，
+		//   而退出时要 join 扫描线程 —— 那正是"退不出去"的来源。
+		//   置位说明「这轮没扫完」，不是「没发现」。
+		bool  LastScanBudgetHit = false;
+
 		// 最近一条告警的明细，供界面底部栏显示。
 		ULONG LatestPid = 0;
 		WCHAR LatestName[64] = {};
@@ -91,7 +98,9 @@ namespace R3ShieldCoreProcWatch
 
 	bool IsEnabled() noexcept;
 
-	// 引擎主循环定期调用（内部按 scanIntervalMs 节流）。
+	// ★ v101：**空实现**。扫描与心跳都在专用线程里跑（`ScanThreadProc`），
+	//   主循环再也不会被"每个进程一次 IPC"拖住。保留函数只为不动调用点；
+	//   调用它是安全的、无副作用的。
 	void Tick() noexcept;
 
 	Stats GetStats() noexcept;

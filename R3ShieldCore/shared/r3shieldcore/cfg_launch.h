@@ -106,8 +106,18 @@ struct LaunchOptions {
 
 	// quiet = 主程序启动时"顺手拉起"，不是用户主动点的：
 	//   · 已经在跑 ⇒ **什么都不做**（连切页都不做，更不抢焦点）；
-	//   · 没在跑   ⇒ 最小化启动（SW_SHOWMINNOACTIVE），并带上 `--quiet`。
-	// 用户主动点「高级」时保持 false：要真的把窗口叫到前台并切到指定页。
+	//   · 没在跑   ⇒ **完全不显示窗口**（SW_HIDE），并带上 `--quiet`。
+	//
+	// ★ v90 改动（用户要求原话）：「cfg 被主程序拉起时**不打开窗口**，
+	//   但是如果是用户双击、或者主程序点「高级」按钮时都要打开窗口」。
+	//   以前 quiet 用的是 `SW_SHOWMINNOACTIVE` —— 窗口会以**最小化**出现在
+	//   任务栏里，用户看到多出来一个条目，观感像"自己弹了个东西"。
+	//   现在改成 `SW_HIDE`：进程在跑、窗口不存在于屏幕上，任务栏也没有条目。
+	//
+	//   点「高级」时怎么又出来：`LaunchOrActivate` 的②分支只负责"已经在跑"，
+	//   它发 `ActivateMessageId()` 给 cfg；cfg 收到后自己
+	//   `ShowWindow(SW_SHOW)` + `SetForegroundWindow`（tools/r3shieldcore_cfg.cpp
+	//   的激活分支）。所以"隐藏"与"能被叫出来"是两条独立的路径，互不影响。
 	bool quiet = false;
 };
 
@@ -182,7 +192,10 @@ inline bool LaunchOrActivate(const LaunchOptions& opts, std::wstring* errOut) {
 	STARTUPINFOW si = {};
 	si.cb = sizeof(si);
 	si.dwFlags = STARTF_USESHOWWINDOW;
-	si.wShowWindow = opts.quiet ? SW_SHOWMINNOACTIVE : SW_SHOWNORMAL;
+	// ★ v90：quiet ⇒ `SW_HIDE`（完全不显示），不是 `SW_SHOWMINNOACTIVE`。
+	//   cfg 侧第一次 `ShowWindow(g_main, SW_SHOWDEFAULT)` 会尊重这个值
+	//   （Windows 的"第一次 ShowWindow 用 STARTUPINFO"约定）。
+	si.wShowWindow = opts.quiet ? SW_HIDE : SW_SHOWNORMAL;
 	PROCESS_INFORMATION pi = {};
 	if (!::CreateProcessW(exe.c_str(), cmd.data(), nullptr, nullptr, FALSE,
 		0, nullptr, nullptr, &si, &pi)) {

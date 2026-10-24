@@ -46,6 +46,7 @@ cd "$PROJECT_ROOT" || exit 1
 #   **不能**叫 `64\R3ShieldCoreLib-x86.dll`（那是无效命名，代码零引用）。
 MAP=(
     "R3 ShieldCore.exe|$BUILD_ROOT/R3 ShieldCore.exe"
+    "r3shieldcore-engine.exe|$BUILD_ROOT/r3shieldcore-engine.exe"
     "r3shieldcore_svc.exe|$BUILD_ROOT/r3shieldcore_svc.exe"
     "64/r3shieldcore-lib.dll|$BUILD_ROOT/64/r3shieldcore-lib.dll"
     "32/r3shieldcore-lib.dll|$BUILD_ROOT/32/r3shieldcore-lib.dll"
@@ -1599,8 +1600,12 @@ fi
 #     ① 共享头在、且关键实现还在（材质只有一份，铁律 127）；
 #     ② 两个 exe 都含**宽串**代次标记（真编进去了 —— 中文窄字面量 `strings -el`
 #        查不到，v82 踩过，故标记必须是宽串）；
-#     ③ 两侧源码都还**调用**玻璃层入口（`g_glass.Begin(`）——
+#     ③ 两侧源码都还**调用**玻璃层入口 ——
 #        这是"重构时被顺手删掉"最可能发生的一处回归。
+#        ★★ v88：主程序改成了三段式（`BeginFrame()` + `Prepare()` + `Compose()`），
+#        不再有 `g_glass.Begin(`。判据必须跟着**搬家**，否则闸门会恒 FAIL
+#        （反过来"判据没跟着搬 ⇒ 恒 PASS"也是同一类病，见铁律 255）。
+#        所以主程序查三段式、cfg 仍查兼容入口 `g_glass.Begin(`。
 echo "=== v83 代次标记（液态玻璃材质）==="
 V83_HDR="$PROJECT_ROOT/R3ShieldCore/shared/r3shieldcore/ui_material.h"
 V83_MARKER="R3ShieldCoreGlass.v83"
@@ -1632,15 +1637,21 @@ else
 fi
 
 # ② 两侧源码都还接在玻璃层上（不是"头在、没人用"）
-for pair in "main|$V83_MAIN_SRC" "cfg|$V83_CFG_SRC"; do
-    who="${pair%%|*}"; src="${pair#*|}"
-    if [ -f "$src" ] && grep -qF "g_glass.Begin(" "$src" 2>/dev/null; then
-        echo "[ OK ] $who 源码仍调用玻璃层入口 g_glass.Begin("
-    else
-        echo "[FAIL] $who 源码里找不到 g_glass.Begin( —— 玻璃层被旁路了（界面会退回不透明）"
-        fail=1
-    fi
-done
+#
+# ★ v88：主程序走三段式（BeginFrame → 画内容 → Compose），cfg 走兼容入口 Begin()。
+#   两条路都必须**同时**命中才算接上 —— 只查一个的话，另一个被删掉也不会报。
+if [ -f "$V83_MAIN_SRC" ]    && grep -qF "g_glass.BeginFrame()" "$V83_MAIN_SRC" 2>/dev/null    && grep -qF "g_glass.Prepare(" "$V83_MAIN_SRC" 2>/dev/null    && grep -qF "g_glass.Compose()" "$V83_MAIN_SRC" 2>/dev/null; then
+    echo "[ OK ] main 源码走三段式（BeginFrame / Prepare / Compose）"
+else
+    echo "[FAIL] main 源码缺三段式之一 —— 玻璃层被旁路（界面会退回不透明）"
+    fail=1
+fi
+if [ -f "$V83_CFG_SRC" ] && grep -qF "g_glass.Begin(" "$V83_CFG_SRC" 2>/dev/null; then
+    echo "[ OK ] cfg 源码仍调用兼容入口 g_glass.Begin("
+else
+    echo "[FAIL] cfg 源码里找不到 g_glass.Begin( —— 玻璃层被旁路了"
+    fail=1
+fi
 
 # ③ 两个 exe 都含宽串代次标记（真编进去了）
 if [ -f "$V83_MAIN_EXE" ] && [ -f "$V83_CFG_EXE" ]; then
@@ -1730,9 +1741,376 @@ if [ -f "$V84_MAIN_EXE" ] && [ -f "$V84_CFG_EXE" ]; then
     done
 fi
 
+# ---------------------------------------------------------------------------
+# v85 代次标记（液态玻璃控件库：彩色玻璃 / 开关 / 分段 / 凹槽）
+# ---------------------------------------------------------------------------
+#
+# ★ 为什么需要这节：v85 的改动**全是视觉的**，一行行为都没变。
+#   ⇒ "跑一遍看看"永远看不出包里是哪一版（都是玻璃卡片），
+#     而这一类改动恰恰最容易半途而废：头文件加了、某处忘了接。
+#   四条判据，各自对应一个**不接就静默退化**的点：
+#     ① 控件库齐全（Card / Pill / Switch / SegmentTrough / Bar）
+#     ② 材质契约带 tint **颜色**（PanelRec::cr/cg/cb）——
+#        没有它，控件库只能画白玻璃，彩色主按钮/危险按钮/凹槽全部失效
+#     ③ 背景调色在（GradeBackdropImage 真的被调用）——
+#        没有它，彩色玻璃底下的背景还是"白纸"，一切照旧是白卡片
+#     ④ 两个 exe 真的**引用了**控件库（不是"头在、没人用"）
+echo "=== v85 代次标记（液态玻璃控件库）==="
+V85_CTL_HDR="$PROJECT_ROOT/R3ShieldCore/shared/r3shieldcore/ui_controls.h"
+V85_MAT_HDR="$PROJECT_ROOT/R3ShieldCore/shared/r3shieldcore/ui_material.h"
+V85_MAIN_SRC="$PROJECT_ROOT/R3ShieldCore/R3ShieldCore/r3shieldcore_gui.cpp"
+V85_CFG_SRC="$PROJECT_ROOT/tools/r3shieldcore_cfg.cpp"
+V85_MARK="R3ShieldCoreUiCtl.v85"
+V85_MAIN_EXE="$DIST_DIR/R3 ShieldCore.exe"
+V85_CFG_EXE="$DIST_DIR/r3shieldcore-cfg.exe"
+
+v85_ok=1
+if [ ! -f "$V85_CTL_HDR" ]; then
+    echo "[FAIL] 缺失: $V85_CTL_HDR（控件库的唯一一份实现）"
+    v85_ok=0
+else
+    for sym in "void Card(" "void Pill(" "void Switch(" "void SegmentTrough(" "void Bar(" "CardTone"; do
+        if grep -qF "$sym" "$V85_CTL_HDR" 2>/dev/null; then
+            echo "[ OK ] ui_controls.h 含 '$sym'"
+        else
+            echo "[FAIL] ui_controls.h 里没有 '$sym' —— 控件库被删改（界面会退回 v84 的白卡片）"
+            v85_ok=0
+        fi
+    done
+fi
+
+# ② tint 颜色进了材质契约
+if grep -qF "BYTE  cr = 255" "$V85_MAT_HDR" 2>/dev/null \
+   && grep -qF "static_cast<float>(cr)" "$V85_MAT_HDR" 2>/dev/null; then
+    echo "[ OK ] PanelRec 带 tint 颜色（cr/cg/cb），且合成时真的用上了"
+else
+    echo "[FAIL] PanelRec 的 tint 颜色缺失/没被使用 —— 彩色玻璃做不出来（只会是白的）"
+    v85_ok=0
+fi
+
+# ③ 背景调色
+if grep -qF "inline void GradeBackdropImage" "$V85_MAT_HDR" 2>/dev/null \
+   && grep -qF "GradeBackdropImage(fresh.full" "$V85_MAT_HDR" 2>/dev/null; then
+    echo "[ OK ] 背景调色在（GradeBackdropImage 被 EnsureBackdrop 调用）"
+else
+    echo "[FAIL] 背景调色缺失/没被调用 —— 背景会退回『往白里掺』，玻璃又会变回白卡片"
+    v85_ok=0
+fi
+
+# ④ 两侧真的用上了控件库
+# ★ v93：开关改成逐帧插值后，主程序调的是 switch 的**浮点版** `SwitchV(`，
+#   不再是布尔版 `Switch(`。判据跟着改 —— 否则这条会给一个**假红**，
+#   而它本来的意思是"界面有没有用控件库画"。
+for pair in "main|$V85_MAIN_SRC|UiCtl::SwitchV(" "main|$V85_MAIN_SRC|UiCtl::Card(" "cfg|$V85_CFG_SRC|UiCtl::Pill("; do
+    who="${pair%%|*}"; rest="${pair#*|}"; src="${rest%%|*}"; call="${rest#*|}"
+    if [ -f "$src" ] && grep -qF "$call" "$src" 2>/dev/null; then
+        echo "[ OK ] $who 源码仍使用控件库（$call）"
+    else
+        echo "[FAIL] $who 源码里找不到 $call —— 控件库被旁路（界面不会用到它）"
+        v85_ok=0
+    fi
+done
+[ "$v85_ok" -eq 1 ] || fail=1
+
+if [ -f "$V85_MAIN_EXE" ] && [ -f "$V85_CFG_EXE" ]; then
+    m1=0
+    m2=0
+    # ★ 用 -w：裸 grep -qF 会被 "..._TMP" 之类的子串满足（铁律 209 复发过几次）
+    strings -el "$V85_MAIN_EXE" | grep -qwF "$V85_MARK" && m1=1
+    strings -el "$V85_CFG_EXE"  | grep -qwF "$V85_MARK" && m2=1
+    if [ "$m1" -eq 1 ] && [ "$m2" -eq 1 ]; then
+        echo "[ OK ] 两侧 EXE 都含宽串标记 '$V85_MARK'"
+    else
+        echo "[FAIL] 宽串标记 '$V85_MARK' 缺失：主程序=$m1 cfg=$m2（包里的 exe 不是 v85 产物）"
+        fail=1
+    fi
+fi
+
+# ---------------------------------------------------------------------------
+# v88 代次标记（整窗 OpenGL 场景渲染 + 字形图集 + 两帧收敛契约）
+# ---------------------------------------------------------------------------
+#
+# ★ 为什么需要这节：v86~v88 把**内容层**（实心/图标/文字）从 GDI 搬进了
+#   OpenGL 场景，一行业务逻辑都没改。这一类改动有三个"不接就静默退化"的点，
+#   而且退化后的样子**仍然像玻璃界面**（只是字变糊、卡片变白），
+#   光看图判断不出来：
+#     ① 场景渲染器在、且两个 exe 共用同一份（主程序用；cfg 走兼容入口）
+#     ② `GlSceneHook` 真的被 `ui_gl.h` 回调（否则内容层根本不会被画）
+#     ③ 背景代次 `refreshStamp` 被写也被读（否则每帧都重跑整条模糊链，
+#        或者反过来——背景换了却不重算，玻璃里透出的是上一张桌面）
+#     ④ **两帧收敛契约**：cfg 走 `Begin()`+`CommitPanels()`（合成上一帧的表），
+#        主程序走 `Compose()`+`SyncPanels()`。谁改了 `ComposeLayer` 的表源
+#        而没改调用方，结果就是"整个窗口一张卡片都没有"（cfg 踩过）
+echo "=== v88 代次标记（整窗 GL 场景渲染）==="
+V88_SCENE_HDR="$PROJECT_ROOT/R3ShieldCore/shared/r3shieldcore/ui_scene.h"
+V88_GL_HDR="$PROJECT_ROOT/R3ShieldCore/shared/r3shieldcore/ui_gl.h"
+V88_MAT_HDR="$PROJECT_ROOT/R3ShieldCore/shared/r3shieldcore/ui_material.h"
+V88_MAIN_SRC="$PROJECT_ROOT/R3ShieldCore/R3ShieldCore/r3shieldcore_gui.cpp"
+V88_CFG_SRC="$PROJECT_ROOT/tools/r3shieldcore_cfg.cpp"
+V88_MARK="R3ShieldCoreScene.v86"
+V88_MAIN_EXE="$DIST_DIR/R3 ShieldCore.exe"
+
+v88_ok=1
+if [ ! -f "$V88_SCENE_HDR" ]; then
+    echo "[FAIL] 缺失: $V88_SCENE_HDR（场景渲染器）"
+    v88_ok=0
+else
+    for sym in "class Scene" "void PaintGdi" "BakeGlyph" "kSceneMarker" "SceneSolidV" "SceneTextV"; do
+        if grep -qF "$sym" "$V88_SCENE_HDR" 2>/dev/null; then
+            echo "[ OK ] ui_scene.h 含 '$sym'"
+        else
+            echo "[FAIL] ui_scene.h 里没有 '$sym' —— 场景渲染器被删改（内容层会退回 GDI）"
+            v88_ok=0
+        fi
+    done
+fi
+
+# ② 回调真的接上了
+if grep -qF "struct GlSceneHook" "$V88_GL_HDR" 2>/dev/null \
+   && grep -qF "scene->Draw(" "$V88_GL_HDR" 2>/dev/null; then
+    echo "[ OK ] GlSceneHook 在 ui_gl.h 里被真正回调"
+else
+    echo "[FAIL] GlSceneHook 缺失/没被调用 —— 内容层画不进 GL（只剩玻璃，没有字）"
+    v88_ok=0
+fi
+
+# ③ 背景代次
+if grep -qF "refreshStamp++" "$V88_MAT_HDR" 2>/dev/null \
+   && grep -qF "refreshStamp != g_lastBgStamp" "$V88_MAIN_SRC" 2>/dev/null; then
+    echo "[ OK ] 背景代次 refreshStamp 被写也被读（模糊链不会白跑/白省）"
+else
+    echo "[FAIL] 背景代次没接上 —— 每帧重跑模糊链，或背景换了不重算"
+    v88_ok=0
+fi
+
+# ④ 两帧收敛契约：两边各用各的入口，且 ComposeLayer 收表做参数
+if grep -qF "void SyncPanels()" "$V88_MAT_HDR" 2>/dev/null \
+   && grep -qF "bool CommitPanels()" "$V88_MAT_HDR" 2>/dev/null \
+   && grep -qF "void ComposeLayer(const PanelRec* panels, int count)" "$V88_MAT_HDR" 2>/dev/null; then
+    echo "[ OK ] 两帧收敛契约在（ComposeLayer 收表做参数 + SyncPanels/CommitPanels 分家）"
+else
+    echo "[FAIL] 两帧收敛契约被破坏 —— cfg 会合成到空表（整窗一张卡片都没有）"
+    v88_ok=0
+fi
+if grep -qF "g_glass.SyncPanels()" "$V88_MAIN_SRC" 2>/dev/null \
+   && grep -qF "g_glass.CommitPanels()" "$V88_CFG_SRC" 2>/dev/null; then
+    echo "[ OK ] 主程序用 SyncPanels、cfg 用 CommitPanels（各自的合成顺序对得上）"
+else
+    echo "[FAIL] 两边的合成入口用错了（主程序要 SyncPanels、cfg 要 CommitPanels）"
+    v88_ok=0
+fi
+
+# ⑤ 主程序真的在用场景（不是"头在、没人用"）
+if grep -qF "g_scene.Begin(" "$V88_MAIN_SRC" 2>/dev/null \
+   && grep -qF "g_scene.PaintGdi(" "$V88_MAIN_SRC" 2>/dev/null \
+   && grep -qF "kSceneMarker" "$V88_MAIN_SRC" 2>/dev/null; then
+    echo "[ OK ] 主程序接的是场景渲染器（Begin / PaintGdi / 代次标记）"
+else
+    echo "[FAIL] 主程序没接场景渲染器 —— 内容层还是 GDI，v88 等于没做"
+    v88_ok=0
+fi
+[ "$v88_ok" -eq 1 ] || fail=1
+
+if [ -f "$V88_MAIN_EXE" ]; then
+    if strings -el "$V88_MAIN_EXE" | grep -qwF "$V88_MARK"; then
+        echo "[ OK ] 主程序 EXE 含宽串标记 '$V88_MARK'"
+    else
+        echo "[FAIL] 宽串标记 '$V88_MARK' 缺失（包里的 exe 不是 v88 产物）"
+        fail=1
+    fi
+fi
+
+# ---------------------------------------------------------------------------
+#  v89：引擎拆成独立进程 + 加密命名管道
+#
+#  这一段查的是**四件缺一不可的事**，每一条都对应一个真实踩过的坑：
+#    ① 代次标记 `R3ShieldCoreEngineIpc.v89` 必须在**引擎 exe** 里（宽串）——
+#       否则包里那个引擎还是老的，界面会一直"连不上"。
+#    ② 协议头里那几个符号必须在：它们一被删，加密/帧/ACL 就有洞。
+#    ③ `BuildPipeSecurity` 必须是**自相对 SD**（`MakeSelfRelativeSD`）——
+#       绝对格式 + 释放 ACL 会让"第一个客户端连上、之后恒定 err=1336"。
+#    ④ `kPadBytes` 必须进帧长计算 —— 漏了帧边界就错位；而且它是
+#       "零长度明文绕过 GCM 验签"那个洞的唯一堵法。
+# ---------------------------------------------------------------------------
+V89_IPC_HDR="$PROJECT_ROOT/R3ShieldCore/shared/r3shieldcore/engine_ipc.h"
+V89_ENGINE_MAIN="$PROJECT_ROOT/R3ShieldCore/R3ShieldCore/engine_host/engine_main.cpp"
+V89_CLIENT_SRC="$PROJECT_ROOT/R3ShieldCore/R3ShieldCore/engine_client.cpp"
+V89_ENGINE_EXE="$DIST_DIR/r3shieldcore-engine.exe"
+V89_MAIN_EXE="$DIST_DIR/R3 ShieldCore.exe"
+V89_MARK="R3ShieldCoreEngineIpc.v89"
+v89_ok=1
+
+if [ ! -f "$V89_ENGINE_EXE" ]; then
+    echo "[FAIL] 缺失: $V89_ENGINE_EXE（界面永远连不上引擎 —— 没有防护）"
+    v89_ok=0
+else
+    if strings -el "$V89_ENGINE_EXE" | grep -qwF "$V89_MARK"; then
+        echo "[ OK ] 引擎 EXE 含宽串标记 '$V89_MARK'"
+    else
+        echo "[FAIL] 引擎 EXE 里没有 '$V89_MARK'（包里那个不是 v89 产物）"
+        v89_ok=0
+    fi
+fi
+
+# ② 协议头关键符号
+if [ ! -f "$V89_IPC_HDR" ]; then
+    echo "[FAIL] 缺失: $V89_IPC_HDR（协议与加密的唯一来源）"
+    v89_ok=0
+else
+    for sym in "class Aead" "bool Seal(" "bool Open(" "struct FrameWriter"                "struct FrameReader" "BuildPipeSecurity" "EnsureMasterKey"                "DeriveSessionKey" "kPadBytes" "EncodeEvents" "DecodeEvents"                "MakeSelfRelativeSD"; do
+        if grep -qF "$sym" "$V89_IPC_HDR" 2>/dev/null; then
+            echo "[ OK ] engine_ipc.h 含 '$sym'"
+        else
+            echo "[FAIL] engine_ipc.h 里没有 '$sym' —— 加密通道被删改"
+            v89_ok=0
+        fi
+    done
+fi
+
+# ③ 主密钥必须**一真一假**：引擎生成、客户端只读。
+#    两边都 createIfMissing=true 会互相覆盖，症状是"偶尔能连、偶尔不能"。
+if grep -qF "EnsureMasterKey(master, true, &keyErr)" "$V89_ENGINE_MAIN" 2>/dev/null    && grep -qF "EnsureMasterKey(master, false" "$V89_CLIENT_SRC" 2>/dev/null; then
+    echo "[ OK ] 主密钥一真一假（引擎 createIfMissing=true / 客户端 false）"
+else
+    echo "[FAIL] 主密钥的 createIfMissing 不是一真一假 —— 两端会互相覆盖"
+    v89_ok=0
+fi
+
+# ④ 帧长必须算上填充字节（漏了 ⇒ 对端按 total 切帧少读一字节 ⇒ 帧边界错位）
+if grep -qF "kFrameHeaderBytes + kIvBytes + kPadBytes + payloadLen + kTagBytes"     "$V89_IPC_HDR" 2>/dev/null; then
+    echo "[ OK ] 帧长计算含 kPadBytes（零长度明文绕过验签的堵法还在）"
+else
+    echo "[FAIL] 帧长计算里没有 kPadBytes —— 空载荷会绕过 GCM 验签（Ping/StopEngine 全裸）"
+    v89_ok=0
+fi
+
+# ⑤ 界面侧必须真的在用 IPC 客户端（exe 里查得到"引擎 exe 名 + 管道名前缀"）
+if [ -f "$V89_MAIN_EXE" ]; then
+    if strings -a "$V89_MAIN_EXE" | grep -qwF "r3shieldcore-engine.exe"; then
+        echo "[ OK ] 主程序 EXE 里带着引擎 exe 名字（会去拉起引擎）"
+    else
+        echo "[FAIL] 主程序 EXE 里没有 'r3shieldcore-engine.exe' —— 它不会拉起引擎"
+        v89_ok=0
+    fi
+    if strings -el "$V89_MAIN_EXE" | grep -qF "R3ShieldCoreEngineIpc"; then
+        echo "[ OK ] 主程序 EXE 含管道名前缀（IPC 客户端被编进去了）"
+    else
+        echo "[FAIL] 主程序 EXE 里没有管道名前缀 —— 界面侧没接 IPC"
+        v89_ok=0
+    fi
+fi
+[ "$v89_ok" -eq 1 ] || fail=1
+
+# ---------------------------------------------------------------------------
+#  v114~v128：cfg 工具（自绘玻璃界面 + 高级页规则编辑台）
+#
+#  ★ 为什么单独一段：cfg 是**唯一**不走 `Release/` 的产物 —— `build_cfgtool.sh`
+#    直接把 exe 写进 `dist/`。也就是说"dist 里那个 cfg"就是"上一次编译的产物"：
+#    改了源码忘了重编，包里发的还是旧的。而这个闸门以前**一条 cfg 判据都没有**。
+#
+#  ★ 为什么不能用 `strings -el` 查中文标记：GNU strings 在 C locale 下只认 ASCII
+#    可打印字符，CJK 宽串一律不输出（实测 `编辑框这一行` 用 `strings -el` 是 MISS，
+#    而按 UTF-16LE 搜字节是 FOUND）。⇒ 用 iconv 把 exe 按 UTF-16LE 转成 UTF-8 再
+#    grep。纯 bash + iconv，不引入 python 依赖。
+#    ★ 必须带**负对照**：否则"转码把什么都转成可匹配"会让判据恒真（铁律 24/28）。
+#
+#  ★ 五条源码判据各自对应一个**真实踩过的缺陷**，删掉任何一条都会静默复发：
+#    ① 追加后清选中 —— 不清 ⇒ 「加入」被永久变成「覆盖」（连点 5 次条数一直 4）。
+#    ② 有取消选中的入口 —— 没有 ⇒ 点过一行就再也加不进新规则。
+#    ③ 右栏解析**左边这一条** —— 旧版跑的是"整张表 × 三个写死样例"。
+#    ④ 表格行数走 `AdvTableRowsShown` —— 需要滚动时让一行给底部提示，
+#       否则提示下半截被原生 EDIT 切掉（`WS_CLIPCHILDREN`）。
+#       ★ 绘制/命中/滚轮/跟随**四处必须读同一个函数**（铁律 127）⇒ 查 ≥4 处调用。
+# ---------------------------------------------------------------------------
+V128_CFG="$DIST_DIR/r3shieldcore-cfg.exe"
+V128_SRC="$PROJECT_ROOT/tools/r3shieldcore_cfg.cpp"
+v128_ok=1
+
+echo ""
+echo "=== v114~v128 cfg 界面代次标记 ==="
+
+if [ ! -f "$V128_SRC" ]; then
+    echo "[FAIL] 缺失源码: $V128_SRC —— 判据失去前提"
+    v128_ok=0
+else
+    # ① 追加成功之后必须**清掉选中**（否则再点一次就覆盖刚加的那条）
+    if grep -B6 "AdvEnsureRowVisible(index);" "$V128_SRC" 2>/dev/null \
+        | grep -qF "g_advSelected = -1;"; then
+        echo "[ OK ] 追加后清选中（「加入」不会退化成「覆盖」）"
+    else
+        echo "[FAIL] AdvApplyRule 追加后没清 g_advSelected —— 「加入」会覆盖刚加的那条"
+        v128_ok=0
+    fi
+
+    # ② 取消选中的入口必须存在且**被调用**（只有定义 = 用户点不到）
+    #    ★ 查 `AdvClearSelection();`（带分号=调用），不查裸名字 —— 裸名字注释里也出现，
+    #      计数阈值会被注释喂饱 ⇒ 判据恒绿（负对照实测过：删掉调用点仍然"通过"）。
+    if grep -qF "void AdvClearSelection()" "$V128_SRC" 2>/dev/null \
+        && grep -qF "AdvClearSelection();" "$V128_SRC" 2>/dev/null; then
+        echo "[ OK ] 有取消选中入口（定义 + 调用，点表格空白可取消）"
+    else
+        echo "[FAIL] AdvClearSelection 只有定义没有调用 —— 用户仍然取消不了选中"
+        v128_ok=0
+    fi
+
+    # ③ 右栏解析左边这一条（不是"整张表 × 写死样例"）
+    #    ★ 同上：查调用形态 `AdvPickParseTarget();`，不查裸名字。
+    if grep -qF "AdvParseTarget AdvPickParseTarget()" "$V128_SRC" 2>/dev/null \
+        && grep -qF "AdvPickParseTarget();" "$V128_SRC" 2>/dev/null; then
+        echo "[ OK ] 右栏解析的是左边这一条（AdvPickParseTarget 三级回落）"
+    else
+        echo "[FAIL] AdvPickParseTarget 只有定义没有调用 —— 右栏退回写死样例"
+        v128_ok=0
+    fi
+
+    # ④ 表格行数四处共用同一个函数（铁律 127：画在这儿、点在那儿 = 差一行的老毛病）
+    v128_rows="$(grep -cF "AdvTableRowsShown(layout" "$V128_SRC" 2>/dev/null)"
+    if [ "${v128_rows:-0}" -ge 4 ]; then
+        echo "[ OK ] 表格行数走 AdvTableRowsShown（${v128_rows} 处调用：绘制/命中/滚轮/跟随）"
+    else
+        echo "[FAIL] AdvTableRowsShown 只被用 ${v128_rows:-0} 处（要 ≥4）—— 提示行又会被切掉"
+        v128_ok=0
+    fi
+fi
+
+if [ ! -f "$V128_CFG" ]; then
+    echo "[FAIL] 缺失: $V128_CFG（配置工具没进发布目录）"
+    v128_ok=0
+else
+    # ★ 落临时文件再 grep，**不要**用 `$(...)`：iconv 的输出里带 NUL，
+    #   bash 命令替换会把 NUL 直接丢掉（还打一句 warning）⇒ 相邻字符串被拼起来，
+    #   可能拼出一个假匹配。`grep -a` 按文本处理二进制文件，不做任何改写。
+    V128_TMP="$(mktemp 2>/dev/null || echo "/tmp/v128_cfg_text.$$")"
+    iconv -f UTF-16LE -t UTF-8 -c "$V128_CFG" > "$V128_TMP" 2>/dev/null
+    # 负对照：这条标记**不该**存在 ⇒ 证明下面的 grep 不是恒真
+    if grep -aqF "R3ShieldCoreCfgAbsentMarker" "$V128_TMP"; then
+        echo "[FAIL] 负对照失败：不存在的标记居然搜到了 —— 判据恒真，本段作废"
+        v128_ok=0
+    else
+        echo "[ OK ] 负对照：不存在的标记搜不到（宽串检索有效）"
+    fi
+    for v128_pair in \
+        "编辑框这一行|v128 右栏会解析**编辑框里那一行**（未保存也生效）" \
+        "已取消选中|v128 能取消选中（「加入」不再被永久变成「覆盖」）" \
+        "解析左边这一条|v128 右栏标题已换（旧版是「改前/改后字节对照」）" \
+        "显示 #|v128 规则表滚动提示（需要滚动时让一行给提示）" ; do
+        v128_mark="${v128_pair%%|*}"
+        v128_desc="${v128_pair#*|}"
+        if grep -aqF "$v128_mark" "$V128_TMP"; then
+            echo "[ OK ] cfg EXE 含宽串标记 '$v128_mark'（$v128_desc）"
+        else
+            echo "[FAIL] cfg EXE 里没有宽串标记 '$v128_mark' —— $v128_desc"
+            echo "       ⇒ dist 里的 cfg 不是 v128 产物（改了源码没重编？）"
+            v128_ok=0
+        fi
+    done
+    command rm -f "$V128_TMP"
+fi
+[ "$v128_ok" -eq 1 ] || fail=1
+
 echo ""
 if [ "$fail" -eq 0 ]; then
-    echo "结果: PASS —— dist 与构建产物一致，双架构同代次，且带 v66/v67/v69/v70/v71/v72/v73/v74/v75/v77/v78/v79/v80/v81/v82/v83/v84 标记。"
+    echo "结果: PASS —— dist 与构建产物一致，双架构同代次，且带 v66/v67/v69/v70/v71/v72/v73/v74/v75/v77/v78/v79/v80/v81/v82/v83/v84/v85/v86/v88/v89 标记，cfg 带 v114~v128 界面标记。"
     exit 0
 fi
 echo "结果: FAIL —— 发布目录与构建产物不同步，**不要打包**。"

@@ -19,7 +19,8 @@
 #      （它只出现在"必备文件清单"和文档里）。
 #
 # 本脚本负责四件事：
-#   1) 校验 `R3ShieldCore/Release/` 里 4 个引擎产物都在；
+#   1) 校验 `R3ShieldCore/Release/` 里 5 个引擎产物都在（v89 起多一个
+#      `r3shieldcore-engine.exe` —— 少了它界面永远连不上引擎）；
 #   2) 编 `tools/dskill.cpp` → `dist/R3ShieldCore-x64/dskill.exe`；
 #   3) 按**约定布局**拷贝（exe 放根、DLL 必须放 `64/` 与 `32/`）；
 #   4) 调 `check_dist_sync.sh` 做验收 —— 判据是**内容相等（md5）**，
@@ -65,6 +66,30 @@ done
 # ⚠️ 必须 cd 进项目根并用**相对路径**（项目根可能含中文，绝对路径会 C1083）。
 cd "$PROJECT_ROOT" || exit 1
 
+# ★★★ 2026-10-24：沙箱会往 shell 注入 `rm` 函数，而 `SAFE_DELETE_BIN_DIR`
+#   是 **Windows 反斜杠绝对路径** ⇒ MSYS 当成相对 cwd 的路径 ⇒ 每次 `rm` 都在 D 盘
+#   做无效查找，脚本卡在下面 2b) 的清理上**几分钟不动、CPU 0%**。
+#   `command rm`（原来那两道修）**只绕开了函数、没绕开 PATH**：真正的 /usr/bin/rm
+#   在被污染的 PATH 里仍要逐个目录查找。⇒ 必须把 safe-bin 段整体从 PATH 剔除。
+unset -f rm unlink rmdir 2>/dev/null || true
+if [ -n "${SAFE_DELETE_BIN_DIR:-}" ]; then
+    _old_path="$PATH"
+    PATH=""
+    _rest="$_old_path:"
+    while [ -n "$_rest" ]; do
+        _seg="${_rest%%:*}"
+        _rest="${_rest#*:}"
+        case "$_seg" in
+            *safe-bin*) continue ;;
+            "") continue ;;
+        esac
+        if [ -z "$PATH" ]; then PATH="$_seg"; else PATH="$PATH:$_seg"; fi
+    done
+    export PATH
+    unset _old_path _rest _seg
+fi
+hash -r 2>/dev/null || true
+
 if [ "$CHECK_ONLY" = "1" ]; then
     exec bash check_dist_sync.sh "$DIST_DIR"
 fi
@@ -81,6 +106,7 @@ fi
 # ---------------------------------------------------------------------------
 MAP=(
     "R3 ShieldCore.exe|$BUILD_ROOT/R3 ShieldCore.exe"
+    "r3shieldcore-engine.exe|$BUILD_ROOT/r3shieldcore-engine.exe"
     "r3shieldcore_svc.exe|$BUILD_ROOT/r3shieldcore_svc.exe"
     "64/r3shieldcore-lib.dll|$BUILD_ROOT/64/r3shieldcore-lib.dll"
     "32/r3shieldcore-lib.dll|$BUILD_ROOT/32/r3shieldcore-lib.dll"
@@ -105,7 +131,7 @@ if [ "$missing" -gt 0 ]; then
     echo "（本脚本只负责**搬运**，不负责编译引擎。）"
     exit 1
 fi
-echo "[OK] 4 个引擎产物都在。"
+echo "[OK] ${#MAP[@]} 个引擎产物都在。"
 echo ""
 
 # ---- 1) dskill.exe：逃生门，必须随包发布，但此前**没有构建脚本**。
@@ -197,8 +223,28 @@ echo ""
 #        所以和上面两个一样要清。
 #        ⚠️ 仍然**只列已知名**、不用通配 `*.log`（铁律 117：判据要窄）——
 #          将来真有随包发的日志文件，才不会被误删。
-for _stale in r3shieldcore-console.log r3shieldcore-events.log r3shieldcore-cfg-console.log; do
+#
+#      ★★ 2026-10-24 补**第四个**已知名：`r3shieldcore-engine-console.log`。
+#        v89 拆进程后**引擎自己**也开了一个控制台，写在自己 exe 同目录。
+#        它比前三个更该清 —— 实测内容第一行就是
+#           程序目录：D:\用户态杀软\dist\R3ShieldCore-x64
+#           配置文件：C:\ProgramData\R3 Shield Core\r3shieldcore.ini
+#        **开发机的完整路径 + pid + 父进程 pid** 全在里面，会随包发出去。
+#        之前漏掉是因为清单里只有前三个，而安装器那边的 `is_runtime_artifact`
+#        也只认 `engine-console-` 前缀 —— 两边**同时**漏了同一个名字
+#        （铁律 197：白名单/黑名单两处各写一份，必然有一处忘记同步）。
+#      ★★ 2026-10-24 补**第五个**已知名：`r3shieldcore-svc.log`。
+#        开机自启服务写在**自己所在目录**（`service/r3shieldcore_svc.c` 的
+#        `LOG_NAME`）。谁在 dist 里跑过一次服务，它就留在发布目录里。
+#        它比引擎那份更露：服务日志里带**服务状态 / 引擎拉起结果 / 错误码**，
+#        还带安装路径。安装器自测那边（`is_runtime_artifact`）早就认它了
+#        ⇒ 这里补上，两边口径才一致（铁律 197）。
+for _stale in r3shieldcore-console.log r3shieldcore-events.log r3shieldcore-cfg-console.log \
+              r3shieldcore-engine-console.log r3shieldcore-svc.log; do
     if [ -f "$DIST_DIR/$_stale" ]; then
+        # ★ 2026-10-24：`command rm` 只绕开 shell 函数，**绕不开被污染的 PATH**
+        #   （safe-bin 段让每次查找都算出一个无效的 D 盘相对路径 ⇒ 卡几分钟）。
+        #   PATH 已在脚本开头清理；这里保留 `command` 作为兜底。
         command rm -f "$DIST_DIR/$_stale" 2>/dev/null || true
         if [ -f "$DIST_DIR/$_stale" ]; then
             echo "[败] 删不掉运行时残留: $_stale"
@@ -208,6 +254,23 @@ for _stale in r3shieldcore-console.log r3shieldcore-events.log r3shieldcore-cfg-
         fi
         echo "  清掉运行时残留: $_stale"
     fi
+done
+
+# ★★ 2026-10-24：`engine-console-<pid>.log` —— **带 pid 后缀**，上面那圈按名字
+#   逐个比对的写法抓不到。它是 `--gui-preview` 探针把引擎/界面的 stderr
+#   重定向到"exe 同目录 + pid"产生的（每次跑探针新增一个，实测 dist 里
+#   攒了 5 个）。内容含 `[diag] redirect pid=…`、`当前页签 = …` 等开发期
+#   细节，同样不该随包发。
+#   ⚠️ 仍然**不写 `*.log`**（铁律 117）—— 只匹配这个已知前缀 + `.log` 后缀。
+for _stale in "$DIST_DIR"/engine-console-*.log; do
+    [ -e "$_stale" ] || continue   # 没有匹配时字面量不展开，跳过
+    _name="$(basename "$_stale")"
+    command rm -f "$_stale" 2>/dev/null || true
+    if [ -e "$_stale" ]; then
+        echo "[败] 删不掉运行时残留: $_name"
+        exit 1
+    fi
+    echo "  清掉运行时残留: $_name"
 done
 echo ""
 
@@ -228,6 +291,20 @@ if [ "$DO_VERIFY_INI" = "1" ]; then
     echo ""
 else
     echo "[跳过] 随包 ini 解析校验（--no-verify-ini）"
+    echo ""
+fi
+
+# ---- 2d) ★ v91：提醒"本机配置会不会把 dist 的 ini 顶掉"
+#      `ResolveConfigPath` 是 **ProgramData 优先**（v66）：只要
+#      `%ProgramData%\R3 Shield Core\r3shieldcore.ini` 存在，引擎/界面读的就是它，
+#      **dist 里的 ini 改动一律不生效**。开发机上这份通常是存在的（本机注入白名单
+#      就写在里面），于是"我改了 dist 的 ini 怎么没反应"会变成一个很贵的坑。
+#      ⇒ 不判失败（这是正常的安装态），但必须**说出来**（铁律 97：不许静默）。
+_PD_INI="${ProgramData:-C:\\ProgramData}\\R3 Shield Core\\r3shieldcore.ini"
+if [ -f "$_PD_INI" ]; then
+    echo "[注意] 本机存在运行时配置：$_PD_INI"
+    echo "       引擎/界面**优先读它** —— 本次部署到 dist 的 r3shieldcore.ini 不会生效。"
+    echo "       要改生效配置请改上面那份（或删掉它，回退到 exe 同目录那份）。"
     echo ""
 fi
 

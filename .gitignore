@@ -60,6 +60,25 @@ _cleanup_backup/
 *.out.p*
 *.pp
 
+# ---- 抓图副产物 / 一次性调试件（v128 补）----
+#   docs/shots/_*.png|bmp|bin 是 r3shot / 像素判据的**每次运行都重生成**的临时抓图，
+#   命名带 `_` 前缀即表示"一次性"。人眼要看的定稿图是不带下划线的
+#   （gui-preview-*.png / live-*.png），那些才进仓库。
+docs/shots/_*
+#   *.bmp.geom 是 r3shot 抓图时导出的**控件几何表**（控件类|文字|x|y|w|h|可见），
+#   供 tools/check_cfg_pills.py 核对版面用。它是**机器产物**、可随时重生成，
+#   且随窗口尺寸/字体变化而变 —— 进仓库只会让每次抓图都产生噪声 diff。
+docs/shots/*.geom
+#   tools/_*.py / tools/_*.cpp 是排查过程中写的**一次性**探针（WDA 抓图、点按、
+#   取色、缩放裁剪…）。正式探针不带 `_` 前缀（*_probe.cpp / r3shot.cpp / drive_*.py）。
+tools/_*
+#   备份目录：整目录改 UI 前的快照，用完即弃（体量大、非源码）
+.bak_v*/
+#   根目录 _fix_*.py：修单点 bug 时的一次性改写脚本，改完就废
+_fix_*.py
+#   根目录孤儿对比图（早期一次性拼图，全仓无任何引用）
+/r3sc_vs_ref.png
+
 # 测试运行输出（verify_log_mode.sh 等写入；每次跑都重新生成）
 tools/logrun/*.txt
 tools/shots/
@@ -95,6 +114,9 @@ dist/R3ShieldCore-x64/*
 !dist/R3ShieldCore-x64/*.md
 !dist/R3ShieldCore-x64/*.txt
 dist/R3ShieldCore-x64.zip
+#   ★ 上面 !*.txt 会把 `_t_dry.txt`（干跑残留）也放回来 ⇒ 单独再忽略一次。
+#     注意 git 规则是「**最后**匹配的生效」，所以这行必须写在 !*.txt **之后**。
+dist/R3ShieldCore-x64/_*
 
 # ---- 编辑器 / 系统 ----
 .vs/

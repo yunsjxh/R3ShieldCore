@@ -182,6 +182,30 @@ namespace R3ShieldCoreArk
 		Stats Stat;
 	};
 
+	// ★ v89：内部退出改由**引擎进程**执行。
+	//
+	//   为什么必须这样（不是"顺手优化"）：内部退出要用"本地引擎 DLL 基址"
+	//   算导出偏移，而界面进程从 v89 起**不再 LoadLibrary 那份 DLL**了
+	//   （引擎是独立进程）。`LocalDllBase` 恒为 0 ⇒ 本地 Perform 必然返回
+	//   `ExportMissing`，而那个提示在界面上写的是"部署包太旧" ——
+	//   一个完全误导的结论。
+	//
+	//   ⇒ 这个回调非空时，InternalExit 走它；引擎那边用**它自己的**基址执行，
+	//     语义与拆进程之前完全一致。
+	//
+	//   `Code` 与 `ArkActions::Result` 的整数值一一对应（顺序在 .cpp 里
+	//   static_assert 钉死）—— 这里刻意不 include `ark_actions.h`：
+	//   那是引擎的动作层（OpenProcess / CreateRemoteThread），界面不该看见。
+	struct SelfExitResult
+	{
+		int Code = 0;
+		DWORD Win32Error = 0;
+		DWORD ElapsedMs = 0;
+		bool DllPresent = false;
+		bool DllSameBuild = false;
+	};
+	using SelfExitFn = bool (*)(DWORD pid, void* context, SelfExitResult* out);
+
 	struct Config
 	{
 		ULONG Level = 0;               // 0 = 关，非 0 = 开
@@ -189,6 +213,9 @@ namespace R3ShieldCoreArk
 		DWORD SelfPid = 0;
 		ULONG_PTR LocalDllBase = 0;    // 引擎加载的那份 DLL 的基址
 		bool SelfExitSupported = false;// DLL 里有没有 GlobalHookSessionSelfExit
+		// v89：内部退出的 IPC 通道（见上面的说明）。空 = 回落到本地 Perform。
+		SelfExitFn SelfExitViaIpc = nullptr;
+		void* SelfExitContext = nullptr;
 	};
 
 	// ------------------------------------------------------------------

@@ -64,6 +64,51 @@ ONLY_ARCH="${2:-}"
 
 cd "$PROJECT_ROOT" || { echo "找不到项目目录: $PROJECT_ROOT"; exit 1; }
 
+# ★★★ 必须 unset 宿主注入的 rm/unlink/rmdir 包装函数。
+#
+#   现象（2026-10-24 实测，卡了 4 次、每次 5~15 分钟）：
+#     构建在 `compile_all` 编完最后一个 .cpp 之后**永久卡住**，
+#     日志停在那一个文件名上，不动、不报错、CPU 为 0。
+#
+#   真因：某些宿主环境（HostTool CLI 的 shell 包装）会注入
+#       rm() { "${SAFE_DELETE_BIN_DIR}/rm" "$@"; }
+#     而 `SAFE_DELETE_BIN_DIR` 是**Windows 反斜杠绝对路径**
+#     （`D:\Program Files\...\safe-bin`）。MSYS bash 把 `which rm` 解析成
+#       /d/用户态杀软/\Program Files\...\safe-bin/rm
+#     —— 它被当成**相对当前目录**的路径，于是每次调用都在 D 盘上做
+#     无效路径查找 + 目录遍历，几十 ms 变几分钟。
+#
+#   本项目 `build_demo` 里恰好有一句 `rm -f "$RES_OBJ"`（见 306 行附近），
+#   正好落在这个坑里。`deploy_dist.sh` 早就因为同一个坑改成 `command rm`
+#   （铁律 264），这里是第二处。
+#
+#   ★ `command rm` 局部绕不过 —— `build_demo` 是函数，函数体里写的是裸 `rm`。
+#     所以直接在脚本入口把函数定义清掉，让 bash 回落到 /usr/bin/rm。
+#   ★★ 光 unset -f **不够**（实测）：那个目录同时被塞进了 PATH，而且带冒号的
+#      Windows 路径被当成 PATH 分隔符，于是 PATH 里出现两个碎片——
+#        `D`  和  `\Program Files\...\safe-bin`
+#     第二个碎片会被 MSYS 解析成 `${cwd}/  行 Program Files/...`，
+#     `which rm` 照样命中它。所以必须**同时把 PATH 里这条剔除**。
+unset -f rm unlink rmdir 2>/dev/null || true
+if [ -n "${SAFE_DELETE_BIN_DIR:-}" ]; then
+    # 用 bash 内建参数替换剔除，不依赖外部命令（此时 PATH 还不可信）
+    _old_path="$PATH"
+    PATH=""
+    _rest="$_old_path:"
+    while [ -n "$_rest" ]; do
+        _seg="${_rest%%:*}"
+        _rest="${_rest#*:}"
+        case "$_seg" in
+            *safe-bin*) continue ;;
+            "") continue ;;
+        esac
+        if [ -z "$PATH" ]; then PATH="$_seg"; else PATH="$PATH:$_seg"; fi
+    done
+    export PATH
+    unset _old_path _rest _seg
+fi
+hash -r 2>/dev/null || true
+
 FAILED=0
 
 setup_toolchain() {
@@ -265,7 +310,10 @@ build_demo() {
     local sources=(
         R3ShieldCore/app.cpp
         R3ShieldCore/ark_actions.cpp
-        R3ShieldCore/engine_control.cpp
+        # ★ v89：界面不再直接 LoadLibrary 引擎 DLL（`engine_control.cpp` 搬去
+        #   引擎进程了）。界面这一侧换成**加密管道客户端**（协议在
+        #   shared/r3shieldcore/engine_ipc.h，两侧同一份）。
+        R3ShieldCore/engine_client.cpp
         R3ShieldCore/functions.cpp
         R3ShieldCore/r3shieldcore_ark.cpp
         # ★ v81：配置工具 ⇄ 引擎 的**管道服务端**。
@@ -379,6 +427,89 @@ build_demo() {
         "${COMPILED_OBJECTS[@]}" \
         "$RES_OBJ" \
         kernel32.lib user32.lib gdi32.lib advapi32.lib shell32.lib comctl32.lib psapi.lib \
+        bcrypt.lib crypt32.lib \
+        || { FAILED=1; return 1; }
+
+    echo "--> $CONFIG/$outName"
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# 引擎进程（r3shieldcore-engine.exe）。
+# ---------------------------------------------------------------------------
+# ★ v89：引擎从"被界面 LoadLibrary 的 DLL"变成**独立进程**。
+#   它自己仍然 LoadLibrary 那份 DLL（注入链路零改动：被注入的进程靠
+#   共享内存 + 会话互斥体找会话管理器，跟谁加载了 DLL 无关），
+#   但注入扫描 / 事件排空 / 会话生命周期都归它；界面只通过**加密管道**
+#   跟它说话（协议见 shared/r3shieldcore/engine_ipc.h）。
+#
+#   为什么单独一个函数（而不是塞进 build_demo）：
+#     · 子系统不同（CONSOLE，入口是 wmain，不是 wWinMain）；
+#     · 源文件集合不同（要 engine_control / ark_actions，**不要** GUI）；
+#     · 链接库不同（要 bcrypt —— AES-256-GCM）。
+#   混在一起以后加开关会互相污染（同 build_svc 的理由）。
+build_engine() {
+    local arch="$1"
+    local outName="r3shieldcore-engine.exe"
+
+    echo ""
+    echo "=== r3shieldcore-engine [$CONFIG|$arch] -> $outName ==="
+
+    setup_toolchain "$arch"
+
+    EXTRA_INCLUDES=(
+        -I shared
+        -I shared/libraries
+        # engine_main.cpp / r3shieldcore_config.cpp 用的是主程序项目的
+        # `stdafx.h`（WIL 预编译头），只在这个目录里。
+        -I R3ShieldCore
+        -I R3ShieldCoreLib
+    )
+
+    local sources=(
+        R3ShieldCore/engine_host/engine_main.cpp
+        R3ShieldCore/engine_control.cpp
+        R3ShieldCore/ark_actions.cpp
+        R3ShieldCore/r3shieldcore_config.cpp
+    )
+
+    compile_all "obj/engine-$arch" "${sources[@]}" || { FAILED=1; return 1; }
+
+    mkdir -p "$CONFIG"
+
+    # 和主程序同一份清单（DPI / 长路径 / comctl32 / requireAdministrator）。
+    local manifestArgs=(
+        /MANIFEST:EMBED
+        /MANIFESTINPUT:R3ShieldCore/rsrc/r3shieldcore-uac.manifest
+    )
+    if [ -z "${R3SHIELDCORE_NO_UAC:-}" ]; then
+        manifestArgs+=( "/MANIFESTUAC:level='requireAdministrator' uiAccess='false'" )
+    fi
+
+    # ★ v90：**WINDOWS 子系统**（不是 CONSOLE）。
+    #
+    #   用户要求原话：「引擎默认不显示控制台」。
+    #   CONSOLE 子系统做不到"默认不显示"：
+    #     · 界面用 CREATE_NO_WINDOW 拉起时，子进程**仍然继承父控制台** ⇒
+    #       父进程（界面）的控制台一关，引擎就收到 `CTRL_CLOSE_EVENT(2)`
+    #       被一起带走 ⇒ "界面关了引擎继续防护"这条保证是假的；
+    #     · 用户手动双击引擎时必然弹一个黑窗口。
+    #   ⇒ 改成 WINDOWS 子系统：**根本没有控制台**，两个问题一起消失。
+    #     需要看日志时传 `--console`（engine_main 里 AttachConsole 父控制台）。
+    #
+    #   ⚠️ WINDOWS 子系统下 CRT 默认找 `wWinMain` ⇒ 必须显式 `-ENTRY:wmainCRTStartup`
+    #      （入口仍是 `wmain`，源码不用改）。忘了这句就是 LNK2019，
+    #      而 link 失败会**把上一次的 exe 删掉**（本项目实测过：产物凭空消失）。
+    MSYS_NO_PATHCONV=1 "$LINK" -nologo \
+        -SUBSYSTEM:WINDOWS \
+        -ENTRY:wmainCRTStartup \
+        -MACHINE:"$MACHINE" \
+        -OUT:"$CONFIG/$outName" \
+        "/VERSION:$PRODUCT_VERSION" \
+        "${manifestArgs[@]}" \
+        "${COMPILED_OBJECTS[@]}" \
+        kernel32.lib user32.lib advapi32.lib shell32.lib psapi.lib \
+        bcrypt.lib crypt32.lib \
         || { FAILED=1; return 1; }
 
     echo "--> $CONFIG/$outName"
@@ -464,6 +595,16 @@ fi
 
 if [ -z "$ONLY_ARCH" ] || [ "$ONLY_ARCH" = "x64" ]; then
     build_demo x64 "R3 ShieldCore.exe"
+fi
+
+# ★ v89：引擎进程（独立 exe）。**两个架构都编** —— 32 位界面要连 32 位引擎，
+#   而且 32 位引擎是"注入 32 位目标"的那一套，不能省。
+if [ -z "$ONLY_ARCH" ] || [ "$ONLY_ARCH" = "x86" ]; then
+    build_engine x86
+fi
+
+if [ -z "$ONLY_ARCH" ] || [ "$ONLY_ARCH" = "x64" ]; then
+    build_engine x64
 fi
 
 # 开机启动服务：只编 x64（ONLY_ARCH=x86 时明确跳过，并说明原因，

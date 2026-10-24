@@ -344,6 +344,55 @@ int main()
 			"prefix 只有单个分隔符 -> false（否则匹配一切）", "");
 		Check(!InjectPolicy::MatchesNeverInjectPath(kProbe, L"\\\\"),
 			"prefix 只有两个分隔符 -> false（否则匹配所有 UNC）", "");
+
+		// ★★ 2026-10-24：钉住"白名单**只放行与引擎通信的两个 exe**"这条语义。
+		//
+		//   背景：用户要求「不注入 cfg 和主程序窗口，不然每截一次屏都有一个事件」，
+		//   随后收窄为「引擎只放行与其通信的主程序和 cfg」。
+		//   两个 exe 的界面是液态玻璃，每帧都要 BitBlt 屏幕做背景模糊；被注入后
+		//   引擎的截屏判据会把自己的抓屏记成「截屏事件」，把真信号淹掉。
+		//
+		//   ★ 为什么必须钉"同目录的 dskill.exe **不**命中"：
+		//     第一版写的是**目录**前缀（`...\R3ShieldCore-x64\`），那样同目录的
+		//     dskill.exe / r3shieldcore-engine.exe / r3shieldcore_svc.exe 会**一并**
+		//     变成"一个 hook 都不装"——比要求宽。收窄成 exe 全路径之后，
+		//     这条负对照就是"没写宽"的证据。
+		//
+		//   为什么还钉"只写文件名不命中"：`never_inject=` 是**镜像全路径前缀匹配**，
+		//   而 `test_inject_only=` 支持"只写基名" —— 两套规则不一样，凭直觉写
+		//   `never_inject=R3 ShieldCore.exe` 会**静默失效**（不报错、不生效）。
+		{
+			const PCWSTR kMainExe = L"D:\\用户态杀软\\dist\\R3ShieldCore-x64\\R3 ShieldCore.exe";
+			const PCWSTR kCfgExe = L"D:\\用户态杀软\\dist\\R3ShieldCore-x64\\r3shieldcore-cfg.exe";
+
+			Check(InjectPolicy::MatchesNeverInjectPath(kMainExe, kMainExe),
+				"主程序 exe 全路径精确命中（exe 名里带空格）", "");
+			Check(InjectPolicy::MatchesNeverInjectPath(kCfgExe, kCfgExe),
+				"cfg exe 全路径精确命中", "");
+
+			// ★ 核心负对照：同目录的**其它** exe 不能被放过。
+			//   这条就是"只放行两个"与"放行整个目录"的分界线。
+			Check(!InjectPolicy::MatchesNeverInjectPath(
+				L"D:\\用户态杀软\\dist\\R3ShieldCore-x64\\dskill.exe", kMainExe),
+				"**同目录的 dskill.exe 不命中**（只放行两个，不是放行整个目录）", "");
+			Check(!InjectPolicy::MatchesNeverInjectPath(
+				L"D:\\用户态杀软\\dist\\R3ShieldCore-x64\\r3shieldcore-engine.exe", kCfgExe),
+				"**同目录的引擎 exe 不命中**", "");
+			Check(!InjectPolicy::MatchesNeverInjectPath(
+				L"D:\\用户态杀软\\dist\\R3ShieldCore-x64\\r3shieldcore_svc.exe", kMainExe),
+				"**同目录的服务 exe 不命中**", "");
+
+			// 文件名前缀更长/更短的同目录文件也不能被误放行
+			Check(!InjectPolicy::MatchesNeverInjectPath(
+				L"D:\\用户态杀软\\dist\\R3ShieldCore-x64\\R3 ShieldCore.exe.bak", kMainExe),
+				"**同名加后缀（.exe.bak）不命中**", "");
+
+			Check(!InjectPolicy::MatchesNeverInjectPath(kMainExe, L"R3 ShieldCore.exe"),
+				"**只写文件名不命中**（never_inject 必须完整路径）", "");
+			Check(!InjectPolicy::MatchesNeverInjectPath(
+				L"D:\\other\\R3 ShieldCore.exe", kMainExe),
+				"别的目录里的同名 exe **不**命中", "");
+		}
 	}
 
 	// ---------------------------------------------------------------

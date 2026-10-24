@@ -52,6 +52,9 @@ typedef char GLchar;
 #define GL_SCISSOR_TEST                0x0C11
 #define GL_UNPACK_ALIGNMENT            0x0CF5
 #define GL_PACK_ALIGNMENT              0x0D05
+#define GL_STREAM_DRAW                 0x88E0
+#define GL_R8                          0x8229
+#define GL_RED                         0x1903
 #endif
 
 #define R3SC_GLAPI __stdcall
@@ -74,6 +77,7 @@ typedef GLint(R3SC_GLAPI* R3PFNGLGETUNIFORMLOCATION)(GLuint, const GLchar*);
 typedef void(R3SC_GLAPI* R3PFNGLUNIFORM1I)(GLint, GLint);
 typedef void(R3SC_GLAPI* R3PFNGLUNIFORM1F)(GLint, GLfloat);
 typedef void(R3SC_GLAPI* R3PFNGLUNIFORM2F)(GLint, GLfloat, GLfloat);
+typedef void(R3SC_GLAPI* R3PFNGLUNIFORM3F)(GLint, GLfloat, GLfloat, GLfloat);
 typedef void(R3SC_GLAPI* R3PFNGLUNIFORM4F)(GLint, GLfloat, GLfloat, GLfloat, GLfloat);
 typedef void(R3SC_GLAPI* R3PFNGLACTIVETEXTURE)(GLenum);
 typedef void(R3SC_GLAPI* R3PFNGLGENBUFFERS)(GLsizei, GLuint*);
@@ -97,8 +101,7 @@ namespace R3ShieldCoreUi {
 inline constexpr wchar_t kGlMarker[] = L"R3ShieldCoreGL.v84";
 
 struct GlFuncs {
-    R3PFNGLACTIVETEXTURE            ActiveTexture = nullptr;
-    R3PFNGLCREATESHADER             CreateShader = nullptr;
+    R3PFNGLACTIVETEXTURE            ActiveTexture = nullptr;    R3PFNGLCREATESHADER             CreateShader = nullptr;
     R3PFNGLSHADERSOURCE             ShaderSource = nullptr;
     R3PFNGLCOMPILESHADER            CompileShader = nullptr;
     R3PFNGLGETSHADERIV              GetShaderiv = nullptr;
@@ -115,6 +118,7 @@ struct GlFuncs {
     R3PFNGLUNIFORM1I                Uniform1i = nullptr;
     R3PFNGLUNIFORM1F                Uniform1f = nullptr;
     R3PFNGLUNIFORM2F                Uniform2f = nullptr;
+    R3PFNGLUNIFORM3F                Uniform3f = nullptr;
     R3PFNGLUNIFORM4F                Uniform4f = nullptr;
     R3PFNGLGENBUFFERS               GenBuffers = nullptr;
     R3PFNGLBINDBUFFER               BindBuffer = nullptr;
@@ -152,13 +156,33 @@ void main(){ vUV = aPos*0.5+0.5; gl_Position = vec4(aPos,0.0,1.0); }
 )";
 }
 
+// ★ 底图 = **模糊后的背景** + 半透明白纱。
+//   这就是"背景模糊半透明"本身：整个窗口的底是糊的，纱给深色文字留可读性。
+//
+// ★★★ v102：**必须把 V 翻过来**（`1.0 - vUV.y`）。
+//
+//   抓屏进 GL 的那张图是 **top-down** 的（DIB 负高度，第 0 行是屏幕最上面），
+//   而 GL 的纹理 v=0 指的是**数据第 0 行**，同时 clip space 的 y=-1 才是屏幕
+//   下方 ⇒ `vUV = aPos*0.5+0.5` 会把"屏幕最上面那行"画到窗口**最下面**。
+//
+//   为什么玻璃面板没跟着翻：面板着色器用的是
+//   `p.y = uRes.y - gl_FragCoord.y`（**y 向下**，和 GDI 一致）再算 uv，
+//   正好又翻了一次 ⇒ 面板是对的、只有这层底图是反的。
+//   症状就是用户看到的："底面背景上下颠倒，但各个框里又是正的"。
+//
+//   ★ 以前没被发现，是因为背景被 v89 的去饱和+抬阴影洗成了一片灰白，
+//     翻不翻看不出来；v96 把压暗降到 0.10 之后结构回来了，这个 bug 才露出来。
 inline const char* GlBaseFS()
 {
     return R"(#version 330 core
 in vec2 vUV;
 out vec4 fragColor;
 uniform sampler2D uTex;
-void main(){ fragColor = vec4(texture(uTex, vUV).rgb, 1.0); }
+uniform float uVeil;
+void main(){
+  vec3 c = texture(uTex, vec2(vUV.x, 1.0 - vUV.y)).rgb;
+  fragColor = vec4(mix(c, vec3(1.0), uVeil), 1.0);
+}
 )";
 }
 
@@ -222,6 +246,9 @@ uniform vec2  uCenter;
 uniform vec2  uHalf;
 uniform float uRadius;
 uniform float uTint;
+// ★ v85：tint 的**颜色**。v84 之前隐含为白色（mix(blur, 1.0, tint)），
+//   于是所有玻璃都是白的；这里把它参数化，才能做出彩色玻璃与凹槽。
+uniform vec3  uTintCol;
 uniform float uDpi;
 uniform float uBend;
 uniform float uBand;
@@ -253,13 +280,19 @@ void main(){
 
   vec2 uv = p / uRes;
 
-  // 投影：只在面板外可见（面板内被玻璃完全盖住）
-  float sdSh = sdRoundBox(d - vec2(0.0, uShadowOff), uHalf, uRadius);
+  // ★★★ 外侧光晕（v87）：白玻璃**不投黑影像**，而是把光散到周围。
+  //
+  //   这一条是参考项目 `LiquidGlassControls` 的做法，本项目一直没搬过来：
+  //   原来这里输出的是 vec4(0,0,0,a) 的**黑色**投影，alpha 0.24、半径 24。
+  //   一屏十几块面板（顶栏 + 页签 + 6 张卡 + 十几个按钮），每块都往下压一圈黑，
+  //   叠加之后整片背景从 236 掉到 203 —— 卡片和背景只差 6 级，于是"浮不起来"。
+  //   白色光晕反过来：越靠近玻璃越亮，卡片是"发光浮起来"而不是"压出一个坑"。
+  float sdSh = sdRoundBox(d - vec2(0.0, uShadowOff * 0.35), uHalf, uRadius);
   float sh = clamp(1.0 - sdSh / uShadowR, 0.0, 1.0);
-  float shadowA = sh * sh * uShadowA;
+  float glow = sh * sh * uShadowA;
 
   if (sd >= 0.5) {
-    fragColor = vec4(0.0, 0.0, 0.0, shadowA);
+    fragColor = vec4(vec3(1.0), glow);
     return;
   }
 
@@ -284,13 +317,26 @@ void main(){
 
   // 磨砂：轻微去饱和 + 提亮
   float luma = dot(bl, vec3(0.299, 0.587, 0.114));
-  bl = mix(bl, vec3(luma), 0.10) * 1.04;
+  bl = mix(bl, vec3(luma), 0.030) * 1.02;
 
-  vec3 col = mix(bl, vec3(1.0), uTint);
+  vec3 col = mix(bl, uTintCol, uTint);
+
+  // 顶部到底部极淡的压暗：玻璃总比它后面的世界暗一点点。
+  // 有这 10% 的差，深色字才站得住；再多就失去通透了。
+  float hN = (p.y - (uCenter.y - uHalf.y)) / max(2.0 * uHalf.y, 1e-3);
+  col *= mix(0.985, 1.025, clamp(hN, 0.0, 1.0));
 
   // 内侧 rim 高光
-  float rim = clamp(exp(sd / (2.6 * uDpi)), 0.0, 1.0);
-  col = mix(col, vec3(1.0), rim * uRim);
+  // ★★ 衰减宽度 2.6 → 5.5（和参考项目一致）。
+  //   2.6px 时边缘是一条 1~2px 的白线，紧跟着就掉回面板内部 =>
+  //   读起来是"白线 + 内侧灰带"，像一圈脏描边。5.5px 才有"厚度"。
+  float rim = clamp(exp(sd / (5.5 * uDpi)), 0.0, 1.0);
+  col = mix(col, vec3(1.0), rim * uRim * 0.72);
+
+  // 最外 1px 的"唇线"：一条更窄更亮的高光，给边缘一个明确的终点。
+  // 没有它，放宽后的 rim 会让边缘看起来发毛（找不到边在哪）。
+  float lip = clamp(exp(sd / (0.9 * uDpi)), 0.0, 1.0);
+  col = mix(col, vec3(1.0), lip * uRim * 0.60);
 
   // 顶部镜面光带
   float topY = uCenter.y - uHalf.y + 1.5 * uDpi;
@@ -302,7 +348,20 @@ void main(){
   float aa = max(fwidth(sd) * 0.75, 0.4);
   float inside = smoothstep(aa, -aa, sd);
 
-  fragColor = vec4(col * inside, inside);
+  // 面板内 = 玻璃色；面板外 = 白色光晕。两者在 AA 带上线性交接。
+  float alpha = inside + (1.0 - inside) * glow;
+  vec3 rgb = col * inside + vec3(1.0) * (1.0 - inside) * glow;
+
+  // ★★★ v87：**还原成非预乘 alpha** 再输出。
+  //
+  //   上面的 rgb 是**预乘**的（已经乘过覆盖率 inside）。而这一层用的混合是
+  //   glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA) —— 它会把 rgb 再乘一次
+  //   alpha。于是抗锯齿带上（inside 从 0 到 1 的那 1~2px）颜色被乘了两次，
+  //   结果就是卡片边缘有一圈**暗线**：看起来像描了一圈脏边，
+  //   而卡片内部和背景的亮度其实是对的（这就是边缘很黑但采样又是白的那个怪现象）。
+  //
+  //   除回去之后：inside=1 ⇒ rgb/a = col（原色）；inside=0 ⇒ rgb/a = 白（光晕）。
+  fragColor = vec4(alpha > 0.001 ? rgb / alpha : vec3(0.0), alpha);
 }
 )";
 }
@@ -310,12 +369,34 @@ void main(){
 // ---------------------------------------------------------------------------
 // GlGlass —— 上下文 + 程序 + 纹理 + FBO
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// ★★ v86：内容层挂载点
+//
+// 参考项目 `LiquidGlassControls` 把"玻璃层 → 实心层 → 图标层 → 文字层"
+// 全部画在同一个 FBO 里，最后一次性上屏。本项目原来只把**玻璃**交给 GL，
+// 文字/柱状条还是 GDI 画在兼容位图上 —— 于是玻璃再准，界面看起来仍是
+// "GDI 界面上贴了几张玻璃卡"。
+//
+// 这里开一个回调：`GlGlass::Render` 在"面板画完、回读之前"把它调起来，
+// 此时 FBO 已绑定、视口已设好、GL 上下文 current ⇒ 实现方（ui_scene.h 的
+// `Scene`）可以自由地画实心/图标/文字。
+//
+// 用回调而不是把顶点类型搬进本头：`ui_gl.h` 保持"只管玻璃"，
+// 场景那一层（含字形图集）全在 `ui_scene.h` 里，两个头互不污染。
+// ---------------------------------------------------------------------------
+struct GlSceneHook {
+    virtual ~GlSceneHook() {}
+    virtual void Draw(GlFuncs& g, int w, int h, float dpi) = 0;
+};
+
 struct GlGlass {
     struct PanelDraw {
         int   x0, y0, x1, y1;
         float radius;
         float tint;
-        int   kind;      // 0=面板 1=玻璃片（不做折射）
+        int   kind;      // 0=面板 1=玻璃片（不做折射） 2=凹槽（无外投影）
+        // ★ v85：tint 的颜色（与 PanelRec 一一对应，桥只做搬运）
+        unsigned char cr = 255, cg = 255, cb = 255;
     };
 
     HWND   dummyWnd = nullptr;
@@ -336,6 +417,7 @@ struct GlGlass {
     GLuint fboB[2] = { 0, 0 };
     GLuint fboOut = 0, texOut = 0;
     int    w = 0, h = 0, aw = 0, ah = 0, bw = 0, bh = 0;
+    bool   blurReady = false;     // ★ v86：模糊链结果是否已就绪（跨帧复用）
 
     bool Ready() const { return ready; }
 
@@ -479,8 +561,9 @@ struct GlGlass {
     bool Render(const BYTE* bgBgra, int bgW, int bgH,
                 const PanelDraw* panels, int panelCount,
                 int headerBand, float headerVeil,
-                int outW, int outH, float dpi,
-                BYTE* outBgra)
+                int outW, int outH, float dpi, float baseVeil,
+                BYTE* outBgra, GlSceneHook* scene = nullptr,
+                bool refreshBackdrop = true)
     {
         if (!ready || !bgBgra || !outBgra || outW <= 0 || outH <= 0) {
             return false;
@@ -490,6 +573,13 @@ struct GlGlass {
             return false;
         }
 
+        // ★★ v86：背景没变就**跳过**上传 + 模糊链。
+        //   原来是"layerDirty 才重建"，所以每帧最多跑一次；现在内容层每帧都要
+        //   重画（计数器在动），如果跟着每帧跑一遍抓屏上传 + 5 遍高斯，
+        //   光这一块就吃掉 3~5ms。背景只在抓屏刷新时才变 ⇒ 用 `refreshBackdrop`
+        //   卡住，模糊结果留在纹理里跨帧复用。
+        const bool needBlur = refreshBackdrop || !blurReady;
+        if (needBlur) {
         // 上传背景原图（BGRA 直接进 GL_BGRA）
         g.ActiveTexture(GL_TEXTURE0);
         glBindTexture(GL_TEXTURE_2D, texFull);
@@ -508,12 +598,12 @@ struct GlGlass {
         g.Uniform1i(Loc(pDown, "uTex"), 0);
         DrawQuad();
         // 高斯 H/V ×2
-        for (int i = 0; i < 2; ++i) {
+        for (int i = 0; i < 3; ++i) {
             BindFbo(fboA[1]);
             glViewport(0, 0, aw, ah);
             UseQuad(pBlur);
             glBindTexture(GL_TEXTURE_2D, texA[0]);
-            g.Uniform2f(Loc(pBlur, "uTexel"), 1.0f / (float)aw, 1.0f / (float)ah);
+            g.Uniform2f(Loc(pBlur, "uTexel"), 2.0f / (float)aw, 2.0f / (float)ah);
             g.Uniform2f(Loc(pBlur, "uDir"), 1.0f, 0.0f);
             g.Uniform1i(Loc(pBlur, "uTex"), 0);
             DrawQuad();
@@ -521,7 +611,7 @@ struct GlGlass {
             glViewport(0, 0, aw, ah);
             UseQuad(pBlur);
             glBindTexture(GL_TEXTURE_2D, texA[1]);
-            g.Uniform2f(Loc(pBlur, "uTexel"), 1.0f / (float)aw, 1.0f / (float)ah);
+            g.Uniform2f(Loc(pBlur, "uTexel"), 2.0f / (float)aw, 2.0f / (float)ah);
             g.Uniform2f(Loc(pBlur, "uDir"), 0.0f, 1.0f);
             g.Uniform1i(Loc(pBlur, "uTex"), 0);
             DrawQuad();
@@ -539,7 +629,7 @@ struct GlGlass {
             glViewport(0, 0, bw, bh);
             UseQuad(pBlur);
             glBindTexture(GL_TEXTURE_2D, texB[0]);
-            g.Uniform2f(Loc(pBlur, "uTexel"), 1.0f / (float)bw, 1.0f / (float)bh);
+            g.Uniform2f(Loc(pBlur, "uTexel"), 2.0f / (float)bw, 2.0f / (float)bh);
             g.Uniform2f(Loc(pBlur, "uDir"), 1.0f, 0.0f);
             g.Uniform1i(Loc(pBlur, "uTex"), 0);
             DrawQuad();
@@ -547,21 +637,26 @@ struct GlGlass {
             glViewport(0, 0, bw, bh);
             UseQuad(pBlur);
             glBindTexture(GL_TEXTURE_2D, texB[1]);
-            g.Uniform2f(Loc(pBlur, "uTexel"), 1.0f / (float)bw, 1.0f / (float)bh);
+            g.Uniform2f(Loc(pBlur, "uTexel"), 2.0f / (float)bw, 2.0f / (float)bh);
             g.Uniform2f(Loc(pBlur, "uDir"), 0.0f, 1.0f);
             g.Uniform1i(Loc(pBlur, "uTex"), 0);
             DrawQuad();
         }
 
         // 输出：底图 + 顶栏薄纱 + 面板
+        blurReady = true;
+        }   // ← needBlur
+
         BindFbo(fboOut);
         glViewport(0, 0, outW, outH);
         glDisable(GL_SCISSOR_TEST);
         glDisable(GL_BLEND);
         UseQuad(pBase);
         g.ActiveTexture(GL_TEXTURE0);
-        glBindTexture(GL_TEXTURE_2D, texFull);
+        // ★★ 绑定 **texA[0]**（模糊版），不是 texFull —— 整个窗口的底必须是糊的。
+        glBindTexture(GL_TEXTURE_2D, texA[0]);
         g.Uniform1i(Loc(pBase, "uTex"), 0);
+        g.Uniform1f(Loc(pBase, "uVeil"), baseVeil);
         DrawQuad();
 
         if (headerBand > 0 && headerVeil > 0.0f) {
@@ -593,6 +688,19 @@ struct GlGlass {
             SetPanelUniforms(panels[i], dpi);
             DrawOnePanel(panels[i], outW, outH, dpi);
         }
+
+        // ★★ v86：内容层（实心 / 图标 / 文字）画在面板之上、回读之前。
+        //   ★★★ 必须**先把 viewport 复原**：`DrawOnePanel` 是逐块设 viewport 的
+        //   （把 quad 限制在包围盒里），循环结束后 viewport 还停在**最后一块面板**
+        //   上。忘了复原 ⇒ 所有内容都被裁进那一小块，症状是"内容全没了"，
+        //   而右下角某处会莫名其妙多出一团字（踩过）。
+        //   scissor 同理：面板那一段是逐块设的，留着会裁掉内容。
+        glDisable(GL_SCISSOR_TEST);
+        glViewport(0, 0, outW, outH);
+        if (scene) {
+            scene->Draw(g, outW, outH, dpi);
+        }
+        glViewport(0, 0, outW, outH);
 
         glDisable(GL_SCISSOR_TEST);
         glDisable(GL_BLEND);
@@ -641,6 +749,7 @@ private:
             { "glUniform1i",               reinterpret_cast<void**>(&g.Uniform1i) },
             { "glUniform1f",               reinterpret_cast<void**>(&g.Uniform1f) },
             { "glUniform2f",               reinterpret_cast<void**>(&g.Uniform2f) },
+            { "glUniform3f",               reinterpret_cast<void**>(&g.Uniform3f) },
             { "glUniform4f",               reinterpret_cast<void**>(&g.Uniform4f) },
             { "glGenBuffers",              reinterpret_cast<void**>(&g.GenBuffers) },
             { "glBindBuffer",              reinterpret_cast<void**>(&g.BindBuffer) },
@@ -749,6 +858,7 @@ private:
         if (texOut) { glDeleteTextures(1, &texOut); texOut = 0; }
         if (fboOut) { g.DeleteFramebuffers(1, &fboOut); fboOut = 0; }
         w = h = aw = ah = bw = bh = 0;
+        blurReady = false;
     }
 
     bool EnsureTargets(int outW, int outH)
@@ -784,24 +894,40 @@ private:
         const float hx = (pd.x1 - pd.x0) * 0.5f;
         const float hy = (pd.y1 - pd.y0) * 0.5f;
         const bool chip = (pd.kind == 1);
+        const bool well = (pd.kind == 2);
         g.Uniform2f(Loc(pGlass, "uCenter"), cx, cy);
         g.Uniform2f(Loc(pGlass, "uHalf"), hx, hy);
         g.Uniform1f(Loc(pGlass, "uRadius"), pd.radius);
         g.Uniform1f(Loc(pGlass, "uTint"), pd.tint);
-        g.Uniform1f(Loc(pGlass, "uBend"), chip ? 0.0f : 14.0f);
-        g.Uniform1f(Loc(pGlass, "uBand"), chip ? 1.0f : 9.0f);
-        g.Uniform1f(Loc(pGlass, "uChroma"), chip ? 0.0f : 0.34f);
-        g.Uniform1f(Loc(pGlass, "uRim"), 0.46f);
-        g.Uniform1f(Loc(pGlass, "uSpec"), chip ? 0.13f : 0.16f);
+        g.Uniform3f(Loc(pGlass, "uTintCol"),
+            (float)pd.cr / 255.0f, (float)pd.cg / 255.0f, (float)pd.cb / 255.0f);
+        // ★ 小控件也给**轻微**折射：用户明确要"按钮和框体都是液态玻璃"，
+        //   完全不做折射的 tint 片看起来只是一块淡色圆角矩形。
+        //   但幅度必须小（5px / 带宽 6px）：半径小的时候大折射会把字底糊成一团。
+        // ★ v85：凹槽（kind 2）折射再小一档（3px）—— 槽里要放滑块/填充条，
+        //   折射一大，槽底的颜色就被搅动，看起来像"槽里有水在动"。
+        const float bend = well ? 3.0f : (chip ? 5.0f : 14.0f);
+        g.Uniform1f(Loc(pGlass, "uBend"), bend);
+        g.Uniform1f(Loc(pGlass, "uBand"), chip || well ? 6.0f : 9.0f);
+        g.Uniform1f(Loc(pGlass, "uChroma"), chip || well ? 0.16f : 0.34f);
+        g.Uniform1f(Loc(pGlass, "uRim"), well ? 0.34f : 0.46f);
+        g.Uniform1f(Loc(pGlass, "uSpec"), well ? 0.05f : (chip ? 0.11f : 0.12f));
         g.Uniform1f(Loc(pGlass, "uNoise"), 0.018f);
-        g.Uniform1f(Loc(pGlass, "uShadowR"), (chip ? 11.0f : 24.0f) * dpi);
-        g.Uniform1f(Loc(pGlass, "uShadowOff"), (chip ? 3.0f : 5.0f) * dpi);
-        g.Uniform1f(Loc(pGlass, "uShadowA"), chip ? 0.16f : 0.24f);
+        // ★ v87：光晕半径 24 → 40（参考项目同值）。光晕比投影要铺得开，
+        //   否则它只是一圈"亮描边"，读不出"玻璃把光散出来"。
+        g.Uniform1f(Loc(pGlass, "uShadowR"), (chip || well ? 14.0f : 40.0f) * dpi);
+        g.Uniform1f(Loc(pGlass, "uShadowOff"), (chip || well ? 2.0f : 3.0f) * dpi);
+        // 凹槽不发光：槽是"凹下去"的，往外散光方向正好反了。
+        // ★ v87：0.30 → 0.14。光晕只是"把光散到边缘"，不能亮到把缝照得比卡片还亮 ——
+        //   那样层级就反了（缝 > 卡片），整页看起来是一张亮纸而不是几块玻璃。
+        g.Uniform1f(Loc(pGlass, "uShadowA"), well ? 0.0f : (chip ? 0.12f : 0.40f));
     }
 
     void DrawOnePanel(const PanelDraw& pd, int outW, int outH, float dpi)
     {
-        const float margin = ((pd.kind == 1 ? 11.0f : 24.0f) * dpi) + 2.0f;
+        // ★ v87：quad 必须包住光晕，否则光晕被裁成一条硬边（= 又变回"描边"）。
+        const float marginPx = (pd.kind == 0) ? 46.0f : (pd.kind == 2 ? 6.0f : 18.0f);
+        const float margin = marginPx * dpi + 2.0f;
         int x0 = (int)(pd.x0 - margin);
         int y0 = (int)(pd.y0 - margin);
         int x1 = (int)(pd.x1 + margin);

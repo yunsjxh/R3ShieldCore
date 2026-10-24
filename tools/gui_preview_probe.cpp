@@ -58,6 +58,23 @@ namespace
 	// 目标窗口类名 —— 由第 5 个参数（app）决定，见 wmain。
 	std::wstring g_className = L"R3ShieldCoreMainWindow";
 
+	// ★★★ v122：**不激活**窗口（`R3SHIELDCORE_PREVIEW_NOACTIVATE=1`）。
+	//
+	//   为什么需要这个开关（用户原话：「他的按钮有问题，但是窗口重绘一下
+	//   之后就好了，比如把鼠标移上去」）：
+	//
+	//   下面 `RaiseToFront` 里的 `SetForegroundWindow(hwnd)` 会发
+	//   `WM_ACTIVATE` ⇒ 窗口**整窗重画一次，连带所有子控件**。而 v122 那个
+	//   缺陷的症状恰好是"子控件停在旧 layer 上，任何一次重绘就恢复" ——
+	//   于是探针自己那一下激活**正好把缺陷抹平了**：v114~v121 的闸门一直是
+	//   绿的，用户在真机上却一眼看见按钮不对。
+	//   （铁律 24/28：截不到的缺陷等于没验；探针把自己要查的现象改掉了，
+	//     比没有探针更危险 —— 它给出的是"已验证"的假象。）
+	//
+	//   ⇒ 置这个变量后只抬 z 序（`SWP_NOACTIVATE`）、不抢前台，窗口保持
+	//     "刚建出来、没人碰过"的状态，抓到的就是**首帧收敛后**的真实样子。
+	bool g_noActivate = false;
+
 	int g_pass = 0;
 	int g_fail = 0;
 
@@ -99,6 +116,57 @@ namespace
 		fwrite(pixels, 1, imageBytes, f);
 		fclose(f);
 		return true;
+	}
+
+	// -----------------------------------------------------------------------
+	// ★★★ v123：把子控件几何落盘（`<bmp>.geom`），给像素判据定位控件用。
+	//
+	//   一行一个：`class|text|x|y|w|h|visible`（**客户坐标**）。
+	//   为什么要它：`check_cfg_pills.py` 原来把按钮矩形写死（`696,114,76,30`）。
+	//   v123 让按钮宽度按文字实测自适应之后，按钮一挪位，写死的坐标就落在
+	//   空白处 ⇒ 判据报「主按钮不是蓝玻璃」的**假红**，看着像功能坏了。
+	//   判据该盯"这个按钮画对了吗"，不是"按钮还在不在老地方"。
+	// -----------------------------------------------------------------------
+	struct GeomCtx { FILE* f; HWND parent; };
+
+	BOOL CALLBACK GeomChildProc(HWND child, LPARAM lp)
+	{
+		GeomCtx* c = reinterpret_cast<GeomCtx*>(lp);
+		WCHAR cls[128] = {};
+		WCHAR txt[512] = {};
+		GetClassNameW(child, cls, _countof(cls));
+		GetWindowTextW(child, txt, _countof(txt));
+		RECT r = {};
+		GetWindowRect(child, &r);
+		MapWindowPoints(HWND_DESKTOP, c->parent, reinterpret_cast<POINT*>(&r), 2);
+		// `|` 是分隔符、换行会毁掉"一行一条" ⇒ 都替换成空格
+		for (WCHAR* p = txt; *p; ++p) {
+			if (*p == L'|' || *p == L'\r' || *p == L'\n') { *p = L' '; }
+		}
+		char clsU[256] = {};
+		char txtU[2048] = {};
+		WideCharToMultiByte(CP_UTF8, 0, cls, -1, clsU, sizeof(clsU), nullptr, nullptr);
+		WideCharToMultiByte(CP_UTF8, 0, txt, -1, txtU, sizeof(txtU), nullptr, nullptr);
+		fprintf(c->f, "%s|%s|%ld|%ld|%ld|%ld|%d\n", clsU, txtU,
+			static_cast<long>(r.left), static_cast<long>(r.top),
+			static_cast<long>(r.right - r.left), static_cast<long>(r.bottom - r.top),
+			IsWindowVisible(child) ? 1 : 0);
+		return TRUE;
+	}
+
+	void DumpChildGeometry(HWND parent, const std::wstring& path)
+	{
+		if (!parent || !IsWindow(parent)) {
+			return;
+		}
+		FILE* f = nullptr;
+		if (_wfopen_s(&f, path.c_str(), L"wb") != 0 || !f) {
+			return;
+		}
+		GeomCtx ctx = { f, parent };
+		EnumChildWindows(parent, GeomChildProc, reinterpret_cast<LPARAM>(&ctx));
+		fclose(f);
+		printf("[gui-preview-probe] 子控件几何 -> %ls\n", path.c_str());
 	}
 
 	HWND g_found = nullptr;
@@ -441,7 +509,14 @@ namespace
 			if (IsIconic(hwnd)) {
 				ShowWindow(hwnd, SW_RESTORE);   // 最小化状态下 SetWindowPos 也抬不上来
 			}
-			SetForegroundWindow(hwnd);
+			// ★★★ v122：`R3SHIELDCORE_PREVIEW_NOACTIVATE=1` 时**不抢前台**。
+			//   `SetForegroundWindow` 会发 WM_ACTIVATE ⇒ 整窗 + 全部子控件重画
+			//   ⇒ 把"首帧子控件没跟着重画"这一类缺陷直接抹平（见 g_noActivate）。
+			//   下面两个 `SWP_NOACTIVATE` 的 SetWindowPos 已经能把窗口抬到 z 序
+			//   最前（不需要前台权），所以截图位置不受影响。
+			if (!g_noActivate) {
+				SetForegroundWindow(hwnd);
+			}
 			SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0,
 				SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW | SWP_NOACTIVATE);
 			SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0,
@@ -554,6 +629,21 @@ namespace
 			printf("[gui-preview-probe] 截图 -> %ls\n", outBmp.c_str());
 		}
 
+		// =================================================================
+		// ★★★ v123：把**子控件的真实矩形**落到 `<bmp>.geom`，给像素判据用。
+		//
+		//   为什么必须这么做（踩过一次）：`check_cfg_pills.py` 原来把按钮矩形
+		//   **写死**成 `(696,114,76,30)` 这类坐标。而 v123 把按钮宽度改成
+		//   "按文字实测自适应"（治文字被裁），按钮一挪位，判据立刻在**空白处**
+		//   求值 —— 报「主按钮不是蓝玻璃」假红，看起来像功能坏了。
+		//
+		//   判据盯的应该是"这个按钮画对了吗"，而不是"按钮是不是还在老地方"。
+		//   ⇒ 探针本来就在枚举窗口（上面找 hwnd 那步），顺手把每个子控件的
+		//     class / 文字 / **客户坐标矩形**写出来；判据有 .geom 就按名字定位，
+		//     没有才退回旧常量（向后兼容，单跑判据也不至于崩）。
+		// =================================================================
+		DumpChildGeometry(hwnd, outBmp + L".geom");
+
 		// ---- 判据 ----
 		Check(width >= 1000 && height >= 600, "窗口尺寸合理（>=1000x600）");
 		Check(ratio > 3.0, "画面上有内容（非白像素 > 3%）");
@@ -564,7 +654,7 @@ namespace
 		//   ★ v82 `cycle`：它从闸门屏起步、切两次后**停在编辑台** ⇒ 末态
 		//     与 `editor` 完全一样（含对照区），所以这里要把它算进来。
 		const bool editorLike = (advMode == L"editor" || advMode == L"typing"
-			|| advMode == L"error" || advMode == L"cycle");
+			|| advMode == L"error" || advMode == L"cycle" || advMode == L"scroll");
 		if (tab == L"advanced") {
 			// 紫色是 Spoof 的语义色：判定/改后两列都用它，出现即说明对照区画出来了。
 			// ⚠️ 这一条只在**编辑台**那几屏成立 —— 闸门屏/解析屏根本没有对照区，
@@ -616,6 +706,10 @@ namespace
 					"日志报「闸门=1 编辑框=1」（截到的是**已解锁的编辑台**）");
 				Check(LogContains(logPath, L"提示=空"),
 					"日志报「提示=空」（编辑框空着，提示给的是语法骨架）");
+				// ★★★ v128：右边那一栏必须解析**左边**（不是三个写死的样例）。
+				//   编辑台这一屏没有选中、输入框空 ⇒ 目标是"表首条 #0"。
+				Check(LogContains(logPath, L"解析目标=#0（表首条） 结果=可解析"),
+					"日志报「解析目标=#0（表首条）」（右边解析的是**左边表里那一条**）");
 				Check(LogContains(logPath, L"[adv] 初始规则=3 来源=示例"),
 					"日志报「初始规则=3 来源=示例」（首次进入走了铺示例那条分支）");
 			}
@@ -626,6 +720,8 @@ namespace
 					"日志报「闸门=1 编辑框=1」（截到的是编辑台）");
 				Check(LogContains(logPath, L"提示=可解析"),
 					"日志报「提示=可解析」（合法规则 -> 实时提示认出来了）");
+				Check(LogContains(logPath, L"解析目标=编辑框这一行 结果=可解析"),
+					"日志报「解析目标=编辑框这一行」（右边跟着输入框走）");
 			}
 			else if (advMode == L"error") {
 				// ★ v79：预置了一条**非法**规则（「模糊」不是算子）⇒ 提示必须报错。
@@ -635,10 +731,30 @@ namespace
 					"日志报「闸门=1 编辑框=1」（截到的是编辑台）");
 				Check(LogContains(logPath, L"提示=错误"),
 					"日志报「提示=错误」（非法规则 -> 实时提示报错）");
+				// ★ 负对照：这一屏右侧必须报错，而不是继续显示上一条的字节
+				Check(LogContains(logPath, L"解析目标=编辑框这一行 结果=解析失败"),
+					"日志报「解析目标=编辑框这一行 结果=解析失败」（右边不拿旧结果糊弄）");
 			}
 			else if (advMode == L"why") {
 				Check(LogContains(logPath, L"闸门=1 编辑框=0"),
 					"日志报「闸门=1 编辑框=0」（截到的是**刚全对的解析屏**）");
+			}
+			else if (advMode == L"scroll") {
+				// ★★★ v127：规则表滚动（"超过 6 条就改不了也删不掉"的修法）。
+				//
+				//   这一屏的 cfg 会自己：① 把规则补到 8 条（一屏放不下）
+				//   ② 按**布局函数算出的坐标**给自己打一发真的 WM_MOUSEWHEEL
+				//   ③ 在处理消息的那一刻比对期望首行、打一行 PASS/FAIL。
+				//   ⇒ 判据不靠截图（滚没滚只差三行字，像素上几乎看不出来），
+				//     而是靠"消息真的走了那条分支并且算对了"。
+				Check(LogContains(logPath, L"闸门=1 编辑框=1"),
+					"日志报「闸门=1 编辑框=1」（截到的是编辑台）");
+				Check(LogContains(logPath, L"预览滚动模式 规则=8"),
+					"日志报「预览滚动模式 规则=8」（规则数超过一屏上限，才谈得上滚动）");
+				Check(LogContains(logPath, L"[adv] 规则表滚动 首行="),
+					"日志报「规则表滚动 首行=…」（滚轮真的进了处理分支）");
+				Check(LogContains(logPath, L"滚动自检=PASS"),
+					"日志报「滚动自检=PASS」（实际首行 == 期望首行，钳位也对）");
 			}
 			else if (advMode == L"cycle") {
 				// ★ v82：演练模式 —— 从闸门屏起步，切两次后停在编辑台。
@@ -772,6 +888,17 @@ int wmain(int argc, wchar_t** argv)
 	const std::wstring mode = (argc >= 5) ? argv[4] : L"";
 	const bool cfgApp = (argc >= 6) && (_wcsicmp(argv[5], L"cfg") == 0);
 	g_className = cfgApp ? R3ShieldCoreCfg::kWindowClass : L"R3ShieldCoreMainWindow";
+
+	// ★★★ v122：`R3SHIELDCORE_PREVIEW_NOACTIVATE=1` ⇒ 不抢前台（见 g_noActivate）。
+	{
+		wchar_t v[8] = {};
+		g_noActivate = GetEnvironmentVariableW(L"R3SHIELDCORE_PREVIEW_NOACTIVATE", v, 8) > 0
+			&& v[0] == L'1';
+		if (g_noActivate) {
+			printf("[gui-preview-probe] 不激活模式：只抬 z 序、不发 WM_ACTIVATE"
+				"（查「首帧子控件没跟着重画」这类缺陷必须这样抓）\n");
+		}
+	}
 	const int rc = Run(argv[1], argv[2], argv[3], mode, cfgApp);
 	printf("\n[gui-preview-probe] 通过 %d / 失败 %d\n", g_pass, g_fail);
 	return rc;

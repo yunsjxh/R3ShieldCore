@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <cstdio>   // 置顶状态变更留痕（stdout）
+#include <mutex>    // v100：g_notice 跨线程（主循环写 / 窗口线程读）必须加锁
 #include <string>
 #include <vector>
 
@@ -38,8 +39,22 @@
 // ★ v84：OpenGL 玻璃后端（真正的着色器实现）。失败会自动退回上面那套 CPU 合成。
 #include <r3shieldcore/ui_gl.h>
 
+// ★ v86：**全窗口 OpenGL 场景渲染器**（背景 → 玻璃 → 实心 → 图标 → 文字）。
+//   参考项目 `LiquidGlassControls` 的渲染架构；两个 exe 共用同一份（铁律 127）。
+#include <r3shieldcore/ui_scene.h>
+
 // ★ v84：界面风格的契约（两个 exe 共用，铁律 127）。
 #include <r3shieldcore/ui_style.h>
+
+// ★ v85：液态玻璃**控件原语**（卡片 / 药丸按钮 / 开关 / 分段 / 进度条 / 徽章）。
+//   视觉模型参考 `LiquidGlassControls`；材质仍走上面那两个头，文字仍走 GDI。
+//   两个 exe 共用同一份（铁律 127）。
+#include <r3shieldcore/ui_controls.h>
+
+// ★ v93：逐帧动画基元（弹簧 / 悬停逼近 / 按 key 存的状态表）。
+//   参数与参考项目 `LiquidGlassControls` 一致；驱动方式见本文件里
+//   `AnimTimerId` 那一段（有交互才起 16ms 定时器，收敛即停）。
+#include <r3shieldcore/ui_anim.h>
 
 //
 // 界面布局
@@ -77,6 +92,17 @@ namespace
 	constexpr PCWSTR GuiClassName = L"R3ShieldCoreMainWindow";
 	constexpr PCWSTR GuiTitle = L"R3ShieldCore 安全控制台";
 
+	// ★★★ v86：本帧的**整个场景**（背景之上的一切：玻璃面板 + 实心块 + 图标 + 文字）。
+	//
+	//   为什么是全局：每个 DrawXxxPage 的签名都只收 `HDC`，一行行改签名会把
+	//   5000 行全部卷进来（diff 无法审）。而它要表达的东西本来就是"本帧画在哪"
+	//   —— 每帧在 PaintWindow 里 Begin 一次即可。
+	//   ★ 只在 GUI 线程读写，和 g_glass 同生命周期。
+	R3ShieldCoreUi::Scene g_scene;
+
+	// 兼容层用的哑 DC：所有绘制都进 g_scene，它只是为了让旧签名不用改。
+	HDC g_sceneDc = nullptr;
+
 	// ---------------------------------------------------------------------
 	// 图标资源 ID —— 必须和 R3ShieldCore/rsrc/r3shieldcore.rc 里的 `1 ICON` 一致。
 	//
@@ -106,6 +132,10 @@ namespace
 	//    实际高度一律用下面的 `PromptSummaryHeight()`。写死会让
 	//    底部栏盖住内容（尤其是事件日志页和进程页列表的底部）。
 	constexpr int PromptSummaryRowHeight = 26;
+
+	// ★ v87：卡片内边距。参考项目 CARD_PAD = 24（卡片宽 ~396），这边卡片窄一半，
+	//   按比例取 18。所有卡片内容（标题 / 柱状条 / 数值）都从这一条竖线起。
+	constexpr int CardPad = 18;
 
 	// 页签栏（标题区下方）。概览 / 事件日志 / 进程 / 配置 / ARK / 高级 六个页签。
 	//
@@ -209,6 +239,35 @@ namespace
 		constexpr int DwmwcpRound = 2;
 		DwmSetWindowAttribute(hwnd, DwmwaWindowCornerPreference,
 			&DwmwcpRound, sizeof(DwmwcpRound));
+
+		// ★★ v88：把**系统标题栏**也拉到浅色。
+		//
+		//   为什么这件事属于"界面重构"而不是"系统设置"：客户区是白玻璃，
+		//   而标题栏走的是系统主题 —— 这台机器上"在标题栏显示强调色"是开的，
+		//   于是窗口顶上挂着一条深蓝黑带，和下面的玻璃界面完全不是一个世界，
+		//   截图里第一眼看到的就是它。
+		//
+		//   `DWMWA_USE_IMMERSIVE_DARK_MODE` 必须一起关：只改 CAPTION_COLOR
+		//   的话 DWM 仍按"深色窗口"画那三个系统按钮（− □ ✕）的**浅色字形**，
+		//   浅底 + 浅字形 = 按钮直接看不见。
+		//
+		//   ⚠️ 这几个属性是 Win11 22000+ 才有的；在 Win10 上调用**直接失败**，
+		//      返回值忽略即可（失败 = 保持系统默认外观，不是错误路径）。
+		constexpr DWORD DwmwaUseImmersiveDarkMode = 20;
+		constexpr DWORD DwmwaBorderColor = 34;
+		constexpr DWORD DwmwaCaptionColor = 35;
+		constexpr DWORD DwmwaTextColor = 36;
+		BOOL darkCaption = FALSE;
+		DwmSetWindowAttribute(hwnd, DwmwaUseImmersiveDarkMode,
+			&darkCaption, sizeof(darkCaption));
+		// 和卡片同一个明度家族：比卡片（约 245）略深一点，
+		// 这样标题栏读成"窗口的边框"，不会和顶栏那张玻璃抢。
+		const COLORREF captionColor = RGB(242, 245, 250);
+		const COLORREF captionText = RGB(24, 24, 24);
+		const COLORREF borderColor = RGB(214, 222, 234);
+		DwmSetWindowAttribute(hwnd, DwmwaCaptionColor, &captionColor, sizeof(captionColor));
+		DwmSetWindowAttribute(hwnd, DwmwaTextColor, &captionText, sizeof(captionText));
+		DwmSetWindowAttribute(hwnd, DwmwaBorderColor, &borderColor, sizeof(borderColor));
 	}
 
 	HINSTANCE g_instance = nullptr;
@@ -227,6 +286,34 @@ namespace
 	bool g_glassLogged = false;        // 背景来源只打一次日志（避免刷屏）
 	bool g_glassWantBackdrop = true;   // 下一次绘制是否强制重建背景
 	ULONGLONG g_glassMovedAt = 0;      // 最近一次移动/缩放时间（用于静止收敛）
+
+	// ★ v85：控件库的画布句柄（玻璃层 + 目标 HDC + dpi）。
+	//
+	// 为什么是全局而不是一路传参：这个文件里每个 DrawXxxPage 的签名都只收
+	// `HDC`，一行行改签名会把 5000 行全部卷进来（diff 无法审）。而它要表达的
+	// 东西本来就是"本帧画在哪" —— 每帧在 PaintWindow 里赋一次即可。
+	// ★ 只在 GUI 线程读写，和 g_glass 同生命周期。
+	namespace UiCtl = R3ShieldCoreUi::UiCtl;
+
+	float GlassDpiScale(HWND hwnd);   // 定义在下面
+
+	UiCtl::Surface g_ui;
+
+	// ★ v85：概览页两张玻璃卡的纵向范围（y0, y1）。
+	//
+	//   为什么要记"上一帧"的：玻璃层按登记顺序叠放，卡片必须**先于**
+	//   柱状条登记；而卡片高度要到画完才知道 ⇒ 只能记下来给下一帧用。
+	//   这不违背"两帧收敛"（本帧的玻璃层本来就是按上一帧的表合成的）。
+	//   只在 GUI 线程读写；[0]==[1] 表示还没量过（首帧）。
+	int g_overviewCardA[2] = { 0, 0 };
+	int g_overviewCardB[2] = { 0, 0 };
+
+	void SyncUiSurface(HDC dc)
+	{
+		g_ui.dc = dc;
+		g_ui.g = &g_glass;
+		g_ui.dpi = GlassDpiScale(g_window);
+	}
 
 	// 取当前 DPI 缩放（PerMonitorV2 清单 ⇒ 必须按窗口取，不能用 GetDeviceCaps）
 	float GlassDpiScale(HWND hwnd)
@@ -265,37 +352,88 @@ namespace
 	using R3ShieldCoreUi::Style;
 	Style g_uiStyle = Style::Glass;
 
+	// ★★★ v98：切到"无系统标题栏"。
+	//
+	//   只在玻璃风格下切 —— 经典模式（`R3SHIELDCORE_GLASS=off`）仍保留
+	//   系统标题栏：那是现场的**一键回退路径**，回退后必须还是一个
+	//   "能拖、能关"的正常窗口，不能因为去掉了标题栏而变成拖不动的板子。
+	//
+	//   用 `SetWindowLongPtr + SWP_FRAMECHANGED` 而不是在 CreateWindowEx 里
+	//   直接写：风格是窗口建好之后才从配置读出来的（`LoadStyle`），
+	//   建窗口那一刻还不知道该不该去标题栏。
+	//
+	//   `WS_THICKFRAME` 必须留着：DWM 的投影和 Win11 圆角靠它，
+	//   缩放命中也靠它（客户区由 WM_NCCALCSIZE 撑满，边框只是不可见）。
+	void ApplyCustomFrame(HWND hwnd)
+	{
+		if (!hwnd || g_uiStyle != Style::Glass) {
+			return;
+		}
+		LONG_PTR style = GetWindowLongPtr(hwnd, GWL_STYLE);
+		style &= ~static_cast<LONG_PTR>(WS_CAPTION | WS_SYSMENU);
+		style |= WS_POPUP | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX;
+		SetWindowLongPtr(hwnd, GWL_STYLE, style);
+		SetWindowPos(hwnd, nullptr, 0, 0, 0, 0,
+			SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+		printf("[glass] 自绘标题栏已启用（去掉系统标题栏，玻璃铺到窗口最上沿）\n");
+	}
+
+
 	// OpenGL 后端实例（进程级；Init 失败就一直是 CPU 合成）
 	R3ShieldCoreUi::GlGlass g_gl;
 
 	// 把 GlassSurface 的面板表翻译成 GL 后端的入参并渲染。
 	// ★ 这是 CPU / GPU 两条路唯一的分叉点：都产出同一块 top-down BGRA 缓冲。
+	//
+	// ★★ v86：**内容层也在这里画**（`&g_scene` 作为 `GlSceneHook` 回调进去）。
+	//   于是这一帧的成品 = 背景 + 玻璃 + 实心块 + 图标 + 文字，一次上屏
+	//   —— 和参考项目 `LiquidGlassControls` 的渲染顺序一致。
+	unsigned long long g_lastBgStamp = 0;   // 上次交给 GL 的背景快照代次
+
 	void GlComposeBridge(void* ctx, const R3ShieldCoreUi::Backdrop& bd,
 		const R3ShieldCoreUi::PanelRec* panels, int count,
 		int headerBand, float headerVeil,
 		int w, int h, float dpi, BYTE* out)
 	{
 		auto* gl = static_cast<R3ShieldCoreUi::GlGlass*>(ctx);
-		R3ShieldCoreUi::GlGlass::PanelDraw list[96];
-		const int n = count < 96 ? count : 96;
-		for (int i = 0; i < n; ++i) {
-			list[i].x0 = panels[i].x0;
-			list[i].y0 = panels[i].y0;
-			list[i].x1 = panels[i].x1;
-			list[i].y1 = panels[i].y1;
-			list[i].radius = panels[i].radius;
-			list[i].tint = panels[i].tint;
-			list[i].kind = panels[i].kind;
+
+		// `PanelRec`（合成层的记录）与 `GlGlass::PanelDraw`（着色器的入参）
+		// 字段一一对应，但**是两个类型**（前者不带任何 GL 依赖，后者在 ui_gl.h 里）。
+		// 逐字段搬一次，最多 96 条，代价可以忽略 —— 比 reinterpret_cast 安全
+		// （后者依赖"两个结构布局完全一致"，一旦谁加个字段就是静默画错）。
+		R3ShieldCoreUi::GlGlass::PanelDraw conv[R3ShieldCoreUi::GlassSurface::kMaxPanels];
+		int n = count;
+		if (n > R3ShieldCoreUi::GlassSurface::kMaxPanels) {
+			n = R3ShieldCoreUi::GlassSurface::kMaxPanels;
 		}
-		if (!gl->Render(bd.full.bits, bd.full.w, bd.full.h, list, n,
-			headerBand, headerVeil, w, h, dpi, out)) {
+		for (int i = 0; i < n; ++i) {
+			conv[i].x0 = panels[i].x0;
+			conv[i].y0 = panels[i].y0;
+			conv[i].x1 = panels[i].x1;
+			conv[i].y1 = panels[i].y1;
+			conv[i].radius = panels[i].radius;
+			conv[i].tint = panels[i].tint;
+			conv[i].kind = panels[i].kind;
+			conv[i].cr = panels[i].cr;
+			conv[i].cg = panels[i].cg;
+			conv[i].cb = panels[i].cb;
+		}
+
+		// ★ 背景代次没变 ⇒ 跳过整条模糊链（上传 + 5 遍高斯，3~5ms）。
+		if (!gl->Render(bd.full.bits, bd.full.w, bd.full.h,
+			conv, n,
+			headerBand, headerVeil, w, h, dpi,
+			R3ShieldCoreUi::DefaultTheme().veil, out, &g_scene,
+			bd.refreshStamp != g_lastBgStamp)) {
 			// ★★ GL 中途失败（设备丢失 / 驱动异常）⇒ **当场退回 CPU**，并把钩子摘掉。
 			//   不摘的话每帧都会重试、每帧都要多花一次失败的 GL 调用。
 			g_glass.glCompose = nullptr;
 			R3ShieldCoreUi::PaintBackdropBase(out, w, h, bd,
 				R3ShieldCoreUi::DefaultTheme(), R3ShieldCoreUi::DefaultTheme().veil);
 			printf("[glass] 警告：GL 合成本帧失败，已退回 CPU 合成（后续不再尝试 GL）\n");
+			return;
 		}
+		g_lastBgStamp = bd.refreshStamp;
 	}
 
 	// ---------------------------------------------------------------------
@@ -369,6 +507,17 @@ namespace
 	HFONT g_boldFont = nullptr;
 
 	R3ShieldCoreGui::Options g_options = {};
+
+	// ★ v103：最近一次鼠标位置（客户区坐标）。
+	//
+	// 为什么需要它：以前只有 `WM_MOUSEMOVE` 里才知道鼠标在哪，而
+	// `DrawConfigPage` 要判断「应用」按钮是否悬停 —— 绘制期间没有 POINT。
+	// 两个选择：① 把 point 一路传进绘制函数（要改一串签名）；
+	// ② 记住最后一次位置（一个 POINT，无锁：只有 UI 线程读写）。
+	// 选 ② —— 悬停**本来就是"上一帧的位置"**，一个 POINT 就是它的全部含义。
+	//
+	// ★ 初值 (-1,-1)：客户区外 ⇒ 一开始不会有任何东西显示成悬停态。
+	POINT g_mousePoint = { -1, -1 };
 
 	//
 	// ★ v61：底部统计栏的**实际**高度。
@@ -466,6 +615,44 @@ namespace
 	// 取值用 InterlockedExchange 一次性消费，避免"点了两下只生效一次/生效两次"。
 	volatile LONG g_pendingMode = -1;
 
+	// ---- ★ v91：引擎连接状态 + 一次性提示条 ----
+	//
+	// 为什么必须有这两个东西：界面是 **WINDOWS 子系统**（没有控制台），
+	// `printf` 全进日志文件，而日志在运行期是**独占**打不开的
+	// ⇒ 任何"静默失败"用户都完全看不到。
+	// 实测事故：引擎被上一次会话留成僵尸 ⇒ 界面连不上 ⇒ 点「切换模式」
+	// 只往日志里写一行"模式切换失败：引擎未连接"，用户看到的就是
+	// **"点了完全没反应、徽章不变"**（2026-10-23）。
+	//
+	// 所以：① 徽章直接显示"未连接"（状态在窗口里可见）；
+	//       ② 切换失败/其它动作失败时，在标题栏右侧画一行红字，8 秒后自己消失。
+	// 默认 1（已连接）：避免界面刚起来、主循环还没轮询时闪一下"未连接"。
+	volatile LONG g_engineConnected = 1;
+
+	//
+	// ★★★ v100：`g_notice` 必须**加锁** —— 这是 2026-10-23 那次
+	//   「点了切换之后，连退出都没反应」的真正根因。
+	//
+	//   写它的线程：`app.cpp` 主循环（`ApplyMode` 失败时调 `ShowNotice`）。
+	//   读它的线程：窗口线程（`PaintWindow` 画副标题那一行）。
+	//
+	//   原来的写法是裸 `std::wstring` 跨线程直接赋值 —— 而 `wstring::operator=`
+	//   会**释放旧堆块、分配新块**。于是：
+	//     · 窗口线程正拿着 `g_notice.c_str()` 在 `DrawText` 里读；
+	//     · 主循环线程同时把这块内存释放掉；
+	//     ⇒ 读到已释放内存，且两个线程并发进出 CRT 堆 ⇒ **堆锁死锁**。
+	//
+	//   症状极具迷惑性：**窗口线程还活着**（还能响应点击、还能打日志），
+	//   但主循环线程永久卡住 ⇒ 「退出引擎」的请求再也没人消费
+	//   ⇒ 用户看到的是"点了完全没反应"。而触发条件恰好是"切换失败"
+	//   （只有失败路径才调 ShowNotice），所以看起来像"一切换就整个界面死了"。
+	//
+	//   修法：读写都走这把锁，并且**绘制侧先拷贝到局部变量再画**，
+	//   把临界区压到最短（不能持锁调 `DrawText`，那会把窗口线程拖进来）。
+	std::mutex g_noticeMutex;
+	std::wstring g_notice;
+	ULONGLONG g_noticeUntil = 0;
+
 	// ---- 置顶状态（只在 GUI 线程读写）----
 	// 三档：不置顶 / 默认置顶（普通 TOPMOST）/ 超级置顶（UIAccess Band）。
 	bool g_topMost = false;          // 当前是否置顶（普通或超级）
@@ -484,6 +671,100 @@ namespace
 	//   单独一个定时器，各自的语义才干净：id 1 管"重画"，
 	//   id 3 管"重取数据 + 重画 ARK 页"。
 	constexpr UINT_PTR ArkRefreshTimerId = 3;
+
+	// ------------------------------------------------------------------
+	// ★★★ v93：逐帧动画时钟（id 4）
+	//
+	//   参考项目是 `glfwSwapInterval(1)` + 无限循环，每帧都重画 —— 手感是
+	//   "60fps 连续推进 + 弹簧"的直接结果。本项目是常驻的安全软件，
+	//   "不动鼠标时不占 CPU"是硬要求（ui_controls.h 开头那段）。
+	//
+	//   所以这里用"按需起表"的模型：
+	//     · 任何交互（鼠标移动 / 按下 / 换页 / 换模式）→ EnsureAnimTimer()；
+	//     · 16ms 一跳，每跳把 g_anim 里所有弹簧推进一帧并重画；
+	//     · 全部收敛（g_anim.Tick 返回 false）→ KillTimer，回到 0 帧。
+	//
+	//   ⇒ 动画过程与参考项目逐帧同参数（k=320/d=30、press k=720/d=42、
+	//     hover 14/s），静止时 CPU 占用为 0。两头都拿到。
+	//
+	//   ⚠️ 不要把它改成常驻定时器：那等于把"常驻安全软件不该持续重绘"
+	//     这条前提推翻了，而且 16ms 一跳会让日志页/统计页的 300ms 节拍
+	//     失去意义（数据没变也在重画）。
+	constexpr UINT_PTR AnimTimerId = 4;
+	constexpr UINT AnimTimerIntervalMs = 16;
+
+	R3ShieldCoreUi::Anim::Bank g_anim;
+	ULONGLONG g_animLastMs = 0;
+	bool g_animRunning = false;   // 动画时钟是否已经在跑（见 EnsureAnimTimer）
+
+	// ★★★ v95：背景"自己在变"的观察窗
+	//
+	//   问题（用户 2026-10-18 提的）："不动的时候不渲染，那我的背景变了怎么办？"
+	//   —— 静止时我们只剩 id 1 那个 **300ms** 重画定时器，也就是背景以
+	//   3.3fps 跟随。背后拖一个窗口时，玻璃会一顿一顿地跳。
+	//
+	//   参考项目是常驻 60fps 抓屏，所以它跟得死死的。我们不可能常驻
+	//   （CPU 成本 + 常驻软件的前提），于是改成**按变化自适应**：
+	//     · 每次重画后比对 `backdrop.refreshStamp`；
+	//     · 变了 ⇒ 开一个 900ms 的观察窗 + 叫醒 16ms 快时钟；
+	//     · 窗内主动抓一次（自己窗口在动 40ms / 其它 100ms，见 PaintWindow）；
+	//     · 窗过期（背景 900ms 没再变）⇒ 快时钟自己停，回到 300ms 常态。
+	//   ⇒ 背景一动，最多 300ms（一次常态重画）就被锁定，之后 25fps 跟随；
+	//     背景一静，立刻回到"几乎不占 CPU"。
+	ULONGLONG g_bgWatchUntil = 0;
+	ULONGLONG g_bgForceAt = 0;
+	unsigned long long g_bgLastStamp = 0;
+
+	// 背景跟随间隔（ms）。默认 100（10fps）：
+	//   实测这台机器上**一次带抓屏的重绘 ≈ 23ms**（BitBlt + 调色 + 模糊 +
+	//   纹理上传），10fps ⇒ 约 25% 单核；40ms（25fps）会到 50%+。
+	//   糊过的背景 10fps 看不出台阶，但"自己窗口被拖动"那 1.2 秒走 40ms，
+	//   因为那一段用户盯得最紧。
+	//   `R3SHIELDCORE_GLASS_FOLLOW_MS=<ms>` 可以改（想追 60fps 就设 16，
+	//   但 CPU 会顶满 —— 帧率也上不去，因为一次重绘就要 23ms）。
+	ULONGLONG g_bgFollowMs = 100;
+
+	// 起表（幂等）。已经起着就只重置时间戳，避免第一帧 dt 很大。
+	//
+	// ⚠️ `g_animLastMs` 只在**从停到起**那一刻对齐。每帧都重置的话
+	//   dt 会一直是 ~0，弹簧永远推不动 —— 表现是"动画卡在第一帧"，
+	//   而且因为每帧都在画，看起来像"界面卡住了"。
+	void EnsureAnimTimer()
+	{
+		if (!g_window) {
+			return;
+		}
+		if (!g_animRunning) {
+			g_animLastMs = GetTickCount64();
+			g_animRunning = true;
+		}
+		SetTimer(g_window, AnimTimerId, AnimTimerIntervalMs, nullptr);
+	}
+	// 页签滑块的弹簧（x0 / x1 各一个：各页签宽度不同，用一个"索引弹簧"
+	// 再插值会在宽度跳变时抖一下）。
+	R3ShieldCoreUi::Anim::Spring g_tabThumbX0;
+	R3ShieldCoreUi::Anim::Spring g_tabThumbX1;
+	bool g_tabThumbInit = false;
+
+	// ★ v94：换页时滑块的"挤压"（参考项目 dock 的 `g_dockW.v = 122` ——
+	//   切换瞬间先比正常宽 12px，再弹回 110）。值 = **额外宽度**。
+	//   没有它，滑块滑到位是"贴上去"的，缺一口气。
+	R3ShieldCoreUi::Anim::Spring g_tabSqueeze;
+
+	// ★ v94：在页签条上按住拖动时记着"正在拖"，鼠标划过哪段就切到哪段
+	//   （参考项目 K_SEG 的 `g_dragId` 就是干这个的：按住可以滑过去）。
+	int g_tabDrag = -1;
+
+	// 动画 key：同一页上同一个位置的控件，跨帧必须得到同一个 key。
+	// 用 (页号, x, y) 拼 —— 位置稳定、页号稳定，就够唯一了。
+	// 不用"绘制顺序计数"：一页里某个元素条件出现（比如"无数据"占位）
+	// 就会让后面所有 key 整体错位，动画会串到别的控件上。
+	int AnimKey(int x, int y)
+	{
+		return ((g_activeTab & 0x0F) << 24)
+			| ((y & 0x0FFF) << 12)
+			| (x & 0x0FFF);
+	}
 
 	int ClientWidth();
 
@@ -547,9 +828,53 @@ namespace
 	// 标题区右侧：从左到右依次是「默认置顶」「超级置顶」，再往右是模式徽章。
 	// 和徽章一样按**真实客户区宽度**右对齐（窗口是 WS_THICKFRAME，能拉宽，
 	// 用常量会在拉宽后浮在中间）。绘制和命中测试都走这两个函数，保证一致。
+	// ★★★ v98：自绘标题栏的三个窗口按钮（最小化 / 最大化-还原 / 关闭）
+	//
+	//   为什么要自绘：窗口已经去掉系统标题栏（`WS_CAPTION`），玻璃从窗口
+	//   最上沿开始铺，否则顶上永远压着一条 31px 的系统灰条 —— 那一条既
+	//   不透背景、也不跟圆角，整窗的"一块玻璃"就断在那一刀上。
+	//
+	//   ★ 尺寸/位置和「模式徽章」共用 `ModeBadgeTop` / `ModeBadgeHeight`：
+	//     三个按钮和徽章必须在同一条水平线上，差 1px 都看得出来。
+	//   ★ 三颗按钮靠右挤成一组（26+2+26+2+26 = 82），把右边的
+	//     默认置顶 / 超级置顶 / 模式徽章整体往左让位 —— 见 ModeBadgeLeft()。
+	// ------------------------------------------------------------------
+	constexpr int CapBtnW = 26;
+	constexpr int CapBtnH = 26;
+	constexpr int CapBtnGap = 2;
+	constexpr int CapClusterWidth = CapBtnW * 3 + CapBtnGap * 2;
+
+	enum class CapBtn { Min = 0, Max = 1, Close = 2, None = -1 };
+
+	RECT CapButtonRect(int i)
+	{
+		const int left = ClientWidth() - Padding - CapClusterWidth;
+		const int x = left + i * (CapBtnW + CapBtnGap);
+		return { x, ModeBadgeTop, x + CapBtnW, ModeBadgeTop + CapBtnH };
+	}
+
+	CapBtn HitTestCapButton(POINT p)
+	{
+		for (int i = 0; i < 3; ++i) {
+			RECT r = CapButtonRect(i);
+			if (PtInRect(&r, p)) {
+				return static_cast<CapBtn>(i);
+			}
+		}
+		return CapBtn::None;
+	}
+
+	// 模式徽章的左边界：让掉"窗口按钮簇"那一块。
+	int ModeBadgeLeft()
+	{
+		return ClientWidth() - Padding - CapClusterWidth - HeaderToggleGap - ModeBadgeWidth;
+	}
+
+	CapBtn g_capHover = CapBtn::None;
+
 	RECT SuperTopMostButtonRect()
 	{
-		const int badgeLeft = ClientWidth() - Padding - ModeBadgeWidth;
+		const int badgeLeft = ModeBadgeLeft();
 		const int top = ModeBadgeTop;
 		const int right = badgeLeft - HeaderToggleGap;
 		return { right - HeaderToggleWidth, top, right, top + HeaderToggleHeight };
@@ -562,37 +887,152 @@ namespace
 			superRect.left - HeaderToggleGap, superRect.bottom };
 	}
 
-	void DrawTextSimple(HDC dc, PCWSTR text, RECT rect, HFONT font, COLORREF color, UINT format)
+	// ------------------------------------------------------------------
+
+	// ---------------------------------------------------------------------
+	// ★★★ v86：绘制层接到 OpenGL 场景渲染器
+	//
+	//   参考项目 `LiquidGlassControls` 把**整个窗口**画在 GL 里：
+	//   背景抓屏 + 模糊 → 玻璃层（有序）→ 实心层 → 图标层 → 文字层 → 一次上屏。
+	//   本项目原来是"GDI 画内容 + 玻璃层当背景图"，玻璃再准，界面看起来
+	//   仍然是"GDI 界面上贴了几张玻璃卡"。
+	//
+	//   这里做的是**换渲染栈、不换布局**：
+	//   · 所有图元（面板 / 实心块 / 圆角 / 分隔线 / 文字）都写进 `g_scene`；
+	//   · `g_scene` 由 `ui_gl.h` 在"面板画完、回读之前"回调，一次画完；
+	//   · 各页的绘制函数**签名和坐标一个字都没改** —— 探针（`gui_exit_button_probe`、
+	//     `gui_copy_all_logs_probe`）镜像了这些坐标，动布局等于让它们静默点空。
+	//
+	//   ★ 为了让 94 处 `DrawTextSimple` / 21 处 `FillRect` 不用逐个改写，
+	//     这里给了两个**同名兼容层**（`DrawTextSimple` / `FillRect`）：
+	//     调用写法不变，落点变成场景。`FillRect` 从 brush 里取颜色 ——
+	//     `CreateSolidBrush` 造出来的就是 BS_SOLID，颜色能原样取回。
+	// ---------------------------------------------------------------------
+	R3ShieldCoreUi::SceneFont SceneFontOf(HFONT font)
 	{
-		HGDIOBJ oldFont = SelectObject(dc, font);
-		SetBkMode(dc, TRANSPARENT);
-		SetTextColor(dc, color);
-		DrawText(dc, text, -1, &rect, format | DT_NOPREFIX);
-		SelectObject(dc, oldFont);
+		using namespace R3ShieldCoreUi;
+		if (font && font == g_titleFont) return SF_Title;
+		if (font && font == g_valueFont) return SF_Value;
+		if (font && (font == g_monoFont || font == g_logFont)) return SF_Mono;
+		if (font && font == g_tabFont) return SF_Tab;
+		if (font && font == g_boldFont) return SF_Bold;
+		return SF_Label;
+	}
+
+	// ★ v87：玻璃模式下的三档文字色。
+	//
+	//   为什么不直接用 ColorTextPrimary / ColorTextSecondary：
+	//   那是**不透明界面**上配的色（纯黑 + 中灰）。压在玻璃上时，中灰 (110) 会和
+	//   玻璃的灰底糊成一片，整页看起来「没有字」。参考项目的做法是给三档
+	//   **带一点冷调的墨色**（Ink / Dim / Faint），在浅玻璃上既有对比又不死黑。
+	COLORREF InkColor()   { return g_glass.active ? UiCtl::ToColor(UiCtl::Ink)   : ColorTextPrimary; }
+	COLORREF DimColor()   { return g_glass.active ? UiCtl::ToColor(UiCtl::Dim)   : ColorTextSecondary; }
+	COLORREF FaintColor() { return g_glass.active ? UiCtl::ToColor(UiCtl::Faint) : ColorTextSecondary; }
+
+	void DrawTextSimple(HDC /*dc*/, PCWSTR text, RECT rect, HFONT font, COLORREF color, UINT format)
+	{
+		using namespace R3ShieldCoreUi;
+		if (!text) {
+			return;
+		}
+		int flags = ST_Left;
+		if (format & DT_CENTER) flags |= ST_Center;
+		if (format & DT_RIGHT) flags |= ST_Right;
+		// ★ GDI 的默认是**顶对齐**（DT_TOP == 0）；场景的默认是竖直居中
+		//   ⇒ 没写 DT_VCENTER 的一律按顶对齐，否则整页文字会整体下沉半行。
+		if (!(format & DT_VCENTER)) flags |= ST_Top;
+		if (format & (DT_END_ELLIPSIS | DT_PATH_ELLIPSIS | DT_WORD_ELLIPSIS)) flags |= ST_Ellipsis;
+		if (format & DT_WORDBREAK) flags |= ST_Wrap;
+		g_scene.Text(text, rect.left, rect.top, rect.right, rect.bottom,
+			SceneFontOf(font), SceneFromColorref(color), 1.0f, flags);
+	}
+
+	// 兼容层：`SceneFillRect(dc, &r, brush)` → 场景里一块实心矩形。
+	// ★ 颜色从 brush 里取：`CreateSolidBrush` 造的是 BS_SOLID，
+	//   `GetObjectW` 拿到的 `lbColor` 就是 RGB —— 调用方连改都不用改。
+	int SceneFillRect(HDC /*dc*/, const RECT* rect, HBRUSH brush)
+	{
+		using namespace R3ShieldCoreUi;
+		if (!rect || !brush) {
+			return 0;
+		}
+		LOGBRUSH lb = {};
+		if (GetObjectW(brush, sizeof(lb), &lb) != sizeof(lb) || lb.lbStyle != BS_SOLID) {
+			return 0;
+		}
+		g_scene.Fill(rect->left, rect->top, rect->right, rect->bottom,
+			SceneFromColorref(lb.lbColor));
+		return 1;
+	}
+
+	// ---------------------------------------------------------------------
+	// 内容层的**半透明**填充（v85 / v86 改成场景）
+	// ---------------------------------------------------------------------
+	//
+	// ★ 玻璃界面里不能用不透明块画行底色 —— 那等于在卡片上盖一张实色贴纸。
+	//   场景里直接给 alpha，比原来"1x1 DIB + AlphaBlend"干净得多。
+	void BlendFillRect(HDC /*dc*/, const RECT& r, COLORREF c, BYTE alpha)
+	{
+		if (r.right <= r.left || r.bottom <= r.top || alpha == 0) {
+			return;
+		}
+		g_scene.Fill(r.left, r.top, r.right, r.bottom,
+			R3ShieldCoreUi::SceneFromColorref(c), static_cast<float>(alpha) / 255.0f);
+	}
+
+	// 登记一块玻璃面板（玻璃不可用时什么也不做）。
+	//
+	// ★ 面板表登记在 `g_glass.cur[]`（本帧现场登记的），合成时才被用到 ——
+	//   所以必须在 `Compose()` **之前**调（见 ui_material.h 的三段式说明）。
+	// ★ 为什么不用 `g_scene.Panel()`：场景自己的面板表是给离屏探针
+	//   （`_t/scene_probe.cpp`）用的；主程序这条路上"面板"由合成层拥有，
+	//   两边各留一份只会让"谁才是真源"变模糊（铁律 127 的精神）。
+	void GlassPanel(int x0, int y0, int x1, int y1, float radius, float tint,
+		int kind, COLORREF c)
+	{
+		if (!g_glass.active) {
+			return;
+		}
+		g_glass.AddPanel(x0, y0, x1, y1, radius, tint, kind,
+			GetRValue(c), GetGValue(c), GetBValue(c));
 	}
 
 	// 画一条水平柱状条。value / maxValue 决定填充比例。
-	void DrawBar(HDC dc, int left, int top, int width, int height,
+	void DrawBar(HDC /*dc*/, int left, int top, int width, int height,
 		ULONGLONG value, ULONGLONG maxValue, COLORREF color)
 	{
-		RECT track = { left, top, left + width, top + height };
-		HBRUSH trackBrush = CreateSolidBrush(ColorTrack);
-		FillRect(dc, &track, trackBrush);
-		DeleteObject(trackBrush);
+		using namespace R3ShieldCoreUi;
+		// 柱状条 = 一条凹槽 + 一段有色玻璃（和滑块/开关同一套材质）。
+		const int radius = height / 2;
+		const bool filledEnough = (maxValue != 0 && value != 0);
 
-		if (maxValue == 0 || value == 0) {
+		if (g_glass.active) {
+			GlassPanel(left, top, left + width, top + height, (float)radius,
+				0.42f, 2, RGB(150, 160, 178));
+			if (!filledEnough) {
+				return;
+			}
+			float frac = static_cast<float>(static_cast<double>(value) / static_cast<double>(maxValue));
+			if (frac > 1.0f) frac = 1.0f;
+			int filled = static_cast<int>(width * frac);
+			if (filled < height) filled = height;   // 非零值至少画一颗"圆头"
+			GlassPanel(left, top, left + filled, top + height, (float)radius,
+				0.86f, 1, color);
 			return;
 		}
 
-		ULONGLONG filled = (static_cast<ULONGLONG>(width) * value) / maxValue;
-		if (filled == 0) {
-			filled = 2; // 非零值至少画一点点，表示"有"
+		// ---- 经典（无玻璃）：凹槽 + 实色填充，v82 原样 ----
+		g_scene.Round(left, top, left + width, top + height, (float)radius,
+			SceneRgb(232, 236, 242));
+		if (!filledEnough) {
+			return;
 		}
-
-		RECT fill = { left, top, left + static_cast<int>(filled), top + height };
-		HBRUSH fillBrush = CreateSolidBrush(color);
-		FillRect(dc, &fill, fillBrush);
-		DeleteObject(fillBrush);
+		float frac = static_cast<float>(static_cast<double>(value) / static_cast<double>(maxValue));
+		if (frac > 1.0f) frac = 1.0f;
+		int filled = static_cast<int>(width * frac);
+		if (filled < height) filled = height;
+		g_scene.Round(left, top, left + filled, top + height, (float)radius,
+			SceneFromColorref(color));
 	}
 
 	COLORREF DecisionColor(R3ShieldCore::Decision decision)
@@ -684,10 +1124,9 @@ namespace
 		return buffer;
 	}
 
-	void DrawOverview(HDC dc, int& y, const R3ShieldCoreStats::Snapshot& snapshot, ULONG injectedTotal)
+	void DrawOverview(HDC dc, const RECT* cards, const R3ShieldCoreStats::Snapshot& snapshot,
+		ULONG injectedTotal)
 	{
-		const int columnWidth = (ClientWidth() - Padding * 2) / 3;
-
 		struct Metric
 		{
 			PCWSTR label;
@@ -723,19 +1162,22 @@ namespace
 			metrics[0].label = L"运行时长（本次）";
 		}
 
+		// ★ v87：三张**各自独立**的卡片（原来是不带卡的三列文字）。
+		//   参考项目里每一组数据都住在自己的玻璃块里，靠缝分隔；三列文字浮在
+		//   同一片底色上，看起来像"一段说明"而不是"三个指标"。
 		for (int i = 0; i < 3; i++) {
-			int left = Padding + i * columnWidth;
+			const RECT& card = cards[i];
 
-			RECT labelRect = { left, y, left + columnWidth, y + 16 };
-			DrawTextSimple(dc, metrics[i].label, labelRect, g_labelFont, ColorTextSecondary,
+			RECT labelRect = { card.left + CardPad, card.top + 15,
+				card.right - CardPad, card.top + 33 };
+			DrawTextSimple(dc, metrics[i].label, labelRect, g_labelFont, DimColor(),
 				DT_LEFT | DT_SINGLELINE);
 
-			RECT valueRect = { left, y + 18, left + columnWidth, y + 44 };
-			DrawTextSimple(dc, metrics[i].value.c_str(), valueRect, g_valueFont, ColorTextPrimary,
+			RECT valueRect = { card.left + CardPad, card.top + 36,
+				card.right - CardPad, card.bottom - 10 };
+			DrawTextSimple(dc, metrics[i].value.c_str(), valueRect, g_valueFont, InkColor(),
 				DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS);
 		}
-
-		y += 58;
 	}
 
 	// 模式短名（徽章 / 切换按钮共用）。
@@ -906,21 +1348,24 @@ namespace
 		border = ColorAccent;
 		textColor = ColorAccent;
 
-		// ★ v83：主按钮 = 更"厚"一点的小玻璃片（tint 比普通按钮高 2 档），
-		//   强调色留在文字与下划线上。
+		// ★★ v85：主按钮 = **蓝玻璃胶囊 + 白字**。
+		//
+		//   v83/v84 的做法是"白玻璃 + 蓝色文字 + 蓝色下划线"，理由是
+		//   "彩色玻璃会变成实色贴纸"。结论对了一半：**浅色**玻璃上铺颜色确实脏，
+		//   但参考项目的做法是**反过来** —— 玻璃掺得很实（0.88）、文字用**白色**，
+		//   于是它读起来是"一块发光的蓝玻璃"，不是贴纸。
+		//   蓝底白字对比度也远高于白底蓝字。
 		if (g_glass.active) {
+			// ★ v93：主按钮同样走逐帧插值（悬停淡入 + 按下缩 2.8%）。
+			//   这一颗是顶栏最显眼的按钮，跳变最扎眼。
 			const ButtonState state = StateOf(HeaderAction::ModeSwitch);
-			float tint = 0.22f;
-			if (state == ButtonState::Hover) { tint = 0.30f; }
-			if (state == ButtonState::Pressed) { tint = 0.36f; }
-			g_glass.AddPanel(rect.left, rect.top, rect.right, rect.bottom,
-				(rect.bottom - rect.top) * 0.5f, tint, 1);
-			{
-				RECT underline = { rect.left + 12, rect.bottom - 4, rect.right - 12, rect.bottom - 3 };
-				HBRUSH ub = CreateSolidBrush(ColorAccent);
-				FillRect(dc, &underline, ub);
-				DeleteObject(ub);
-			}
+			R3ShieldCoreUi::Anim::Slot& mb =
+				g_anim.Get(AnimKey(rect.left, rect.top), 0.0f);
+			mb.hoverTgt = (state == ButtonState::Hover || state == ButtonState::Pressed)
+				? 1.0f : 0.0f;
+			mb.press.tgt = (state == ButtonState::Pressed) ? 1.0f : 0.0f;
+			UiCtl::Pill(g_ui, rect, UiCtl::Btn::Primary, mb.hover, mb.press.v);
+			textColor = RGB(255, 255, 255);
 		} else {
 			HBRUSH brush = CreateSolidBrush(background);
 			HGDIOBJ oldBrush = SelectObject(dc, brush);
@@ -947,8 +1392,15 @@ namespace
 	//
 	// id 用来查三态（悬停/按下）—— 和 HitTestHeaderAction 用的是同一套 id，
 	// 所以"画成什么样"和"点到哪个"不可能对不上。
+	// `quiet`：**安静档**。玻璃模式下常态不铺胶囊，只留一行字（悬停才浮出来）。
+	//
+	// ★ v87：页签那一行挤了 11 个元素（6 个页签 + 5 个动作）。如果每个动作都是
+	//   一块胶囊玻璃，整行读起来就是"11 个同等重要的按钮"—— 主次全丢，
+	//   而且胶囊边缘互相顶在一起，比"都靠边"更显脏。
+	//   参考项目里一行最多两个胶囊（Continue / Cancel），其余都是纯文字。
+	//   ⇒ 三个次要动作（复制日志 x2 / 清空统计）降到安静档，主次立刻出来。
 	void DrawActionButton(HDC dc, HeaderAction id, const RECT& rect, PCWSTR text,
-		bool active, COLORREF accent = ColorAccent, bool danger = false)
+		bool active, COLORREF accent = ColorAccent, bool danger = false, bool quiet = false)
 	{
 		const ButtonState state = StateOf(id);
 		COLORREF background = ColorHeaderBackground;
@@ -956,18 +1408,46 @@ namespace
 		COLORREF textColor = ColorTextSecondary;
 		ButtonColors(active, danger, state, &background, &border, &textColor);
 
-		// ★ v83：按钮 = 一块小玻璃片。语义（危险=红 / 生效=强调色 / 三态）全部
-		//   保留在 **文字色** 上；底色只表达"玻璃的厚度"（tint 随三态变化）。
-		//   ★ 为什么不把语义色也铺到玻璃上：玻璃是半透明的，一铺色整块就变成
-		//     "实色贴纸"，反而丢掉材质感；而且深色文字压在饱和底色上更难读。
+		// ★★ v85：语义色**铺到玻璃上**（参考项目就是这个做法）。
+		//   危险 = 红玻璃白字；生效 = 强调色玻璃白字；中性 = 白玻璃深色字。
+		//   三档之间一眼就能分出来，不再靠一条 1px 下划线去暗示。
+		//
+		// ★★★ v93：悬停 / 按下从"三态跳变"改成**逐帧插值**。
+		//   参考项目 drawBtn 里是 `c.hover`（14/s 指数逼近）和 `c.press`
+		//   （弹簧 k=720 d=42），按下时整块缩 2.8%。这里是同一组参数。
+		//   三态仍然决定**目标值**，只是不再直接当开关用。
 		if (g_glass.active) {
-			float tint = 0.16f;
-			if (state == ButtonState::Hover) { tint = 0.24f; }
-			if (state == ButtonState::Pressed) { tint = 0.32f; }
-			if (active) { tint += 0.10f; }
-			if (danger) { tint += 0.03f; }
-			g_glass.AddPanel(rect.left, rect.top, rect.right, rect.bottom,
-				(rect.bottom - rect.top) * 0.5f, tint, 1);
+			R3ShieldCoreUi::Anim::Slot& a = g_anim.Get(AnimKey(rect.left, rect.top), 0.0f);
+			a.hoverTgt = (state == ButtonState::Hover || state == ButtonState::Pressed) ? 1.0f : 0.0f;
+			a.press.tgt = (state == ButtonState::Pressed) ? 1.0f : 0.0f;
+			const float hoverK = a.hover;
+			const float pressK = a.press.v;
+
+			if (danger) {
+				UiCtl::Pill(g_ui, rect, UiCtl::Btn::Danger, hoverK, pressK);
+				textColor = RGB(255, 255, 255);
+			} else if (active) {
+				UiCtl::PillTone(g_ui, rect, UiCtl::FromColor(accent), 0.86f, hoverK, pressK);
+				textColor = RGB(255, 255, 255);
+			} else if (quiet && state == ButtonState::Normal) {
+				// ★★ v88：安静档从"只有文字"改成"极淡的一层玻璃"。
+				//
+				//   上一版（v87）常态什么都不画，本意是让这三个次要动作退到
+				//   背景里、不和页签凹槽抢注意力。但实测（日志页截图）：
+				//   三个 6 字标签之间只有 8px 缝，**没有底色就没有边界** ——
+				//   「复制全部日志」和「复制日志路径」连起来读成了
+				//   「复制全部日志复制日志路径」一长串。
+				//   参考项目的次按钮（Cancel / Details）也是"浅胶囊 + 8px 缝"，
+				//   靠一块很淡的底划界，不靠留白。所以退回浅胶囊，
+				//   只是掺色压到 0.30（页签凹槽是 0.55）—— 层级仍在页签之下。
+				UiCtl::PillTone(g_ui, rect, UiCtl::Raised, 0.30f, hoverK, pressK);
+				textColor = UiCtl::ToColor(UiCtl::Dim);
+			} else {
+				UiCtl::Pill(g_ui, rect, UiCtl::Btn::Glass, hoverK, pressK);
+				// 文字色也跟着插值：从 Dim 走到 Ink，不是"一到悬停就跳黑"。
+				textColor = UiCtl::ToColor(
+					UiCtl::Mix(UiCtl::Dim, UiCtl::Ink, hoverK));
+			}
 		} else {
 			HBRUSH brush = CreateSolidBrush(background);
 			HPEN pen = CreatePen(PS_SOLID, 1, border);
@@ -987,14 +1467,8 @@ namespace
 		}
 		DrawTextSimple(dc, text, textRect, g_tabFont, textColor,
 			DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-
-		// 生效态：底部一条 1px 的语义色下划线（代替原来的实底高亮）
-		if (g_glass.active && active) {
-			RECT underline = { rect.left + 12, rect.bottom - 4, rect.right - 12, rect.bottom - 3 };
-			HBRUSH ub = CreateSolidBrush(border);
-			FillRect(dc, &underline, ub);
-			DeleteObject(ub);
-		}
+		// ★ v85：玻璃模式下不再画那条 1px 下划线 —— 生效态已经靠
+		//   "整块彩色玻璃 + 白字"表达，再叠一条线就是冗余。
 	}
 
 	void DrawHeaderActions(HDC dc)
@@ -1012,13 +1486,15 @@ namespace
 				? L"已复制" : L"复制失败";
 			copyLogsActive = (g_copyLogsFeedback == CopyLogsFeedback::Copied);
 		}
+		// ★ v87：这三个是**安静档**（最后一个参数 true）—— 常态只留文字，
+		//   悬停才浮出胶囊。理由见 DrawActionButton 的注释。
 		DrawActionButton(dc, HeaderAction::CopyAllLogs, CopyAllLogsButtonRect(),
-			copyLogsLabel, copyLogsActive);
+			copyLogsLabel, copyLogsActive, ColorAccent, false, true);
 
 		DrawActionButton(dc, HeaderAction::CopyLogPath, CopyLogButtonRect(),
-			L"复制日志路径", false);
+			L"复制日志路径", false, ColorAccent, false, true);
 		DrawActionButton(dc, HeaderAction::ClearStats, ClearStatsButtonRect(),
-			L"清空统计", false);
+			L"清空统计", false, ColorAccent, false, true);
 	}
 
 	// 标题区右侧的两个置顶开关。默认置顶高亮 = 普通档生效；
@@ -1468,7 +1944,14 @@ namespace
 				DWORD childPid = 0;
 				DWORD error = ERROR_SUCCESS;
 				if (R3ShieldCoreSuperDesk::LaunchUiAccessInstance(GetCurrentProcessId(), &childPid, &error)) {
-					printf("[gui] UIAccess handoff complete child=%lu; requesting engine shutdown\n",
+					// ★ v102：文案从 "requesting engine shutdown" 改成 "detaching"。
+					//   旧文案是 v89 拆进程**之前**留下的：那时引擎活在界面进程里，
+					//   界面重启必须把引擎一起停掉重建。拆完之后引擎是独立进程，
+					//   界面重启只是**让出**管道，引擎继续防护、由新实例接管。
+					//   ★ 这句日志是排障第一现场 —— 文案写错会把人直接带偏
+					//   （上一轮就是照着 "requesting engine shutdown" 去查引擎为什么没起来）。
+					printf("[gui] UIAccess handoff complete child=%lu; detaching from engine"
+						" (engine keeps running)\n",
 						static_cast<unsigned long>(childPid));
 					InterlockedExchange(&g_uiAccessRestartRequest, 1);
 					return;
@@ -1528,56 +2011,183 @@ namespace
 	{
 		PCWSTR text = L"LOG";
 		COLORREF color = RGB(160, 160, 160);
+		// ★ v88：中性档标记。LOG = "只记录、不拦截"，它**没有**要强调的语义，
+		//   而原来给的是 RGB(160,160,160) 掺 0.86 —— 一块深灰实底 + 白字，
+		//   成了整个顶栏最重的一块色，比 BLOCK 还抢眼，语义正好反了。
+		//   现在中性档走浅玻璃 + 墨色字：它是一枚"状态标签"，不是一枚"告警"。
+		bool neutral = true;
 
 		switch (static_cast<R3ShieldCore::Mode>(InterlockedCompareExchange(&g_displayMode, 0, 0))) {
 		case R3ShieldCore::Mode::Block:
 			text = L"BLOCK";
 			color = ColorBlocked;
+			neutral = false;
 			break;
 		case R3ShieldCore::Mode::Ask:
 			text = L"ASK";
 			color = ColorWouldBlock;
+			neutral = false;
 			break;
 		case R3ShieldCore::Mode::BlockAll:
 			text = L"全拦";
 			color = ColorBlockAll;
+			neutral = false;
 			break;
 		case R3ShieldCore::Mode::BlockAllSafe:
 			// 用同一个破坏性配色（它同属"全拦"家族），只是文案区分。
 			text = L"全拦·安全";
 			color = ColorBlockAll;
+			neutral = false;
 			break;
 		default:
 			break;
 		}
 
+		// ★ v91：引擎没连上 ⇒ 徽章直接说"未连接"。
+		//
+		//   为什么不照旧显示真实模式：模式切换必须经引擎才生效，连不上时点按钮
+		//   **一定**失败，而失败原因只进日志（界面是 WINDOWS 子系统，没有控制台；
+		//   日志运行期还独占打不开）⇒ 用户看到的就是"点了完全没反应"。
+		//   徽章上把状态写出来，比"显示一个切不动的模式"诚实（铁律 97）。
+		if (InterlockedCompareExchange(&g_engineConnected, 0, 0) == 0) {
+			text = L"未连接";
+			color = ColorWouldBlock;   // 复用警示色：这确实是异常状态
+			neutral = false;
+		}
+
 		// 尺寸走文件头的共用常量 —— 置顶按钮靠它右对齐，两边必须同源。
-		int left = ClientWidth() - Padding - ModeBadgeWidth;
+		int left = ModeBadgeLeft();
 
 		RECT badge = { left, top, left + ModeBadgeWidth, top + ModeBadgeHeight };
-		HBRUSH brush = CreateSolidBrush(color);
-		HGDIOBJ oldBrush = SelectObject(dc, brush);
-		HPEN pen = CreatePen(PS_SOLID, 1, color);
-		HGDIOBJ oldPen = SelectObject(dc, pen);
-		RoundRect(dc, badge.left, badge.top, badge.right, badge.bottom, 13, 13);
-		SelectObject(dc, oldBrush);
-		SelectObject(dc, oldPen);
-		DeleteObject(brush);
-		DeleteObject(pen);
 
-		DrawTextSimple(dc, text, badge, g_labelFont, RGB(255, 255, 255),
+		// ★ v85：徽章 = 一块**该模式语义色**的实玻璃（掺 0.86），白字。
+		//   原来那个实色 RoundRect 在玻璃界面上像一张贴纸 —— 它下面没有
+		//   任何模糊背景透上来，一眼就看得出"这块不是材质"。
+		if (g_glass.active) {
+			if (neutral) {
+				// 中性档：浅玻璃（Raised 掺 0.52），和页签凹槽是同一个明度家族。
+				UiCtl::Badge(g_ui, badge, UiCtl::Raised, 0.52f);
+			} else {
+				UiCtl::Badge(g_ui, badge, UiCtl::FromColor(color), 0.86f);
+			}
+		} else {
+			HBRUSH brush = CreateSolidBrush(color);
+			HGDIOBJ oldBrush = SelectObject(dc, brush);
+			HPEN pen = CreatePen(PS_SOLID, 1, color);
+			HGDIOBJ oldPen = SelectObject(dc, pen);
+			RoundRect(dc, badge.left, badge.top, badge.right, badge.bottom, 13, 13);
+			SelectObject(dc, oldBrush);
+			SelectObject(dc, oldPen);
+			DeleteObject(brush);
+			DeleteObject(pen);
+		}
+
+		// 中性档的底是浅玻璃 ⇒ 文字必须是墨色；彩色档（BLOCK/ASK/全拦）
+		// 掺 0.86 足够深，白字才站得住。
+		const COLORREF badgeText = (g_glass.active && neutral)
+			? UiCtl::ToColor(UiCtl::Ink) : RGB(255, 255, 255);
+		DrawTextSimple(dc, text, badge, g_labelFont, badgeText,
 			DT_CENTER | DT_VCENTER | DT_SINGLELINE);
 	}
 
-	void DrawDecisionBreakdown(HDC dc, int& y, const R3ShieldCoreStats::Snapshot& snapshot)
+	// ★★★ v98/v99：三个窗口按钮。
+	//
+	//   字形**不用字体画，用几何图形画**。这不是洁癖，是被坑出来的：
+	//   第一版用文本字形（− / □ / ✕），其中 U+2715 ✕ 在 `Microsoft YaHei UI`
+	//   里**根本不存在**（`GetGlyphIndicesW` 返回 0xFFFF），画出来是空白 ——
+	//   于是"关闭按钮看不见，但点上去照样关窗口"（命中测试用矩形，不看字形）。
+	//   换 `Segoe MDL2 Assets` 的原生码位（E921/E922/E8BB）也不行：本项目
+	//   内容层走 `ui_scene.h` 的自带光栅器，它按 (字号,字重) 自己建字体
+	//   （`FontFor`），**根本不看调用方传的 HFONT** ⇒ 私有区码位落到
+	//   YaHei 的 .notdef，三个按钮画出同一个方框。
+	//   ⇒ 一律用 `g_scene.Round()` 画线：不依赖任何字体，1px 精度可控。
+	//     这本来也是 Windows 自己画标题栏按钮的方式。
+	void DrawCaptionButtons(HDC dc)
 	{
-		RECT headerRect = { Padding, y, ClientWidth() - Padding, y + 20 };
-		DrawTextSimple(dc, L"决策分布", headerRect, g_labelFont, ColorTextPrimary, DT_LEFT | DT_SINGLELINE);
-		y += 26;
+		(void)dc;
+		if (!g_glass.active) {
+			return;   // 经典模式没有自绘标题栏（还留着系统标题栏）
+		}
+		const bool zoomed = IsZoomed(g_window) != FALSE;
+		const CapBtn ids[3] = { CapBtn::Min, CapBtn::Max, CapBtn::Close };
 
-		constexpr int barLeft = Padding + 96;
-		constexpr int barWidth = 240;
-		const int valueLeft = barLeft + barWidth + 12;
+		for (int i = 0; i < 3; ++i) {
+			RECT r = CapButtonRect(i);
+			const bool hot = (g_capHover == ids[i]);
+			if (hot) {
+				if (ids[i] == CapBtn::Close) {
+					UiCtl::PillTone(g_ui, r, UiCtl::Red, 0.82f, 1.0f, 0.0f);
+				} else {
+					UiCtl::PillTone(g_ui, r, UiCtl::Raised, 0.42f, 1.0f, 0.0f);
+				}
+			}
+			const COLORREF gc = hot
+				? (ids[i] == CapBtn::Close ? RGB(255, 255, 255) : UiCtl::ToColor(UiCtl::Ink))
+				: UiCtl::ToColor(UiCtl::Dim);
+			const unsigned col = R3ShieldCoreUi::SceneFromColorref(gc);
+			const int cx = (r.left + r.right) / 2;
+			const int cy = (r.top + r.bottom) / 2;
+			auto bar = [&](int x0, int y0, int x1, int y1) {
+				g_scene.Round(x0, y0, x1, y1, 0.0f, col, 1.0f);
+			};
+
+			if (ids[i] == CapBtn::Min) {
+				bar(cx - 5, cy, cx + 5, cy + 1);
+			} else if (ids[i] == CapBtn::Max && !zoomed) {
+				const int h = 4;
+				bar(cx - h, cy - h, cx + h + 1, cy - h + 1);   // 上
+				bar(cx - h, cy + h, cx + h + 1, cy + h + 1);   // 下
+				bar(cx - h, cy - h, cx - h + 1, cy + h + 1);   // 左
+				bar(cx + h, cy - h, cx + h + 1, cy + h + 1);   // 右
+			} else if (ids[i] == CapBtn::Max) {
+				// 还原：两个错开 2px 的方框（后框只画上/左两条边，被前框压住）
+				const int h = 4;
+				bar(cx - h - 2, cy - h - 2, cx + h - 1, cy - h - 1);
+				bar(cx - h - 2, cy - h - 2, cx - h - 1, cy + h - 1);
+				bar(cx - h + 1, cy - h + 1, cx + h + 1, cy - h + 2);
+				bar(cx - h + 1, cy + h, cx + h + 1, cy + h + 1);
+				bar(cx - h + 1, cy - h + 1, cx - h + 2, cy + h + 1);
+				bar(cx + h, cy - h + 1, cx + h + 1, cy + h + 1);
+			} else {
+				// 关闭：1px 步进的 45° 斜线 —— 每步正好一格，就是 Bresenham，
+				// 不需要三角剖分，也不会出现台阶。
+				// 每步画 2x1 而不是 1x1：纯 1px 的对角线像素密度只有横线的一半，
+				// 看上去会"比 − 和 □ 淡一档"。加宽一格刚好补回来。
+				for (int k = -4; k <= 4; ++k) {
+					bar(cx + k, cy + k, cx + k + 2, cy + k + 1);
+					bar(cx + k, cy - k, cx + k + 2, cy - k + 1);
+				}
+			}
+		}
+	}
+
+	void DrawDecisionBreakdown(HDC dc, const RECT& card, const R3ShieldCoreStats::Snapshot& snapshot)
+	{
+		const int left = card.left + CardPad;
+		const int right = card.right - CardPad;
+
+		RECT headerRect = { left, card.top + CardPad, right, card.top + CardPad + 20 };
+		// v88：与 DrawPanel 的卡片标题同色（分组标签一档），否则同一页上
+		// 会出现两种"卡片标题"，一个深一个浅。
+		DrawTextSimple(dc, L"决策分布", headerRect, g_labelFont, FaintColor(), DT_LEFT | DT_SINGLELINE);
+
+		int y = card.top + CardPad + 28;
+
+		// 柱状条按卡片宽度算：标签列固定 104，数值列固定 52，剩下的都给条。
+		// ★ 不能写死宽度 —— 窗口能拉宽，写死的话条会浮在卡片左边、右边空一大片。
+		//
+		// ★★ v88：标签从**右对齐**改成**左对齐**。
+		//   右对齐时短标签（SPOOF/ALLOW）会缩到条边上，卡片左边 100px 全是空白，
+		//   而"WOULD-BLOCK"又把整列撑到最长 —— 视觉上像"半个卡片是空的"。
+		//   左对齐 + 固定列宽后，四个标签从同一条竖线起，条也从同一条竖线起。
+		constexpr int labelW = 104;
+		constexpr int valueW = 52;
+		const int barLeft = left + labelW + 8;
+		int barWidth = right - valueW - 8 - barLeft;
+		if (barWidth < 40) {
+			barWidth = 40;
+		}
+		const int valueLeft = right - valueW;
 
 		ULONGLONG maxValue = 0;
 		for (ULONG count : snapshot.DecisionCounts) {
@@ -1608,65 +2218,42 @@ namespace
 				break;
 			}
 
-			RECT labelRect = { Padding, y + 4, barLeft - 8, y + 24 };
-			DrawTextSimple(dc, label, labelRect, g_monoFont, ColorTextSecondary,
-				DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
+			// ★ DT_END_ELLIPSIS 是**保险**：文本比矩形宽时，GDI 会
+			//   从矩形右缘**往外**画（不裁剪、不报错）—— 自绘界面里就是"字跑到卡片外面"。
+			RECT labelRect = { left, y + 4, barLeft - 8, y + 24 };
+			DrawTextSimple(dc, label, labelRect, g_monoFont, FaintColor(),
+				DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
 
 			DrawBar(dc, barLeft, y + 6, barWidth, 14,
 				snapshot.DecisionCounts[i], maxValue, DecisionColor(decision));
 
-			RECT valueRect = { valueLeft, y + 4, ClientWidth() - Padding, y + 24 };
+			RECT valueRect = { valueLeft, y + 4, right, y + 24 };
 			std::wstring value = FormatNumber(snapshot.DecisionCounts[i]);
-			DrawTextSimple(dc, value.c_str(), valueRect, g_monoFont, ColorTextPrimary,
-				DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+			DrawTextSimple(dc, value.c_str(), valueRect, g_monoFont, InkColor(),
+				DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
 
-			y += 24;
+			y += 32;
 		}
-
-		y += 12;
 	}
 
-	void DrawOpBreakdown(HDC dc, int& y, const R3ShieldCoreStats::Snapshot& snapshot, int maxRows)
+	void DrawOpBreakdown(HDC dc, const RECT& card, const R3ShieldCoreStats::Snapshot& snapshot, int maxRows)
 	{
-		RECT headerRect = { Padding, y, ClientWidth() - Padding, y + 20 };
-		DrawTextSimple(dc, L"操作分布（按次数）", headerRect, g_labelFont, ColorTextPrimary, DT_LEFT | DT_SINGLELINE);
+		const int left = card.left + CardPad;
+		const int right = card.right - CardPad;
 
-		// 图例：各类各自用**本色**画类型名，从右往左排。
-		// ⚠️ 原来是一整条字符串「蓝=注册表 绿=文件 紫=进程 …」，九个条目实测约
-		// 515px（g_labelFont 13px × 汉字宽），和左边的标题（20~137px）画在同一行
-		// 会**叠字** —— 560px 窗口根本放不下。改成只写类型名 + 本色：
-		// 又短，又不用再维护"色名"和实际柱色两套对应关系（旧文案里"蓝=注册表"
-		// 本身就是错的，注册表柱一直是 ColorTextSecondary 灰）。
+		RECT headerRect = { left, card.top + CardPad, right, card.top + CardPad + 20 };
+		DrawTextSimple(dc, L"操作分布（按次数）", headerRect, g_labelFont, FaintColor(),
+			DT_LEFT | DT_SINGLELINE);
+
+		// ★★ v87：**删掉**了原来挤在标题右边的那 15 条彩色图例。
 		//
-		// ⚠️ ABI v10 后是 12 类，全部平铺实测会超出 560px 窗口宽度。
-		//    这里从最小行高挤出一行显示后半段（前 6 类），或者叫用户拉宽窗口。
-		//    先把图例截到窗口内：从右往左画，画到 x < 标题右缘就停。
-		{
-			constexpr int legendMinX = 170; // 标题「操作分布（按次数）」右缘预留
-			int x = ClientWidth() - Padding;
-			bool drewAny = false;
-			for (int i = static_cast<int>(R3ShieldCore::ObjectType::ScheduledTask); i >= 0; i--) {
-				const ULONG type = static_cast<ULONG>(i);
-				PCWSTR label = ObjectTypeLabel(type);
+		//   它本来是"类型 -> 颜色"的对照表，但 15 个中文词平铺在同一行里，
+		//   和左边的标题几乎贴在一起，读起来是一片彩色的噪点（v82 的注释里
+		//   已经记过"和标题叠字"，当时只是把字号/起点调了调，没解决根本问题）。
+		//   现在改成**每行操作名前面一个色点**：颜色和类型的对应关系不用再记，
+		//   看哪行就是哪行 —— 参考项目里也没有图例，靠颜色本身说话。
+		int y = card.top + CardPad + 28;
 
-				SIZE size = {};
-				GetTextExtentPoint32W(dc, label, lstrlenW(label), &size);
-
-				if (x - size.cx < legendMinX) {
-					break;
-				}
-
-				x -= size.cx;
-				RECT itemRect = { x, y, x + size.cx + 2, y + 20 };
-				DrawTextSimple(dc, label, itemRect, g_labelFont, ObjectTypeColor(type),
-					DT_LEFT | DT_SINGLELINE);
-
-				x -= 8; // 条目间距
-				drewAny = true;
-			}
-			(void)drewAny;
-		}
-		y += 26;
 
 		// 收集并排序
 		struct OpEntry
@@ -1748,10 +2335,9 @@ namespace
 			[](const OpEntry& a, const OpEntry& b) { return a.count > b.count; });
 
 		if (merged.empty()) {
-			RECT emptyRect = { Padding, y, ClientWidth() - Padding, y + 24 };
-			DrawTextSimple(dc, L"(暂无数据)", emptyRect, g_labelFont, ColorTextSecondary,
+			RECT emptyRect = { left, y, right, y + 24 };
+			DrawTextSimple(dc, L"(暂无数据)", emptyRect, g_labelFont, FaintColor(),
 				DT_LEFT | DT_SINGLELINE);
-			y += 34;
 			return;
 		}
 
@@ -1761,9 +2347,17 @@ namespace
 		}
 		ULONG maxCount = merged[0].count;
 
-		constexpr int barLeft = Padding + 160;
-		constexpr int barWidth = 170;
-		const int valueLeft = barLeft + barWidth + 12;
+		// ★ v88：与「决策分布」同一套列宽/对齐（左对齐标签 + 右对齐数值），
+		//   两卡片并排时列线才会齐；原来是 118/52 且数值左对齐，两张卡的
+		//   条起点和数字位置都差几个像素，看起来像"两张没对齐的图"。
+		constexpr int labelW = 124;
+		constexpr int valueW = 52;
+		const int barLeft = left + labelW + 8;
+		int barWidth = right - valueW - 8 - barLeft;
+		if (barWidth < 40) {
+			barWidth = 40;
+		}
+		const int valueLeft = right - valueW;
 
 		for (size_t i = 0; i < count; i++) {
 			// 名字必须按来源翻：文件 op 走 FileOpName、进程走 ProcessOpName……
@@ -1773,42 +2367,60 @@ namespace
 			WCHAR label[64] = {};
 			MultiByteToWideChar(CP_ACP, 0, rawName, -1, label, _countof(label));
 
-			RECT labelRect = { Padding, y + 4, barLeft - 8, y + 24 };
-			DrawTextSimple(dc, label, labelRect, g_monoFont, ColorTextSecondary,
-				DT_RIGHT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+			// 色点：类型 -> 颜色，6px 的小圆，替代原来那排图例。
+			const COLORREF typeColor = ObjectTypeColor(merged[i].objectType);
+			if (g_glass.active) {
+				UiCtl::Piece(g_ui, left, y + 9, left + 6, y + 15, 3.0f, 0.92f,
+					UiCtl::FromColor(typeColor), UiCtl::KPiece);
+			} else {
+				RECT dot = { left, y + 9, left + 6, y + 15 };
+				HBRUSH dotBrush = CreateSolidBrush(typeColor);
+				SceneFillRect(dc, &dot, dotBrush);
+				DeleteObject(dotBrush);
+			}
+
+			RECT labelRect = { left + 12, y + 4, barLeft - 8, y + 24 };
+			DrawTextSimple(dc, label, labelRect, g_monoFont, FaintColor(),
+				DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
 
 			DrawBar(dc, barLeft, y + 6, barWidth, 14, merged[i].count, maxCount,
-				ObjectTypeColor(merged[i].objectType));
+				typeColor);
 
-			RECT valueRect = { valueLeft, y + 4, ClientWidth() - Padding, y + 24 };
+			RECT valueRect = { valueLeft, y + 4, right, y + 24 };
 			std::wstring value = FormatNumber(merged[i].count);
-			DrawTextSimple(dc, value.c_str(), valueRect, g_monoFont, ColorTextPrimary,
-				DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+			DrawTextSimple(dc, value.c_str(), valueRect, g_monoFont, InkColor(),
+				DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
 
-			y += 24;
+			y += 32;
 		}
-
-		y += 12;
 	}
 
-	void DrawTopProcesses(HDC dc, int& y, const R3ShieldCoreStats::Snapshot& snapshot, int maxRows)
+	void DrawTopProcesses(HDC dc, const RECT& card, const R3ShieldCoreStats::Snapshot& snapshot, int maxRows)
 	{
-		RECT headerRect = { Padding, y, ClientWidth() - Padding, y + 20 };
-		DrawTextSimple(dc, L"触发最多的进程", headerRect, g_labelFont, ColorTextPrimary, DT_LEFT | DT_SINGLELINE);
-		y += 26;
+		const int left = card.left + CardPad;
+		const int right = card.right - CardPad;
+
+		RECT headerRect = { left, card.top + CardPad, right, card.top + CardPad + 20 };
+		DrawTextSimple(dc, L"触发最多的进程", headerRect, g_labelFont, FaintColor(), DT_LEFT | DT_SINGLELINE);
+
+		int y = card.top + CardPad + 28;
 
 		if (snapshot.TopProcesses.empty() || maxRows <= 0) {
-			RECT emptyRect = { Padding, y, ClientWidth() - Padding, y + 24 };
-			DrawTextSimple(dc, L"(暂无数据)", emptyRect, g_labelFont, ColorTextSecondary,
+			RECT emptyRect = { left, y, right, y + 24 };
+			DrawTextSimple(dc, L"(暂无数据)", emptyRect, g_labelFont, FaintColor(),
 				DT_LEFT | DT_SINGLELINE);
-			y += 34;
 			return;
 		}
 
 		ULONG maxTotal = snapshot.TopProcesses.front().Total;
-		constexpr int barLeft = Padding + 220;
-		constexpr int barWidth = 150;
-		const int valueLeft = barLeft + barWidth + 12;
+		constexpr int labelW = 210;
+		constexpr int valueW = 120;
+		const int barLeft = left + labelW;
+		int barWidth = right - valueW - 10 - barLeft;
+		if (barWidth < 60) {
+			barWidth = 60;
+		}
+		const int valueLeft = barLeft + barWidth + 10;
 
 		size_t count = snapshot.TopProcesses.size() < 6 ? snapshot.TopProcesses.size() : 6;
 		if (static_cast<int>(count) > maxRows) {
@@ -1821,27 +2433,25 @@ namespace
 				? (L"PID " + std::to_wstring(process.ProcessId))
 				: (process.Name + L" (" + std::to_wstring(process.ProcessId) + L")");
 
-			RECT labelRect = { Padding, y + 4, barLeft - 8, y + 24 };
-			DrawTextSimple(dc, name.c_str(), labelRect, g_monoFont, ColorTextSecondary,
+			RECT labelRect = { left, y + 4, barLeft - 8, y + 24 };
+			DrawTextSimple(dc, name.c_str(), labelRect, g_monoFont, FaintColor(),
 				DT_RIGHT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
 
 			// 被拦的部分用红色叠在上面，一眼看出"谁被拦得最多"。
 			COLORREF color = process.Blocked > 0 ? ColorBlocked : ColorAccent;
 			DrawBar(dc, barLeft, y + 6, barWidth, 14, process.Total, maxTotal, color);
 
-			RECT valueRect = { valueLeft, y + 4, ClientWidth() - Padding, y + 24 };
+			RECT valueRect = { valueLeft, y + 4, right, y + 24 };
 			std::wstring value = FormatNumber(process.Total);
 			if (process.Blocked > 0) {
 				value += L"  (拦 " + FormatNumber(process.Blocked) + L")";
 			}
 
-			DrawTextSimple(dc, value.c_str(), valueRect, g_monoFont, ColorTextPrimary,
+			DrawTextSimple(dc, value.c_str(), valueRect, g_monoFont, InkColor(),
 				DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
 
-			y += 24;
+			y += 26;
 		}
-
-		y += 12;
 	}
 
 	void DrawPromptSummary(HDC dc, int clientHeight, const R3ShieldCoreStats::Snapshot& snapshot)
@@ -1850,10 +2460,18 @@ namespace
 		// 用窗口常量会让这一栏跑到可视区外面去。
 		const int top = clientHeight - PromptSummaryHeight();
 
-		RECT separator = { Padding, top, ClientWidth() - Padding, top + 1 };
-		HBRUSH brush = CreateSolidBrush(ColorBorder);
-		FillRect(dc, &separator, brush);
-		DeleteObject(brush);
+		// ★ v85：底部这一栏也垫玻璃 —— 它是"状态条"，浮在最下面一层，
+		//   和上面的内容卡同材质才像一个整体。分隔线在玻璃模式下不画
+		//   （卡的边+投影已经够了，再压一条实线反而脏）。
+		if (g_glass.active) {
+			RECT bar = { Padding - 12, top + 4, ClientWidth() - Padding + 12, clientHeight - 4 };
+			UiCtl::Card(g_ui, bar, 0.44f);
+		} else {
+			RECT separator = { Padding, top, ClientWidth() - Padding, top + 1 };
+			HBRUSH brush = CreateSolidBrush(ColorBorder);
+			SceneFillRect(dc, &separator, brush);
+			DeleteObject(brush);
+		}
 
 		// 询问统计记在 DLL 侧（弹窗发生在被注入进程的 hook 里），
 		// 由主循环读回来后推给 R3ShieldCoreStats，这里只读快照。
@@ -1969,9 +2587,9 @@ namespace
 		// ★ 玻璃不可用（R3SHIELDCORE_GLASS=off / 建缓冲失败）时退回原来的不透明画法
 		//   —— 这条兜底路径必须保留：现场一键回退靠它（不是可选项）。
 		if (g_glass.active) {
-			const R3ShieldCoreUi::GlassTheme& th = R3ShieldCoreUi::DefaultTheme();
-			g_glass.AddPanel(rect.left, rect.top, rect.right, rect.bottom,
-				th.panelRadius * GlassDpiScale(g_window), th.tintIdle);
+			// ★ v85：卡片 = 奶白玻璃（掺 Card 0.52）。圆角 24 比 v84 的 18 更圆，
+			//   跟参考项目一个调门 —— 圆角太小会让"玻璃"读成"圆角矩形"。
+			UiCtl::Card(g_ui, rect);
 		} else {
 			// ---- 兜底：不透明卡片（v82 及之前的外观）----
 			RECT shadow = { rect.left + 1, rect.top + 3, rect.right + 1, rect.bottom + 3 };
@@ -2001,8 +2619,16 @@ namespace
 			DeleteObject(rim);
 		}
 
-		RECT titleRect = { rect.left + 16, rect.top + 12, rect.right - 16, rect.top + 34 };
-		DrawTextSimple(dc, title, titleRect, g_labelFont, ColorTextPrimary,
+		RECT titleRect = { rect.left + CardPad, rect.top + 15,
+			rect.right - CardPad, rect.top + 33 };
+		// ★ v85：卡片标题用**次要色**而不是主文字色 —— 参考项目里
+		//   标题是"分组标签"，不是内容；涂成近黑会和正文抢注意力。
+		// ★ v88：Dim(51,56,71) -> Faint(92,97,115)。
+		//   实测 Dim 和正文 ColorTextPrimary(24,24,24) 在小字号下**看不出差别**：
+		//   配置页的「监控面板」和第一行「高危规则」长得一模一样，标题读成了
+		//   内容的一部分。参考项目的分组标签（SWITCHES / SLIDERS）明显更淡一档，
+		//   层级是靠**明度**拉开的，不是靠字号 —— 我们字号只有一个，那就只能靠色。
+		DrawTextSimple(dc, title, titleRect, g_labelFont, FaintColor(),
 			DT_LEFT | DT_SINGLELINE);
 	}
 
@@ -2037,7 +2663,9 @@ namespace
 		RECT panel = { left, tableTop, right, client.bottom - PromptSummaryHeight() - 12 };
 		DrawPanel(dc, panel, L"进程活动明细");
 
-		const int headerTop = tableTop + 44;
+		// ★ v88：+44 → +52。卡片标题占 top+15~33，表头原来紧跟其后（+44 只差
+		//   11px），"进程活动明细"和列名挤成一坨；52 让标题和列名分成两层。
+		const int headerTop = tableTop + 52;
 		const int colProcess = left + 16;
 		const int colPid = left + 300;
 		const int colEvents = left + 390;
@@ -2066,10 +2694,12 @@ namespace
 		for (int i = 0; i < count; ++i) {
 			const auto& process = snapshot.TopProcesses[static_cast<size_t>(i)];
 			const int rowTop = rowsTop + i * rowHeight;
-			if (i % 2 == 1) {
+			// ★ v85：玻璃模式下**不画**斑马纹 —— 不透明实色条会把卡片切成一段段
+			//   色带，"玻璃"立刻变回"贴纸"。横向对行靠列对齐 + 行距就够了。
+			if (!g_glass.active && i % 2 == 1) {
 				RECT stripe = { left + 8, rowTop - 4, right - 8, rowTop + rowHeight - 4 };
 				HBRUSH stripeBrush = CreateSolidBrush(ColorLogRowAlt);
-				FillRect(dc, &stripe, stripeBrush);
+				SceneFillRect(dc, &stripe, stripeBrush);
 				DeleteObject(stripeBrush);
 			}
 
@@ -2211,8 +2841,9 @@ namespace
 		layout.DetailLeft = layout.TableRight + 12;
 		layout.DetailRight = layout.Right;
 
-		// 面板标题 34 + 表头 26
-		layout.RowsTop = layout.MainTop + 34 + 26;
+		// 面板标题 34 + 表头 26 —— ★ v88：标题区 34 → 46，表头下移
+		//   （与进程页 +52 同一节奏：标题 / 列名 / 行 三层要分开）
+		layout.RowsTop = layout.MainTop + 46 + 26;
 		const int rowsAvailable = layout.MainBottom - layout.RowsTop - 10;
 		layout.MaxRows = rowsAvailable > 0 ? rowsAvailable / ArkRowHeight : 0;
 
@@ -2454,22 +3085,39 @@ namespace
 			text = ColorAccent;
 		}
 
-		// ★ v83：ARK 页 / 「高级」跳转页的按钮也走玻璃片。
-		//   禁用态**不加玻璃**（一块"什么都没写"的玻璃看起来像可点的按钮，
-		//   而禁用必须一眼看出"点不动"），危险动作靠**红字 + 红下划线**表达。
+		// ★★ v85：ARK / 「高级」跳转页的按钮也统一成**玻璃胶囊**。
+		//   禁用态**还是不加玻璃**（一块"什么都没写"的玻璃看起来像可点的按钮，
+		//   而禁用必须一眼看出"点不动"）；危险动作走红玻璃 + 白字。
 		if (g_glass.active) {
 			if (enabled) {
-				float tint = 0.16f;
-				if (hovered) { tint = 0.24f; }
-				if (pressed) { tint = 0.32f; }
-				g_glass.AddPanel(rect.left, rect.top, rect.right, rect.bottom, 8.0f, tint, 1);
-				RECT underline = { rect.left + 10, rect.bottom - 3, rect.right - 10, rect.bottom - 2 };
-				HBRUSH ub = CreateSolidBrush(danger ? ColorBlocked : ColorAccent);
-				FillRect(dc, &underline, ub);
-				DeleteObject(ub);
+				// ★ v93：ARK / 「高级」页的按钮同样逐帧插值，和顶栏那颗同参数。
+				R3ShieldCoreUi::Anim::Slot& ab =
+					g_anim.Get(AnimKey(rect.left, rect.top), 0.0f);
+				ab.hoverTgt = hovered ? 1.0f : 0.0f;
+				ab.press.tgt = pressed ? 1.0f : 0.0f;
+				const float hk = ab.hover;
+				const float pk = ab.press.v;
+				const float radius = static_cast<float>(rect.bottom - rect.top) * 0.5f;
+				if (danger) {
+					UiCtl::Pill(g_ui, rect, UiCtl::Btn::Danger, hk, pk);
+					text = RGB(255, 255, 255);
+				} else {
+					UiCtl::PieceR(g_ui, rect, radius, 0.62f + 0.05f * hk + 0.05f * pk,
+						UiCtl::Raised, UiCtl::KPiece);
+					text = UiCtl::ToColor(UiCtl::Mix(UiCtl::Dim, UiCtl::Ink,
+						hk > pk ? hk : pk));
+				}
+			} else {
+				// ★ v88：禁用态画成**凹槽**，不是"什么都不画"。
+				//   原来禁用时一块底都没有，只剩一行 170 灰的字浮在浅色卡片上 ——
+				//   ARK 页在"没选中进程"时四个按钮全禁用，看起来像四行说明文字，
+				//   用户根本不知道那儿本来有按钮。
+				//   凹槽（kind 2）刚好表达"这里有个位子，但现在按不下去"，
+				//   和开关的"关"、柱状条的轨道是同一种语言。
+				const float radius = static_cast<float>(rect.bottom - rect.top) * 0.5f;
+				UiCtl::PieceR(g_ui, rect, radius, 0.46f, UiCtl::Sunken, UiCtl::KWell);
+				text = UiCtl::ToColor(UiCtl::Faint);
 			}
-			text = enabled ? (danger ? ColorBlocked : (hovered || pressed ? ColorAccent : ColorTextPrimary))
-				: RGB(170, 170, 170);
 		} else {
 			HBRUSH brush = CreateSolidBrush(fill);
 			HPEN pen = CreatePen(PS_SOLID, 1, border);
@@ -2489,6 +3137,23 @@ namespace
 	void DrawArkPage(HDC dc, const RECT& client)
 	{
 		RefreshArkCache();
+		// ★★ v90：修「ARK 页一直显示"引擎正在初始化"、列表永远不出来」。
+		//
+		//   根因：`RefreshArkCache()` 有节流（`ark_refresh_ms`，默认 1000ms）。
+		//   窗口一建好就先画了一帧，那一帧取到的是**ARK 模块还没 Start 时**的
+		//   零快照（`Started=0 / Scans=0 / Rows=空`）。之后虽然 ARK 起来了，
+		//   但只要节流窗口内的那次取快照被跳过，界面就一直捧着这份零快照 ——
+		//   而这一页的文案是"ARK 尚未启动（引擎正在初始化）"，
+		//   于是用户看到的就是"一直在加载"。
+		//   （实测日志：整场只有一行 `[ark] 页面已绘制 行数=0 已启动=0 已扫描=0`，
+		//     引擎那边却已经 `[ark] 已启用 …` 并在正常心跳。）
+		//
+		//   修法：拿**模块自己的状态**跟快照对一下，不一致就强制重取一次。
+		//   判据用 `IsEnabled()`（模块真状态）而不是快照里的字段 ——
+		//   用快照自己的字段判断，等于让"错的缓存"证明自己没错。
+		if (!g_arkSnapshot.Stat.Started && R3ShieldCoreArk::IsEnabled()) {
+			RefreshArkCache(true);
+		}
 		TryArkActionSelfTest();
 
 		const ArkLayout layout = ArkLayoutFor(client);
@@ -2560,7 +3225,16 @@ namespace
 				// ★ 三态要分开报（铁律 97）：
 				//   未启动 / 启动但被配置关掉 / 已启用 —— 三种都显示"空的列表"
 				//   的话，用户根本分不清该去改配置还是该等一等。
-				summary = L"ARK 尚未启动（引擎正在初始化）—— 列表暂时为空。";
+				//
+				// ★ v90：这里再分一层 —— "模块其实已经启用、只是首轮扫描还没完成"
+				//   不能写成"引擎正在初始化"，否则用户会以为卡住了（他报的
+				//   "ARK 一直显示正在加载"就是这么来的）。
+				if (R3ShieldCoreArk::IsEnabled()) {
+					summary = L"ARK 已启用，正在等首轮扫描完成 —— 列表马上出来。";
+				}
+				else {
+					summary = L"ARK 尚未启动（引擎正在初始化）—— 列表暂时为空。";
+				}
 			}
 			else if (!stat.Enabled) {
 				summary = L"ARK 未启用（r3shieldcore.ini 里 ark_enabled=0）—— 列表不刷新、动作不可用。";
@@ -2593,8 +3267,18 @@ namespace
 					summary += extra;
 				}
 			}
+			// ★ v88：玻璃模式下给摘要行垫一条**玻璃片**。
+			//   原来这行字直接浮在背景上：橙色字压在一片渐变里，读起来像
+			//   "一条报错横幅挂在半空"，而且和下面的卡片没有任何关系。
+			//   垫上之后它属于"状态条"这一层，和顶栏/页签同一材质。
+			if (g_glass.active) {
+				RECT strip = { layout.Left, layout.SummaryTop - 3,
+					layout.Right, layout.SummaryTop + 21 };
+				UiCtl::PieceR(g_ui, strip, (strip.bottom - strip.top) * 0.5f, 0.58f,
+					UiCtl::CardTone, UiCtl::KPiece);
+			}
 			DrawTextSimple(dc, summary.c_str(),
-				{ layout.Left, layout.SummaryTop, layout.Right, layout.SummaryTop + 22 },
+				{ layout.Left + 12, layout.SummaryTop, layout.Right - 12, layout.SummaryTop + 22 },
 				g_labelFont, stat.Enabled ? ColorTextSecondary : ColorWouldBlock,
 				DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS);		}
 
@@ -2602,7 +3286,7 @@ namespace
 		RECT tablePanel = { layout.TableLeft, layout.MainTop, layout.TableRight, layout.MainBottom };
 		DrawPanel(dc, tablePanel, L"全部进程（Toolhelp 快照，含受保护进程）");
 
-		const int headerTop = layout.MainTop + 34;
+		const int headerTop = layout.MainTop + 46;
 		const int colName = layout.TableLeft + 16;
 		const int colPid = colName + 200;
 		const int colCpu = colPid + 62;
@@ -2639,16 +3323,23 @@ namespace
 				const int rowTop = layout.RowsTop + i * ArkRowHeight;
 				const bool isSelected = (static_cast<int>(row.Pid) == g_arkSelectedPid);
 
+				// ★ v85：选中行改用**半透明**叠色（见 BlendFillRect）——
+				//   原来的实色浅蓝在玻璃卡上是一块不透明贴纸，把背景糊掉。
+				//   斑马纹在玻璃模式下取消（同进程页）。
 				if (isSelected) {
 					RECT mark = { layout.TableLeft + 8, rowTop - 2, layout.TableRight - 8, rowTop + ArkRowHeight - 4 };
-					HBRUSH brush = CreateSolidBrush(RGB(214, 232, 250));
-					FillRect(dc, &mark, brush);
-					DeleteObject(brush);
+					if (g_glass.active) {
+						BlendFillRect(dc, mark, RGB(64, 132, 220), 56);
+					} else {
+						HBRUSH brush = CreateSolidBrush(RGB(214, 232, 250));
+						SceneFillRect(dc, &mark, brush);
+						DeleteObject(brush);
+					}
 				}
-				else if (i % 2 == 1) {
+				else if (!g_glass.active && i % 2 == 1) {
 					RECT stripe = { layout.TableLeft + 8, rowTop - 2, layout.TableRight - 8, rowTop + ArkRowHeight - 4 };
 					HBRUSH brush = CreateSolidBrush(ColorLogRowAlt);
-					FillRect(dc, &stripe, brush);
+					SceneFillRect(dc, &stripe, brush);
 					DeleteObject(brush);
 				}
 
@@ -2918,7 +3609,7 @@ namespace
 			const COLORREF decisionColor = DecisionColor(static_cast<R3ShieldCore::Decision>(row.Decision));
 			RECT stripe = { layout.Left + 4, top + 2, layout.Left + 7, top + eventRowHeight - 3 };
 			HBRUSH stripeBrush = CreateSolidBrush(row.IsHighRisk ? ColorHighRisk : decisionColor);
-			FillRect(dc, &stripe, stripeBrush);
+			SceneFillRect(dc, &stripe, stripeBrush);
 			DeleteObject(stripeBrush);
 
 			DrawTextSimple(dc, FormatLogTime(row.TimeStamp).c_str(),
@@ -3032,11 +3723,512 @@ namespace
 		}
 	}
 
-	void DrawConfigRow(HDC dc, int x, int y, int width, PCWSTR label, bool enabled)
+	// =================================================================
+	// ★★★ v103：「配置」页的开关变成**真能拨的**
+	// =================================================================
+	//
+	// 用户的诉求就一句：「主程序配置页里的开关用不了，点不动」。
+	//
+	// 以前这一页是**只读**的（v85 的注释里明写着「开关不接受点击，配 ini 才行」）。
+	// 问题是：它画成了开关的样子，用户就会去拨；拨不动，第一反应不是
+	// "这页只读"，而是**"软件坏了"** —— 按了没反应比不放开关更糟。
+	//
+	// -----------------------------------------------------------------
+	// 设计：**一个寄存区 + 一个按钮**
+	// -----------------------------------------------------------------
+	//
+	// 为什么不"点一下直接写 ini"：
+	//   · 这些开关决定的是**注入 DLL 的 hook 面**（`FlagHook*`），落在共享内存的
+	//     `Policy` 块里。引擎只在 **LoadLibrary 那一刻**读它；
+	//   · 也就是说"改了对已经注入的 233 个进程**没有任何影响**"，必须重新注入。
+	//     让用户点一下就"看起来生效了"，是另一种谎。
+	//
+	// 所以：点开关 ⇒ 只改**待提交值**；右侧多出一颗「应用并重启引擎」，
+	// 按下去才真写 ini + 重启引擎。没改动时那颗按钮**不出现**（不占位置、不误导）。
+	//
+	// ★ 主窗口和 cfg 工具是**同一个 exe 的两份进程**，但这里是主程序 exe 的
+	//   源码，cfg 不 include 这个文件 ⇒ 不会牵连到 cfg 的构建。
+	enum class ConfigField : int
 	{
+		None = -1,
+		HighRisk = 0,
+		HookReads,
+		HookFile,
+		HookProcess,
+		HookThread,
+		HookDriver,
+		HookSelfThread,
+		HighRiskProcessAlert,
+		ArkEnabled,
+		Count
+	};
+
+	// 寄存区：用户拨过、但还没按「应用」的值。`dirty == false` 时一律以
+	// 引擎给的真值为准（= 现在绘制出来的那个值）。
+	struct PendingConfig
+	{
+		bool dirty = false;
+		bool value[static_cast<int>(ConfigField::Count)] = {};
+	};
+
+	PendingConfig g_pendingConfig;
+
+	// 把一个字段的"引擎当前真值"取出来。
+	//
+	// ★★ 必须和 `app.cpp` 填 `R3ShieldCoreGui::Options` 的口径**逐字一致**
+	//   （铁律 127：同一个判断只写一次）。写岔了的后果不是崩溃，而是
+	//   "拨完之后开关自己弹回去" —— 用户会以为又没反应。
+	bool CurrentConfigValue(ConfigField field)
+	{
+		switch (field) {
+		case ConfigField::HighRisk:
+			return g_options.HighRisk;
+		case ConfigField::HookReads:
+			// ★ 界面上这一行是「注册表只读 / Hive」两项合一 ——
+			//   读到的是**或**，但取消时两项都关。这条语义在 Apply 里体现。
+			return g_options.HookReads || g_options.HookHive;
+		case ConfigField::HookFile:
+			return g_options.HookFile;
+		case ConfigField::HookProcess:
+			return g_options.HookProcess;
+		case ConfigField::HookThread:
+			return g_options.HookThread;
+		case ConfigField::HookDriver:
+			return g_options.HookDriver;
+		case ConfigField::HookSelfThread:
+			return g_options.HookSelfThread;
+		case ConfigField::HighRiskProcessAlert:
+			return g_options.HighRiskProcessAlert != 0;
+		case ConfigField::ArkEnabled:
+			return g_options.ArkEnabled;
+		default:
+			return false;
+		}
+	}
+
+	// 绘制 / 命中 / 提交三处共用的"显示值"：有改动看寄存区，否则看引擎。
+	bool DisplayConfigValue(ConfigField field)
+	{
+		if (field == ConfigField::None) {
+			return false;
+		}
+		if (!g_pendingConfig.dirty) {
+			return CurrentConfigValue(field);
+		}
+		return g_pendingConfig.value[static_cast<int>(field)];
+	}
+
+	void SetPendingConfig(ConfigField field, bool value)
+	{
+		if (field == ConfigField::None) {
+			return;
+		}
+		g_pendingConfig.value[static_cast<int>(field)] = value;
+		g_pendingConfig.dirty = true;
+	}
+
+	// 把寄存区里的改动拼成 ini 行（返回给 app.cpp 去写 + 重启引擎）。
+	//
+	// 为什么返回"行"而不是直接写：**写 ini 和重启引擎是主程序的活**
+	// （它才知道 exe 目录、才知道怎么干净地停引擎）。界面线程碰文件 I/O
+	// 会卡住整屏重绘 —— v101 就是栽在"在 UI 线程上做重活"。
+	//
+	// `ark_enabled` 不在 ini 的引擎配置里（它属于界面侧设置），
+	// 所以它单独用一条 `ConfigApplyRequest.arkEnabled` 带出去。
+	struct ConfigApplyRequest
+	{
+		bool valid = false;
+		std::vector<std::wstring> lines;   // 每行形如 `hook_file=0`
+		bool arkPresent = false;
+		bool arkEnabled = false;
+	};
+
+	ConfigApplyRequest g_configApply;
+
+	// ★ 待处理标记 + 锁必须在**第一次使用之前**声明（`BuildConfigApplyRequest`
+	//   和点击处理都在下面）。原来放在文件尾的 `TakeConfigApplyRequest` 旁边，
+	//   结果上面两处都成了"未声明的标识符"——编译期才发现，属于好消息。
+	std::mutex g_configApplyMutex;
+	LONG g_configApplyPending = 0;
+
+	// ★ 前置声明：点击处理（`WndProc` 的 `WM_LBUTTONDOWN`）在文件里出现的
+	//   位置比 `ShowNotice` 的**定义**早。C++ 里"先声明后使用"，少这一行就是
+	//   `error C3861: 找不到标识符`。
+	//
+	// ★★ 但这个声明**不能**写在这里 —— 这里还在匿名命名空间（文件顶部
+	//   `namespace {`），而 `ShowNotice` 定义在 `namespace R3ShieldCoreGui`
+	//   里面。在匿名命名空间里声明一个同名同签名的函数，得到的是**另一个**
+	//   函数（mangled name 不同）⇒ 编译全过、链接 `LNK2019: 无法解析`。
+	//   ⇒ 用**限定名**声明/调用，见 `WndProc` 里那处 `R3ShieldCoreGui::ShowNotice`。
+
+	// 各字段对应的 ini 键。返回 nullptr = 这一项不能靠写 ini 生效
+	// （目前只有 `ark_enabled`，它走单独的字段）。
+	PCWSTR ConfigIniKey(ConfigField field)
+	{
+		switch (field) {
+		case ConfigField::HighRisk:
+			return L"high_risk";
+		case ConfigField::HookFile:
+			return L"hook_file";
+		case ConfigField::HookProcess:
+			return L"hook_process";
+		case ConfigField::HookThread:
+			return L"hook_thread";
+		case ConfigField::HookDriver:
+			return L"hook_driver";
+		case ConfigField::HookSelfThread:
+			return L"hook_self_thread";
+		case ConfigField::HookReads:
+			// 这一行管**两个**键，由 ApplyPendingConfig 单独展开
+			return L"hook_reads+hook_hive";
+		case ConfigField::HighRiskProcessAlert:
+			return L"high_risk_process_alert";
+		default:
+			return nullptr;
+		}
+	}
+
+	// =================================================================
+	// 布局：**一个几何函数**同时给绘制和命中使用
+	// =================================================================
+	//
+	// ★ 为什么不做成"绘制时顺手记下矩形"：绘制可能被跳过（换页、GL 分支），
+	//   一旦没画过，矩形就是上一页的残值 ⇒ 点哪儿都可能命中。
+	//   （铁律 182：坐标只在创建点出现一次；铁律 127：别抄两份。）
+	struct ConfigLayout
+	{
+		RECT monitorPanel = {};
+		RECT runtimePanel = {};
+		int rowStart = 0;
+		int rowGap = 0;
+		int rowLeftMonitor = 0;
+		int rowLeftRuntime = 0;
+		int rowWidth = 0;
+		int rowCountMonitor = 0;   // 9 行
+		int rowCountRuntime = 0;   // 8 行
+
+		// 右侧「应用」按钮。没改动时 `valid=false`，**既不画也不命中**。
+		bool applyVisible = false;
+		RECT applyButton = {};
+	};
+
+	int PromptSummaryHeight() noexcept;
+
+	// ★ v103：配置页交互诊断开关（`R3SHIELDCORE_CFG_TRACE=1`）。
+	//
+	// 为什么需要它：这台机器上**截屏判据不可靠** —— 主窗口是 OpenGL 场景
+	// （PrintWindow 抓不到 GL 表面，只会给一张空图），而 CopyFromScreen
+	// 又被前台锁 + 置顶 IDE 窗口遮住。所以配一个纯日志通道，
+	// 让"这一下点没点到 / 拨完状态对不对"能自证。
+	//
+	// ★★★ 为什么是**写文件**而不是 `printf`（这一步踩过）：
+	//   主程序是 **WINDOWS 子系统**（`wWinMain`）—— **根本没有 stdout**。
+	//   `printf` 不报错、不抛异常、什么都不发生，连 `--gui-preview`
+	//   重定向到文件也是空的（实测：gui_stdout.log 恒为 0 字节）。
+	//   所以诊断必须自己 `CreateFileW` 写。
+	//
+	// 缓存成 static：每次 WM_LBUTTONDOWN 都调 GetEnvironmentVariableW 太浪费。
+	bool ConfigTraceEnabled()
+	{
+		static int s_on = -1;
+		if (s_on < 0) {
+			s_on = GetEnvironmentVariableW(L"R3SHIELDCORE_CFG_TRACE", nullptr, 0) > 0 ? 1 : 0;
+		}
+		return s_on != 0;
+	}
+
+	// 追加一行诊断。仅 `ConfigTraceEnabled()` 为真时写。
+	//
+	// 路径固定 `%TEMP%\r3shieldcore-cfg-trace.log`，追加写（多次运行不覆盖）。
+	// ★ 只用 ASCII 窄串 —— 中文在 GBK/UTF-8 之间来回转容易出乱码。
+	void ConfigTrace(const char* line)
+	{
+		if (!ConfigTraceEnabled() || line == nullptr) {
+			return;
+		}
+		wchar_t dir[MAX_PATH] = {};
+		const DWORD n = GetTempPathW(_countof(dir), dir);
+		if (n == 0 || n >= _countof(dir)) {
+			return;
+		}
+		wchar_t path[MAX_PATH] = {};
+		_snwprintf_s(path, _countof(path), _TRUNCATE, L"%sr3shieldcore-cfg-trace.log", dir);
+
+		const HANDLE file = CreateFileW(path, FILE_APPEND_DATA, FILE_SHARE_READ,
+			nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+		if (file == INVALID_HANDLE_VALUE) {
+			return;
+		}
+		DWORD written = 0;
+		// 每条前面加时间戳（tick），方便对照"哪一下是哪个动作"。
+		char buf[512] = {};
+		const int len = _snprintf_s(buf, _countof(buf), _TRUNCATE, "[%lu] %s\r\n",
+			static_cast<unsigned long>(GetTickCount()), line);
+		if (len > 0) {
+			WriteFile(file, buf, static_cast<DWORD>(len), &written, nullptr);
+		}
+		CloseHandle(file);
+	}
+
+	// ★★★ v103：**有没有真差异**（不是"用户碰过没有"）。
+	//
+	// `g_pendingConfig.dirty` 只表示"寄存区里有值"，拨开再拨回去它照样是 true。
+	// 「应用」按钮、以及"要不要发请求"必须看这个函数 —— 否则用户会看到
+	// 一颗"没什么可应用"的按钮，按下去白重启一次引擎（实测缺陷，见
+	// ComputeConfigLayout 里的说明）。
+	bool HasPendingConfigDiff()
+	{
+		if (!g_pendingConfig.dirty) {
+			return false;   // 没碰过 ⇒ 必然没差异（常见路径，省一次循环）
+		}
+		for (int i = 0; i < static_cast<int>(ConfigField::Count); i++) {
+			const ConfigField f = static_cast<ConfigField>(i);
+			if (g_pendingConfig.value[i] != CurrentConfigValue(f)) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	ConfigLayout ComputeConfigLayout(const RECT& client)
+	{
+		ConfigLayout out;
+		const int left = Padding;
+		const int right = client.right - Padding;
+		const int top = TabBarTop + TabBarHeight + 18;
+		const int panelsTop = top + 122;
+		const int gap = 14;
+		const int panelWidth = (right - left - gap) / 2;
+
+		out.monitorPanel = { left, panelsTop, left + panelWidth,
+			client.bottom - PromptSummaryHeight() - 12 };
+		out.runtimePanel = { left + panelWidth + gap, panelsTop, right,
+			client.bottom - PromptSummaryHeight() - 12 };
+
+		out.rowStart = panelsTop + 46;
+		out.rowGap = 30;
+		out.rowLeftMonitor = out.monitorPanel.left + 16;
+		out.rowLeftRuntime = out.runtimePanel.left + 16;
+		out.rowWidth = panelWidth - 32;
+		out.rowCountMonitor = 9;
+		out.rowCountRuntime = 8;
+
+		// 应用按钮：贴在左侧「监控面板」的标题行右端（那里本来是空的）。
+		//
+		// ★ 不放在底部：底部是「询问统计」栏，高度随 `HighRiskProcessAlert`
+		//   变化（不是常量），贴底的按钮会被它挤掉或盖住。
+		//
+		// ★★★ v103 修缺陷：判据不能只看 `dirty`。
+		//
+		//   第一版写的是 `if (g_pendingConfig.dirty)` —— 实测（截图 03_back）：
+		//   拨开再拨回去，开关已经回到原样，**「应用」按钮却还挂着**。
+		//   用户会以为"我明明没改什么，为什么让我应用"，而且按下会白重启一次引擎。
+		//
+		//   `dirty` 的含义是"用户碰过开关"，不是"有差异" —— 这两件事在
+		//   "拨了又拨回去"时**不相等**。所以这里改成查**真差异**：
+		//   任何一个字段的待提交值和引擎真值不同，才算有改动。
+		if (HasPendingConfigDiff()) {
+			constexpr int kApplyW = 132;
+			constexpr int kApplyH = 26;
+			const int btnRight = out.monitorPanel.right - 16;
+			const int btnTop = panelsTop + 12;
+			out.applyButton = { btnRight - kApplyW, btnTop, btnRight, btnTop + kApplyH };
+			out.applyVisible = true;
+		}
+		return out;
+	}
+
+	// 命中：返回被点到的字段。
+	//
+	// ★ 只认**开关那一小块**（右边 60px），不认整行 —— 整行都可点会让
+	//   "想选中文字/想拖窗口"变成误触。60px 覆盖 44px 的开关 + 一点余量。
+	bool HitTestConfigToggle(POINT point, const RECT& client, ConfigField* out)
+	{
+		if (g_activeTab != 3) {
+			return false;
+		}
+		const ConfigLayout layout = ComputeConfigLayout(client);
+		constexpr int kHitWidth = 60;
+
+		// 左栏 9 行：顺序必须和 `DrawConfigPage` 的绘制顺序**完全一致**。
+		const ConfigField kMonitorRows[] = {
+			ConfigField::HighRisk,
+			ConfigField::HookReads,
+			ConfigField::HookFile,
+			ConfigField::HookProcess,
+			ConfigField::HookThread,
+			ConfigField::HookDriver,
+			ConfigField::HookSelfThread,
+			ConfigField::HighRiskProcessAlert,
+			ConfigField::ArkEnabled,
+		};
+		for (int i = 0; i < layout.rowCountMonitor; i++) {
+			const int rowTop = layout.rowStart + layout.rowGap * i;
+			RECT hit = { layout.rowLeftMonitor + layout.rowWidth - kHitWidth, rowTop - 4,
+				layout.rowLeftMonitor + layout.rowWidth, rowTop + 26 };
+			if (PtInRect(&hit, point)) {
+				*out = kMonitorRows[i];
+				return true;
+			}
+		}
+
+		// 右栏只有第 0 行（策略项 / 计数）不是开关类 —— 但 ArkEnabled 在左栏，
+		// 所以右栏这一版**没有可拨的项**。留空是刻意的：见下面 DrawConfigPage
+		// 里右栏的说明（那几行是"计数"不是"开关"，画成开关就得配得上一个动作）。
+		return false;
+	}
+
+	bool HitTestConfigApply(POINT point, const RECT& client)
+	{
+		if (g_activeTab != 3) {
+			return false;
+		}
+		const ConfigLayout layout = ComputeConfigLayout(client);
+		if (!layout.applyVisible) {
+			return false;
+		}
+		const RECT r = layout.applyButton;
+		return point.x >= r.left && point.x < r.right
+			&& point.y >= r.top && point.y < r.bottom;
+	}
+
+	// 把寄存区里**真正改过的**项拼成 ini 行。
+	//
+	// ★★★ 关键设计：只写**与引擎当前值不同**的项。
+	//
+	//   为什么不整份写回：这些开关有一部分（`hook_reads`/`hook_hive`）在界面上
+	//   是合并显示的。如果无脑写回，就会出现"用户只拨了'高危规则'，
+	//   顺手把注册表那两项也写了一遍" —— 一旦界面的合并口径和 ini 的真实
+	//   语义有一丁点偏差（比如用户手改过 ini 里的 `hook_hive=0`），
+	//   就会**静默改掉一个用户没碰过的设置**。只写差异项没有这个风险。
+	void BuildConfigApplyRequest()
+	{
+		g_configApply.lines.clear();
+		g_configApply.arkPresent = false;
+		g_configApply.valid = false;
+
+		if (!g_pendingConfig.dirty) {
+			return;
+		}
+
+		auto addLine = [](PCWSTR key, bool value) {
+			std::wstring line = key;
+			line += value ? L"=1" : L"=0";
+			g_configApply.lines.push_back(line);
+		};
+
+		// 左栏 8 个可写字段（第 9 项 `ark_enabled` 走单独通道）。
+		const ConfigField kFields[] = {
+			ConfigField::HighRisk,
+			ConfigField::HookReads,
+			ConfigField::HookFile,
+			ConfigField::HookProcess,
+			ConfigField::HookThread,
+			ConfigField::HookDriver,
+			ConfigField::HookSelfThread,
+			ConfigField::HighRiskProcessAlert,
+		};
+		for (const ConfigField f : kFields) {
+			const bool next = g_pendingConfig.value[static_cast<int>(f)];
+			if (next == CurrentConfigValue(f)) {
+				continue;   // 没动过
+			}
+			switch (f) {
+			case ConfigField::HookReads:
+				// 这一行管两个键，**两个都写** —— 只写 `hook_reads` 的话，
+				// 用户看到开关灭了、但 `hook_hive` 还亮着，行为没变。
+				addLine(L"hook_reads", next);
+				addLine(L"hook_hive", next);
+				break;
+			case ConfigField::HighRiskProcessAlert:
+				// 它**不是布尔**：0 = 关 / 1 = 仅记录 / 2 = 记录 + 界面。
+				// 界面只有一个开关 ⇒ 开 = 恢复成 2（记录 + 界面），关 = 0。
+				// ★ 不能写 1 —— 那等于"悄悄把界面提示降级成只记日志"，
+				//   用户会以为"开了但看不到任何提示"。
+				addLine(L"high_risk_process_alert", next);
+				break;
+			default: {
+				const PCWSTR key = ConfigIniKey(f);
+				if (key) {
+					addLine(key, next);
+				}
+				break;
+			}
+			}
+		}
+
+		// ARK 页开关。
+		if (g_pendingConfig.value[static_cast<int>(ConfigField::ArkEnabled)]
+			!= CurrentConfigValue(ConfigField::ArkEnabled)) {
+			g_configApply.arkPresent = true;
+			g_configApply.arkEnabled =
+				g_pendingConfig.value[static_cast<int>(ConfigField::ArkEnabled)];
+		}
+
+		// 一条都没变（用户拨了又拨回去）⇒ 不弹按钮、不发请求。
+		//
+		// ★ 这里**顺手把 `dirty` 清掉**：`dirty` 的语义是"寄存区有效"，
+		//   而"拨回原值"之后寄存区已经没有意义了 —— 留着它会让
+		//   `DisplayConfigValue` 一直走寄存区分支，万一以后 `g_options`
+		//   被刷新，界面就显示一个跟谁都不一致的陈旧值。
+		g_configApply.valid = !g_configApply.lines.empty() || g_configApply.arkPresent;
+		if (!g_configApply.valid) {
+			g_pendingConfig.dirty = false;   // 回到"以引擎为准"
+		}
+	}
+
+	void DrawConfigRow(HDC dc, int x, int y, int width, PCWSTR label, bool enabled,
+		bool interactive = false)
+	{
+		// ★★ v85：配置行改成"左边文字 + 右边开关"。
+		//
+		//   原来是一个 10x10 的实心方块 + 右边「已启用 / 已关闭」四个字：
+		//   方块只是"状态指示灯"，而这一页的用户心智是"开关"（他想拨一下）。
+		//   参考项目里所有布尔项都是真开关 —— 拨动感本身就是"可信"的一部分。
+		//
+		// ★★★ v103：这一页**不再是只读**（原注释写着"开关不接受点击"）。
+		//   用户原话：「主程序配置页里的开关用不了，点不动」。
+		//   画成开关却不给点，比不放开关更糟 —— 用户只会认为软件坏了。
+		//   现在的语义：点一下 = 改**待提交值**（寄存区），右侧多出
+		//   「应用并重启引擎」；按那颗才真写 ini + 重启（见上方 v103 说明）。
+		//
+		//   `interactive=false` 的那几行仍然画成开关，但**画得更淡**：
+		//   它们是 `Options` 里没有写通道的只读项，拨了没法生效。
+		//   ★ 这是同一条原则的两面：能拨的必须真能拨，不能拨的必须看得出不能拨
+		//     （只靠注释说明"这页只读"，用户永远读不到）。
+		if (g_glass.active) {
+			DrawTextSimple(dc, label, { x, y, x + width - UiCtl::SwitchW - 12, y + 22 },
+				g_labelFont, UiCtl::ToColor(interactive ? UiCtl::Ink : UiCtl::Faint),
+				DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS);
+			// ★ v93：开关的**值**也走弹簧（参考项目 `Spring v`）。
+			//   轨道颜色 mix(灰, 蓝, v) + 圆头 lerp 左→右，一起动才是"拨一下"；
+			//   只动圆头会像"色块瞬间换掉、圆头慢慢追"。
+			//
+			// ★ v103：值改成从 `DisplayConfigValue` 取（寄存区优先），
+			//   这样拨动后 `sw.v.tgt` 真的会变，弹簧才有得动 ——
+			//   原来 `enabled` 来自 `g_options`（只读快照），拨了也不会变。
+			//
+			// ★ v103：悬停只在 `interactive` 行给（`hover` 参数进 `SwitchV` 的
+			//   高光），不可拨的行给出悬停高光就是在骗人。
+			float hover = 0.0f;
+			if (interactive) {
+				const RECT swHit = { x + width - UiCtl::SwitchW - 10, y - 4,
+					x + width, y + 26 };
+				if (PtInRect(&swHit, g_mousePoint)) {
+					hover = 1.0f;
+				}
+			}
+			R3ShieldCoreUi::Anim::Slot& sw =
+				g_anim.Get(AnimKey(x + width, y + 11), enabled ? 1.0f : 0.0f);
+			sw.v.tgt = enabled ? 1.0f : 0.0f;
+			const float v = interactive ? sw.v.v : (enabled ? 1.0f : 0.0f);
+			UiCtl::SwitchV(g_ui, x + width, y + 11, v, hover);
+			return;
+		}
+
 		RECT dot = { x, y + 5, x + 10, y + 15 };
 		HBRUSH brush = CreateSolidBrush(enabled ? RGB(34, 160, 96) : ColorBorder);
-		FillRect(dc, &dot, brush);
+		SceneFillRect(dc, &dot, brush);
 		DeleteObject(brush);
 		DrawTextSimple(dc, label, { x + 18, y, x + width - 54, y + 22 },
 			g_labelFont, ColorTextPrimary, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS);
@@ -3053,35 +4245,77 @@ namespace
 		const R3ShieldCore::Mode mode = static_cast<R3ShieldCore::Mode>(
 			InterlockedCompareExchange(&g_displayMode, 0, 0));
 
+		// ★ v103 诊断：把算出来的布局打一次，好和探针用的坐标对账。
+		//   只在前 8 次绘制时写，免得日志被重绘刷满。
+		if (ConfigTraceEnabled()) {
+			static int s_drawTrace = 0;
+			if (s_drawTrace < 8) {
+				++s_drawTrace;
+				const ConfigLayout lay = ComputeConfigLayout(client);
+				char trace[384] = {};
+				_snprintf_s(trace, _countof(trace), _TRUNCATE,
+					"draw client=%ldx%ld panelsTop=%ld rowStart=%d gap=%d "
+					"hitX=%ld..%ld row0Y=%d..%d applyVisible=%d",
+					client.right, client.bottom,
+					static_cast<long>(lay.monitorPanel.top),
+					lay.rowStart, lay.rowGap,
+					static_cast<long>(lay.rowLeftMonitor + lay.rowWidth - 60),
+					static_cast<long>(lay.rowLeftMonitor + lay.rowWidth),
+					lay.rowStart - 4, lay.rowStart + 26,
+					lay.applyVisible ? 1 : 0);
+				ConfigTrace(trace);
+			}
+		}
+
 		RECT modePanel = { left, top, right, top + 104 };
 		DrawPanel(dc, modePanel, L"当前防护模式");
 		RECT modeName = { left + 16, top + 42, left + 160, top + 76 };
 		DrawTextSimple(dc, ModeShortName(mode), modeName, g_valueFont,
 			mode == R3ShieldCore::Mode::Block ? ColorBlocked : ColorAccent,
 			DT_LEFT | DT_SINGLELINE);
-		DrawTextSimple(dc, ModeDescription(mode), { left + 178, top + 46, right - 20, top + 72 },
+		// ★ v88：说明文字跟着模式名**动态定位**（原来写死 left+178）。
+		//   写死的问题："全拦·安全"这种长名字会压到说明上，而 "LOG" 又
+		//   把说明甩到 160px 之外 —— 同一张卡上两种间距，读起来是断开的。
+		//   用场景的 Measure 量一下真宽（字形推进量就是排版用的那个数）。
+		const int descLeft = left + 16
+			+ static_cast<int>(g_scene.Measure(ModeShortName(mode),
+				R3ShieldCoreUi::SF_Value) + 0.5f) + 18;
+		DrawTextSimple(dc, ModeDescription(mode), { descLeft, top + 46, right - 20, top + 72 },
 			g_labelFont, ColorTextSecondary, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS);
 
-		const int panelsTop = top + 122;
-		const int gap = 14;
-		const int panelWidth = (right - left - gap) / 2;
-		RECT monitorPanel = { left, panelsTop, left + panelWidth, client.bottom - PromptSummaryHeight() - 12 };
-		RECT runtimePanel = { left + panelWidth + gap, panelsTop, right, client.bottom - PromptSummaryHeight() - 12 };
+		// ★★★ v103：几何全部走 `ComputeConfigLayout` —— 绘制和命中**同一份**。
+		//   原来这里是就地算的，点击处理那边只能再抄一遍（必然漂移，铁律 182）。
+		const ConfigLayout configLayout = ComputeConfigLayout(client);
+		const RECT monitorPanel = configLayout.monitorPanel;
+		const RECT runtimePanel = configLayout.runtimePanel;
 		DrawPanel(dc, monitorPanel, L"监控面板");
 		DrawPanel(dc, runtimePanel, L"运行参数");
 
-		const int rowStart = panelsTop + 46;
-		const int rowGap = 27;
-		DrawConfigRow(dc, monitorPanel.left + 16, rowStart, panelWidth - 32, L"高危规则", g_options.HighRisk);
-		DrawConfigRow(dc, monitorPanel.left + 16, rowStart + rowGap, panelWidth - 32, L"注册表只读 / Hive", g_options.HookReads || g_options.HookHive);
-		DrawConfigRow(dc, monitorPanel.left + 16, rowStart + rowGap * 2, panelWidth - 32, L"文件行为", g_options.HookFile);
-		DrawConfigRow(dc, monitorPanel.left + 16, rowStart + rowGap * 3, panelWidth - 32, L"进程创建", g_options.HookProcess);
-		DrawConfigRow(dc, monitorPanel.left + 16, rowStart + rowGap * 4, panelWidth - 32, L"远程线程", g_options.HookThread);
-		DrawConfigRow(dc, monitorPanel.left + 16, rowStart + rowGap * 5, panelWidth - 32, L"驱动 / 服务", g_options.HookDriver);
-		DrawConfigRow(dc, monitorPanel.left + 16, rowStart + rowGap * 6, panelWidth - 32, L"本进程线程噪音", g_options.HookSelfThread);
+		const int rowStart = configLayout.rowStart;
+		// ★ v88：27 → 30。9 行挤在 27px 的节距里，行与行之间只剩 13px 空白，
+		//   开关（26px 高）几乎首尾相接；30 才读得出"一行一项"。
+		const int rowGap = configLayout.rowGap;
+		// ★ v103：每行统一用 "显示值"（寄存区优先）+ interactive=true。
+		const int rowX = configLayout.rowLeftMonitor;
+		const int rowW = configLayout.rowWidth;
+		DrawConfigRow(dc, rowX, rowStart, rowW, L"高危规则",
+			DisplayConfigValue(ConfigField::HighRisk), true);
+		DrawConfigRow(dc, rowX, rowStart + rowGap, rowW, L"注册表只读 / Hive",
+			DisplayConfigValue(ConfigField::HookReads), true);
+		DrawConfigRow(dc, rowX, rowStart + rowGap * 2, rowW, L"文件行为",
+			DisplayConfigValue(ConfigField::HookFile), true);
+		DrawConfigRow(dc, rowX, rowStart + rowGap * 3, rowW, L"进程创建",
+			DisplayConfigValue(ConfigField::HookProcess), true);
+		DrawConfigRow(dc, rowX, rowStart + rowGap * 4, rowW, L"远程线程",
+			DisplayConfigValue(ConfigField::HookThread), true);
+		DrawConfigRow(dc, rowX, rowStart + rowGap * 5, rowW, L"驱动 / 服务",
+			DisplayConfigValue(ConfigField::HookDriver), true);
+		DrawConfigRow(dc, rowX, rowStart + rowGap * 6, rowW, L"本进程线程噪音",
+			DisplayConfigValue(ConfigField::HookSelfThread), true);
 		// ★ v61：高危进程提示。注意它**不是** hook —— 是引擎自己定期快照
 		//   全机进程，所以即使"进程创建"那一行是关的，它照样工作。
-		DrawConfigRow(dc, monitorPanel.left + 16, rowStart + rowGap * 7, panelWidth - 32, L"高危进程提示", g_options.HighRiskProcessAlert != 0);
+		DrawConfigRow(dc, rowX, rowStart + rowGap * 7, rowW, L"高危进程提示",
+			DisplayConfigValue(ConfigField::HighRiskProcessAlert), true);
 		// ★ v62：ARK 页。同样是"引擎自己枚举"，与 hook 无关。
 		//   它只影响 ARK 页的列表刷新与动作可用性，不改变任何拦截行为。
 		{
@@ -3091,23 +4325,63 @@ namespace
 			swprintf_s(arkBuffer, L"ARK 全机进程视图（扫描 %u / 刷新 %u ms）",
 				g_options.ArkScanMs ? g_options.ArkScanMs : 2000,
 				ArkRefreshIntervalMs());
-			DrawConfigRow(dc, monitorPanel.left + 16, rowStart + rowGap * 8, panelWidth - 32,
-				arkBuffer, g_options.ArkEnabled);
+			DrawConfigRow(dc, rowX, rowStart + rowGap * 8, rowW,
+				arkBuffer, DisplayConfigValue(ConfigField::ArkEnabled), true);
 		}
 
+		// ★ v103：「应用并重启引擎」——只在有未提交改动时出现。
+		//
+		//   为什么必须显式这么写：这些开关改的是**注入 DLL 的 hook 面**，
+		//   引擎只在 LoadLibrary 那一刻读 Policy 块 ⇒ 不重新注入就等于没改。
+		//   按钮文案里直接写"重启引擎"，是为了让用户**预先知道**代价，
+		//   而不是点完之后才惊讶"怎么全断了"。
+		if (configLayout.applyVisible) {
+			const RECT r = configLayout.applyButton;
+			const bool hot = HitTestConfigApply(g_mousePoint, client);
+			if (g_glass.active) {
+				// 参考项目的主按钮就是 `Pill(Primary)` —— 蓝底白字，
+				// 和这一页里唯一的"要用户下决心"的动作相称。
+				UiCtl::Pill(g_ui, r, UiCtl::Btn::Primary, hot ? 1.0f : 0.0f, 0.0f);
+				DrawTextSimple(dc, L"应用并重启引擎", r, g_labelFont,
+					UiCtl::PillText(UiCtl::Btn::Primary),
+					DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+			}
+			else {
+				HBRUSH b = CreateSolidBrush(hot ? ColorAccent : ColorHeaderBackground);
+				SceneFillRect(dc, &r, b);
+				DeleteObject(b);
+				DrawTextSimple(dc, L"应用并重启引擎", r, g_labelFont,
+					hot ? RGB(255, 255, 255) : ColorTextPrimary,
+					DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+			}
+		}
+
+		// ★★★ v103：右栏这 5 行**没有写通道**，必须留 `interactive=false`。
+		//
+		//   「排除路径 / 绝不注入」是 `exclude_path=` / `never_inject=` 的**多行列表**，
+		//   不是布尔项 —— 拨一下没有任何合理语义（关掉就等于"清空整个白名单"，
+		//   那是灾难性的，绝不能做成一次误点）。
+		//   「询问超时」是数值，「日志输出」是路径。
+		//
+		//   ⇒ 这几行画成开关只为**和左栏对齐、能一眼看出状态**，
+		//     但它们**不能长得像能拨** —— 所以 `DrawConfigRow` 会给
+		//     不可交互的行画一个略淡的轨道（见该函数末尾）。
+		//     ★ 这条是用户这次抱怨的镜像：能拨的必须能拨，不能拨的必须看得出不能拨。
 		WCHAR buffer[256] = {};
 		swprintf_s(buffer, L"排除路径：%u 条", g_options.ExcludePathCount);
-		DrawConfigRow(dc, runtimePanel.left + 16, rowStart, panelWidth - 32, buffer, true);
+		DrawConfigRow(dc, configLayout.rowLeftRuntime, rowStart, rowW, buffer, true, false);
 		// ★ v51：把「绝不注入」条数也显示出来 —— 理由同启动横幅（app.cpp）：
 		//   这是**最容易配错又最难自查**的一项，ini 里少个结尾 `\`、或误写成
 		//   文件名而不是完整路径，都会**静默不生效**；而"不生效"的表现是
 		//   "某个程序偶尔卡一下"，几乎没人会联想到 ini。
 		//   控制台横幅有、GUI 没有 ⇒ 从界面看，用户永远不知道自己有几个程序在裸奔。
 		swprintf_s(buffer, L"绝不注入：%u 条", g_options.NeverInjectPathCount);
-		DrawConfigRow(dc, runtimePanel.left + 16, rowStart + rowGap, panelWidth - 32, buffer, true);
+		DrawConfigRow(dc, configLayout.rowLeftRuntime, rowStart + rowGap, rowW, buffer, true, false);
 		swprintf_s(buffer, L"询问超时：%u 秒", g_options.PromptTimeoutMs / 1000);
-		DrawConfigRow(dc, runtimePanel.left + 16, rowStart + rowGap * 2, panelWidth - 32, buffer, mode == R3ShieldCore::Mode::Ask);
-		DrawConfigRow(dc, runtimePanel.left + 16, rowStart + rowGap * 3, panelWidth - 32, L"日志输出", g_options.LogPath != nullptr && g_options.LogPath[0] != L'\0');
+		DrawConfigRow(dc, configLayout.rowLeftRuntime, rowStart + rowGap * 2, rowW, buffer,
+			mode == R3ShieldCore::Mode::Ask, false);
+		DrawConfigRow(dc, configLayout.rowLeftRuntime, rowStart + rowGap * 3, rowW, L"日志输出",
+			g_options.LogPath != nullptr && g_options.LogPath[0] != L'\0', false);
 		RECT pathRect = { runtimePanel.left + 16, rowStart + rowGap * 4 + 6, runtimePanel.right - 16, rowStart + rowGap * 6 };
 		DrawTextSimple(dc, g_options.LogPath ? g_options.LogPath : L"(未配置日志路径)", pathRect,
 			g_monoFont, ColorTextSecondary, DT_LEFT | DT_WORDBREAK | DT_PATH_ELLIPSIS);
@@ -3252,10 +4526,24 @@ namespace
 		//    不是出现次数；行内容必须短。
 		//    这里顺带把**按钮矩形**报出来 —— 探针可以用它验证
 		//    "按钮确实落在客户区内"（几何算错时是最容易看不出来的一类错）。
-		printf("[adv] 跳转页已绘制 按钮=%ld,%ld,%ld,%ld 失败=%d 客户区=%ldx%ld\n",
-			button.left, button.top, button.right, button.bottom,
-			g_advLaunchError.empty() ? 0 : 1,
-			client.right, client.bottom);
+		//
+		// ★★ v101：改成**节流**（前 5 次 + 每 200 次一条）。
+		//   2026-10-24 现场：这一行刷了 982 条，把整个日志（1361 行）淹掉了 ——
+		//   真正有用的 `[btn]` / `[ipc]` / `[procwatch]` 全被埋在里面，
+		//   排查时得先把它滤掉才看得见东西。探针判据不受影响：
+		//   它要的那一句在前 5 条里就有，而且**留在日志里**不会消失。
+		{
+			static ULONG s_drawCount = 0;
+			s_drawCount++;
+			if (s_drawCount <= 5 || (s_drawCount % 200) == 0) {
+				printf("[adv] 跳转页已绘制 按钮=%ld,%ld,%ld,%ld 失败=%d 客户区=%ldx%ld"
+					" 第%lu次\n",
+					button.left, button.top, button.right, button.bottom,
+					g_advLaunchError.empty() ? 0 : 1,
+					client.right, client.bottom,
+					static_cast<unsigned long>(s_drawCount));
+			}
+		}
 
 		if (!g_advLaunchError.empty()) {
 			// 失败原因直接画出来（不弹窗）—— 否则用户只看到"点了没反应"。
@@ -3314,19 +4602,68 @@ namespace
 		//   （原来那块 `ColorHeaderBackground` 的 FillRect 是"玻璃感"的头号杀手：
 		//     页签条下面一片实色，整条看起来就是贴纸。）
 		//   页签条与顶栏共用顶部的"薄纱"（见 PaintWindow 里的 headerBand）。
+		//
+		// ★★ v85：页签栏改成**分段控件**（一条凹槽 + 一块白滑块），
+		//   和参考项目的 dock 是同一个模型。
+		//
+		//   为什么不能继续"每个页签各自一块玻璃"：没有选中项时（理论上不会，
+		//   但悬停时会多出一块）屏幕上就是几块散落的胶囊，读不出"这是一组"。
+		//   一个凹槽把它们圈起来，语义立刻就对了 —— 这也是 iOS 分段控件的做法。
+		if (g_glass.active) {
+			const RECT first = TabRect(0);
+			const RECT last = TabRect(TabCount - 1);
+			// 左右各外扩 6px（**对称**）。为什么不跟顶栏一样对齐到 8：
+			// 右边被动作按钮簇卡住了（页签右缘 480、按钮左缘 492），
+			// 只能各留 6 —— 一个凹槽左右不对称比"不跟顶栏对齐"更扎眼。
+			RECT trough = { first.left - 6, first.top - 2, last.right + 6, last.bottom + 2 };
+			UiCtl::SegmentTrough(g_ui, trough);
+
+			// 滑块放在**文字之前**登记：玻璃层按登记顺序合成，后登记的压在上面。
+			if (g_activeTab >= 0 && g_activeTab < TabCount) {
+				const RECT t = TabRect(g_activeTab);
+				// ★ v93：滑块**滑过去**而不是跳过去（参考项目的 dock 也是弹簧）。
+				//   x0/x1 各一个弹簧：各页签宽度不同（"概览"2 字 vs "事件日志"4 字），
+				//   用一个"索引弹簧"再插值，会在经过窄页签时宽度跳一下。
+				const float tx0 = static_cast<float>(t.left + 1);
+				const float tx1 = static_cast<float>(t.right - 1);
+				if (!g_tabThumbInit) {
+					g_tabThumbX0.Init(tx0);
+					g_tabThumbX1.Init(tx1);
+					g_tabThumbInit = true;
+				}
+				g_tabThumbX0.tgt = tx0;
+				g_tabThumbX1.tgt = tx1;
+				// ★ v94：挤压 —— 换页瞬间滑块比正常宽 12px，再弹回去。
+				//   左右各扩一半，中心不动（参考项目 dock 也是原地变宽）。
+				const float sq = g_tabSqueeze.v * 0.5f;
+				RECT thumb = {
+					static_cast<LONG>(g_tabThumbX0.v - sq + 0.5f), t.top + 1,
+					static_cast<LONG>(g_tabThumbX1.v + sq + 0.5f), t.bottom - 1
+				};
+				UiCtl::SegmentThumb(g_ui, thumb);
+			}
+		}
+
 		for (int i = 0; i < TabCount; i++) {
 			RECT rect = TabRect(i);
 			const bool active = (i == g_activeTab);
 			const bool hover = (i == g_hoverTab);
 
-			if (g_glass.active && (active || hover)) {
-				// 页签 = 一块小玻璃片；选中态 tint 更亮（"凸起来"）。
-				const R3ShieldCoreUi::GlassTheme& th = R3ShieldCoreUi::DefaultTheme();
-				g_glass.AddPanel(rect.left, rect.top, rect.right, rect.bottom,
-					(rect.bottom - rect.top) * 0.5f,     // 胶囊：半径 = 半高
-					active ? 0.34f : 0.18f, 1);
+			if (g_glass.active) {
+				// 文字色：选中 = 墨色；悬停 = 次色；其余 = 弱色。
+				// ★ v93：悬停是**淡入**的（Faint → Dim 插值），不是一到就跳。
+				R3ShieldCoreUi::Anim::Slot& ts =
+					g_anim.Get(AnimKey(rect.left, rect.top), 0.0f);
+				ts.hoverTgt = hover ? 1.0f : 0.0f;
+				const COLORREF textColor = active
+					? UiCtl::ToColor(UiCtl::Ink)
+					: UiCtl::ToColor(UiCtl::Mix(UiCtl::Faint, UiCtl::Dim, ts.hover));
+				DrawTextSimple(dc, TabTitle(i), rect, g_tabFont, textColor,
+					DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+				continue;
 			}
-			else if (active) {
+
+			if (active) {
 				// 兜底（玻璃不可用）：保留原来的蓝色实底
 				HBRUSH brush = CreateSolidBrush(ColorTabActiveBg);
 				HGDIOBJ old = SelectObject(dc, brush);
@@ -3350,38 +4687,24 @@ namespace
 				DeleteObject(pen);
 			}
 
-			// ★ 文字配色跟着玻璃改：选中/悬停用**深蓝**（玻璃底是浅的，
-			//   原来那个"白字压深蓝底"的反色在这里会完全看不见）。
-			COLORREF textColor;
-			if (g_glass.active) {
-				textColor = (active || hover) ? ColorAccent : ColorTabInactiveText;
-			}
-			else {
-				textColor = active ? ColorTabActiveText
-					: (hover ? ColorAccent : ColorTabInactiveText);
-			}
+			const COLORREF textColor = active ? ColorTabActiveText
+				: (hover ? ColorAccent : ColorTabInactiveText);
 			DrawTextSimple(dc, TabTitle(i), rect, g_tabFont, textColor,
 				DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-
-			// 选中态：底部一条 2px 的蓝色下划线（玻璃上比"整块填色"更清爽，
-			// 也更像 iOS 26 那套"玻璃胶囊 + 指示条"）。
-			if (g_glass.active && active) {
-				RECT underline = { rect.left + 14, rect.bottom - 5, rect.right - 14, rect.bottom - 3 };
-				HBRUSH ub = CreateSolidBrush(ColorAccent);
-				FillRect(dc, &underline, ub);
-				DeleteObject(ub);
-			}
 		}
 
 		// 右端的操作按钮（页签在左、操作在右，互不重叠）
 		DrawHeaderActions(dc);
 		DrawModeButton(dc);
 
-		// 页签栏下缘分隔线
-		RECT line = { 0, TabBarTop + TabBarHeight, width, TabBarTop + TabBarHeight + 1 };
-		HBRUSH lineBrush = CreateSolidBrush(ColorBorder);
-		FillRect(dc, &line, lineBrush);
-		DeleteObject(lineBrush);
+		// 页签栏下缘分隔线（玻璃模式下不画：凹槽本身就是边界，
+		// 再加一条 1px 实线会把顶栏切成"两个平面"）
+		if (!g_glass.active) {
+			RECT line = { 0, TabBarTop + TabBarHeight, width, TabBarTop + TabBarHeight + 1 };
+			HBRUSH lineBrush = CreateSolidBrush(ColorBorder);
+			SceneFillRect(dc, &line, lineBrush);
+			DeleteObject(lineBrush);
+		}
 	}
 
 	// -----------------------------------------------------------------
@@ -3490,8 +4813,17 @@ namespace
 	{
 		RefreshLogRows();
 
-		const int top = TabBarTop + TabBarHeight + 1;
+		// ★ v87：+1 -> +16。原来日志页的卡片紧贴页签条下沿（差 1px），
+		//   表头那一行看着像被页签压住；其它页都是 +16~+18，这里跟它们对齐。
+		const int top = TabBarTop + TabBarHeight + 16;
 		const int bottom = client.bottom - PromptSummaryHeight() - 8;
+		// ★ v88：卡片顶部内边距。
+		//   原来表头凹槽的顶边只比卡片顶边低 3px，而卡片圆角是 24 ——
+		//   凹槽两端那两个半圆直接从卡片的圆角里**顶出去**，看起来像
+		//   "一条贴纸压在卡片上"，也是这一页最像"没做完"的地方。
+		//   参考项目的卡片内边距在 20 上下；这里取 12，够让凹槽躲开圆角
+		//   （圆角 24、内缩 8px 处卡片上边界在 top+10.7，凹槽顶在 top+12）。
+		const int sheetPad = 12;
 
 		// ---- 表头 ----
 		const int contentLeft = Padding;
@@ -3504,40 +4836,71 @@ namespace
 		const int colTarget = colOp + LogColOpWidth;
 		const int colStatus = contentRight - LogColStatusWidth;
 
-		RECT headerRect = { contentLeft, top, contentRight, top + LogHeaderHeight };
-		HBRUSH headerBrush = CreateSolidBrush(ColorHeaderBackground);
-		FillRect(dc, &headerRect, headerBrush);
-		DeleteObject(headerBrush);
+		// v85：表头文字在凹槽上，用次色（Dim）而不是 ColorTextSecondary ——
+		// 凹槽比卡片暗一档，原来的灰在它上面偏淡。
+		const COLORREF logHeaderColor = g_glass.active ? UiCtl::ToColor(UiCtl::Dim)
+			: ColorTextSecondary;
+		RECT headerRect = { contentLeft, top + sheetPad, contentRight,
+			top + sheetPad + LogHeaderHeight };
+		// ★ v85：日志页整块垫一张玻璃卡（表头 + 行区 + 底部信息都在上面）。
+		//   原来表头是一条**不透明**的 `ColorHeaderBackground` 实色带 ——
+		//   在玻璃界面上就是一条白胶带，把上面的玻璃和下面的背景割断。
+		if (g_glass.active) {
+			RECT sheet = { contentLeft - 12, top, contentRight + 12, bottom + 6 };
+			UiCtl::Card(g_ui, sheet, 0.44f);
+			// 表头单独一条**凹槽**：它属于"列名"这一层，不像正文那样可以
+			// 直接浮在卡上 —— 没有这条，六列标题就是六个孤零零的词。
+			// ★ 后登记 ⇒ 压在卡上面（玻璃层按登记顺序合成）。
+			// 左右各内缩到 contentLeft-8 / contentRight+8（卡片边在 ±12）——
+			// 留 4px 让凹槽整条落在卡片内，不再切角。
+			RECT head = { contentLeft - 8, top + sheetPad, contentRight + 8,
+				top + sheetPad + LogHeaderHeight };
+			UiCtl::PieceR(g_ui, head, (head.bottom - head.top) * 0.5f, 0.55f,
+				UiCtl::Sunken, UiCtl::KWell);
+		} else {
+			HBRUSH headerBrush = CreateSolidBrush(ColorHeaderBackground);
+			SceneFillRect(dc, &headerRect, headerBrush);
+			DeleteObject(headerBrush);
+		}
 
-		RECT timeHeader = { colTime, top + 4, colSource, top + LogHeaderHeight };
-		DrawTextSimple(dc, L"时间", timeHeader, g_labelFont, ColorTextSecondary, DT_LEFT | DT_SINGLELINE);
+		RECT timeHeader = { colTime, top + sheetPad + 4, colSource,
+			top + sheetPad + LogHeaderHeight };
+		DrawTextSimple(dc, L"时间", timeHeader, g_labelFont, logHeaderColor, DT_LEFT | DT_SINGLELINE);
 
-		RECT sourceHeader = { colSource, top + 4, colProcess, top + LogHeaderHeight };
-		DrawTextSimple(dc, L"来源", sourceHeader, g_labelFont, ColorTextSecondary, DT_LEFT | DT_SINGLELINE);
+		RECT sourceHeader = { colSource, top + sheetPad + 4, colProcess,
+			top + sheetPad + LogHeaderHeight };
+		DrawTextSimple(dc, L"来源", sourceHeader, g_labelFont, logHeaderColor, DT_LEFT | DT_SINGLELINE);
 
-		RECT procHeader = { colProcess, top + 4, colOp, top + LogHeaderHeight };
-		DrawTextSimple(dc, L"进程", procHeader, g_labelFont, ColorTextSecondary,
+		RECT procHeader = { colProcess, top + sheetPad + 4, colOp,
+			top + sheetPad + LogHeaderHeight };
+		DrawTextSimple(dc, L"进程", procHeader, g_labelFont, logHeaderColor,
 			DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS);
 
-		RECT opHeader = { colOp, top + 4, colTarget - 4, top + LogHeaderHeight };
-		DrawTextSimple(dc, L"操作", opHeader, g_labelFont, ColorTextSecondary,
+		RECT opHeader = { colOp, top + sheetPad + 4, colTarget - 4,
+			top + sheetPad + LogHeaderHeight };
+		DrawTextSimple(dc, L"操作", opHeader, g_labelFont, logHeaderColor,
 			DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS);
 
-		RECT targetHeader = { colTarget, top + 4, colStatus - 6, top + LogHeaderHeight };
-		DrawTextSimple(dc, L"目标（键 / 文件 / 进程）", targetHeader, g_labelFont, ColorTextSecondary,
+		RECT targetHeader = { colTarget, top + sheetPad + 4, colStatus - 6,
+			top + sheetPad + LogHeaderHeight };
+		DrawTextSimple(dc, L"目标（键 / 文件 / 进程）", targetHeader, g_labelFont, logHeaderColor,
 			DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS);
 
-		RECT statusHeader = { colStatus, top + 4, contentRight, top + LogHeaderHeight };
-		DrawTextSimple(dc, L"状态", statusHeader, g_labelFont, ColorTextSecondary,
+		RECT statusHeader = { colStatus, top + sheetPad + 4, contentRight,
+			top + sheetPad + LogHeaderHeight };
+		DrawTextSimple(dc, L"状态", statusHeader, g_labelFont, logHeaderColor,
 			DT_RIGHT | DT_SINGLELINE);
 
-		RECT headerLine = { 0, top + LogHeaderHeight, client.right, top + LogHeaderHeight + 1 };
-		HBRUSH lineBrush = CreateSolidBrush(ColorBorder);
-		FillRect(dc, &headerLine, lineBrush);
-		DeleteObject(lineBrush);
+		RECT headerLine = { 0, top + sheetPad + LogHeaderHeight,
+			client.right, top + sheetPad + LogHeaderHeight + 1 };
+		if (!g_glass.active) {
+			HBRUSH lineBrush = CreateSolidBrush(ColorBorder);
+			SceneFillRect(dc, &headerLine, lineBrush);
+			DeleteObject(lineBrush);
+		}
 
 		// ---- 行区 ----
-		const int rowsTop = top + LogHeaderHeight + 1;
+		const int rowsTop = top + sheetPad + LogHeaderHeight + 1;
 		const int rowsHeight = bottom - rowsTop;
 		int visibleRows = rowsHeight / LogRowHeight;
 		if (visibleRows < 1) {
@@ -3586,12 +4949,28 @@ namespace
 				const bool isHistoryRow =
 					row.Serial <= R3ShieldCoreStats::HistoryCount();
 
-				// 交替底色，方便横向对行
-				if (isHistoryRow || (i - start) % 2 == 1) {
+				// 交替底色，方便横向对行。
+				// ★ v85：玻璃模式下**只**给历史行铺一层半透明暖色 ——
+				//   ① 斑马纹取消（实色条会把玻璃卡切成色带）；
+				//   ② 历史行必须留标记：它是"上一轮会话的事件"，和本次会话
+				//      混在一起会误导（v54 起就要求一眼可分）。原来是靠"更暗的
+				//      底色 + 史字标记"，但史字标记从来没实现过 ⇒ 底色一取消
+				//      就彻底分不出来了，所以这里改成半透明暖色。
+				if (g_glass.active) {
+					if (isHistoryRow) {
+						// ★ v88：原来这里铺的是 {0 .. client.right} —— **整个客户区宽**。
+						//   经典模式日志页本来就是通栏的，看不出来；但玻璃模式下的
+						//   卡片是左右各内缩 12 的，色带会一直淌到卡片外面，
+						//   在卡片圆角两侧露出两条暖色横杠。
+						RECT alt = { contentLeft - 12, rowTop,
+							contentRight + 12, rowTop + LogRowHeight };
+						BlendFillRect(dc, alt, RGB(214, 196, 150), 46);
+					}
+				} else if (isHistoryRow || (i - start) % 2 == 1) {
 					RECT alt = { 0, rowTop, client.right, rowTop + LogRowHeight };
 					HBRUSH altBrush = CreateSolidBrush(
 						isHistoryRow ? ColorLogRowHistory : ColorLogRowAlt);
-					FillRect(dc, &alt, altBrush);
+					SceneFillRect(dc, &alt, altBrush);
 					DeleteObject(altBrush);
 				}
 
@@ -3599,7 +4978,7 @@ namespace
 				COLORREF decisionColor = DecisionColor(static_cast<R3ShieldCore::Decision>(row.Decision));
 				RECT stripe = { 0, rowTop + 2, 3, rowTop + LogRowHeight - 2 };
 				HBRUSH stripeBrush = CreateSolidBrush(decisionColor);
-				FillRect(dc, &stripe, stripeBrush);
+				SceneFillRect(dc, &stripe, stripeBrush);
 				DeleteObject(stripeBrush);
 
 				int textTop = rowTop + 3;
@@ -3749,7 +5128,7 @@ namespace
 		const int infoTop = client.bottom - PromptSummaryHeight();
 		RECT separator = { Padding, infoTop, ClientWidth() - Padding, infoTop + 1 };
 		HBRUSH sepBrush = CreateSolidBrush(ColorBorder);
-		FillRect(dc, &separator, sepBrush);
+		SceneFillRect(dc, &separator, sepBrush);
 		DeleteObject(sepBrush);
 
 		RECT infoRect = { Padding, infoTop + 8, ClientWidth() - Padding, infoTop + 42 };
@@ -3770,73 +5149,121 @@ namespace
 		}
 
 		// -----------------------------------------------------------------
-		// ★ v83 液态玻璃：先把"背景 + 面板"这一层准备好，再在上面画内容。
+		// ★★★ v86：**整窗换成 OpenGL 场景渲染**（照参考项目
+		//   `LiquidGlassControls` 的渲染顺序重写，布局与逻辑一个字没改）。
 		//
-		//   玻璃层的内容 = 窗口后方的真实桌面（捕获，已模糊）+ 各面板的
-		//   圆角折射/色散/rim/投影。它**不含**任何文字与表格 —— 那些属于内容层，
-		//   每帧都要重画（ARK 页 300ms 一刷）。这个切分是性能的关键。
-		//
-		//   `Begin()` 返回 false（`R3SHIELDCORE_GLASS=off` 或缓冲区建不起来）
-		//   ⇒ 走原来的不透明渐变路径，一像素都不变（现场一键回退靠它）。
+		//   参考项目的顺序是：
+		//     抓屏 → 模糊 → 背景 → 玻璃层（有序）→ 实心层 → 图标层 → 文字层 → 上屏
+		//   也就是说"这一帧画什么"必须**全部先攒起来**，最后一次性提交。
+		//   所以这里的顺序固定成五步，任何一步换位置都会出可见的错：
+		//     ① `g_scene.Begin()` + `g_glass.BeginFrame()`  清空本帧顶点/面板表
+		//     ② `g_glass.Prepare()`  判断有没有玻璃（`active`）—— **必须**在画之前，
+		//        因为各页要靠它决定"登记玻璃 / 画深色字 / 画实色底"
+		//     ③ 画顶栏 / 页签 / 各页 —— 全部写进场景，一个 HDC 都不碰
+		//     ④ `g_glass.Compose()`  背景 + 玻璃 [+ 内容] 一次合成
+		//     ⑤ 上屏
+		//   ★ v85 及之前是"先把玻璃层 BitBlt 上来、再拿 GDI 往上画内容"，
+		//     那样玻璃再准也还是"GDI 界面上贴了几张玻璃卡"。现在内容也在 GL 里。
 		// -----------------------------------------------------------------
 		const float dpi = GlassDpiScale(hwnd);
-		const bool wantBackdrop = g_glassWantBackdrop ||
-			(GetTickCount64() - g_glassMovedAt) < 1200;   // 拖动/缩放期间持续刷新
-		g_glass.headerBand = TabBarTop + TabBarHeight;   // 顶栏 + 页签条共用一块薄纱
+
+		// ---- v95：背景"自己在变"的自适应跟随 ----
+		// 详见 g_bgWatchUntil 的注释。这里做两件事：
+		//   ① 上一帧合成时抓到的背景和"上次见到的"不同 ⇒ 开观察窗 + 叫醒快时钟；
+		//   ② 观察窗内，每 40ms 主动要求抓一次（25fps），不要等 300ms 常态重画。
+		const ULONGLONG nowMs = GetTickCount64();
+		if (g_glass.backdrop.refreshStamp != g_bgLastStamp) {
+			g_bgLastStamp = g_glass.backdrop.refreshStamp;
+			g_bgWatchUntil = nowMs + 900;
+			EnsureAnimTimer();
+		}
+		bool wantBackdrop = g_glassWantBackdrop ||
+			(nowMs - g_glassMovedAt) < 1200;   // 拖动/缩放期间持续刷新
+		// 跟随间隔：**自己窗口**在拖动/缩放 ⇒ 40ms（这一段最扎眼，必须跟手）；
+		// 其它情况（背后有窗口在动 / 动态壁纸）⇒ 100ms。
+		//
+		// ★ 为什么不一味给 40ms：实测这台机器上**一次完整重绘 ≈ 20ms**
+		//   （GL 合成 + 内容层 + 背景上传与模糊）。25fps 就是 50% 单核，
+		//   60fps 物理上做不到 —— 再快只会把 CPU 吃满、帧率一点不涨。
+		//   100ms（10fps）在"糊过的背景"上看不出台阶，CPU 约 20%。
+		const ULONGLONG followMs = (nowMs - g_glassMovedAt) < 1200 ? 40ull : g_bgFollowMs;
+		if (!wantBackdrop && nowMs < g_bgWatchUntil && (nowMs - g_bgForceAt) >= followMs) {
+			wantBackdrop = true;
+		}
+		if (wantBackdrop) {
+			g_bgForceAt = nowMs;
+		}
+		// ★ v85：玻璃模式下顶栏自己就是一块**浮起来的玻璃条**（见下面
+		//   RegisterHeaderBar），所以**不要**再铺那条全宽的白色薄纱 ——
+		//   两者叠在一起会让窗口最上面 100px 变成一片奶白，背景的景深全丢。
+		//   经典模式仍然保留薄纱（它不铺玻璃，靠它提亮）。
+		g_glass.headerBand = (g_uiStyle == Style::Glass) ? 0 : (TabBarTop + TabBarHeight);
 		g_glass.headerVeil = 0.20f;
 
 		// ★ 风格门：经典模式下**不进**玻璃层（`active` 保持 false ⇒ 走老绘制路径）。
 		const bool glassWanted = (g_uiStyle == Style::Glass);
 		if (!glassWanted) {
 			g_glass.active = false;
-		}
-		if (glassWanted) {
+			g_glass.glCompose = nullptr;
+		} else if (g_gl.Ready()) {
 			// GPU 就绪就走 GL；否则 glCompose 为空 ⇒ CPU 合成（ui_material.h）。
-			if (g_gl.Ready()) {
-				g_glass.glCompose = GlComposeBridge;
-				g_glass.glCtx = &g_gl;
-			} else {
-				g_glass.glCompose = nullptr;
-			}
+			g_glass.glCompose = GlComposeBridge;
+			g_glass.glCtx = &g_gl;
+		} else {
+			g_glass.glCompose = nullptr;
 		}
-		if (glassWanted && g_glass.Begin(hwnd, client.right, client.bottom, dpi, wantBackdrop)) {
+
+		// ①② 场景开帧 + 玻璃层准备（不合成）
+		g_scene.Begin(client.right, client.bottom, dpi);
+		g_glass.BeginFrame();
+		const bool glassActive =
+			glassWanted && g_glass.Prepare(hwnd, client.right, client.bottom, dpi, wantBackdrop);
+		if (glassActive) {
 			g_glassWantBackdrop = false;
 			if (!g_glassLogged) {
 				g_glassLogged = true;
-				printf("[glass] 液态玻璃已就绪 背景=%ls 后端=%ls 尺寸=%dx%d dpi=%.2f 标记=%ls\n",
+				printf("[glass] 液态玻璃已就绪 背景=%ls 后端=%ls 尺寸=%dx%d dpi=%.2f 标记=%ls 控件=%ls 场景=%ls\n",
 					R3ShieldCoreUi::BackdropSourceName(g_glass.backdrop.source),
-					g_glass.backend == 1 ? L"OpenGL" : L"CPU",
+					g_glass.glCompose ? L"OpenGL" : L"CPU",
 					client.right, client.bottom, static_cast<double>(dpi),
-					R3ShieldCoreUi::kGenerationMarker);
+					R3ShieldCoreUi::kGenerationMarker,
+					// ★ v85：控件库的代次标记必须**被引用一次**，否则
+					//   inline constexpr 的宽串会被链接器当死代码丢掉，
+					//   发布闸门就查不到它（v83 踩过：cfg 少一行 ⇒ 闸门 FAIL）。
+					UiCtl::kMarker,
+					// ★ v86：场景渲染器的代次标记，同理必须被引用。
+					R3ShieldCoreUi::kSceneMarker);
 			}
 		} else if (glassWanted) {
 			static int s_glassFailLogged = 0;
 			if (s_glassFailLogged < 3) {
 				++s_glassFailLogged;
-				printf("[glass] 诊断：Begin 失败 active=%d enabled=%d client=%dx%d stage=%d\n",
+				printf("[glass] 诊断：Prepare 失败 active=%d enabled=%d client=%dx%d stage=%d\n",
 					g_glass.active ? 1 : 0, R3ShieldCoreUi::GlassEnabled() ? 1 : 0,
 					client.right, client.bottom, g_glass.failStage);
 			}
 		}
 
 		// -----------------------------------------------------------------
-		// 双缓冲载体：**始终**是兼容位图（与改造前完全一致）。
+		// 双缓冲载体：**始终**是兼容位图。
 		//
-		// ★★ 为什么不在玻璃层的 32bpp DIB 上直接画内容（踩过）：
+		// ★★ 为什么不直接把内容画进玻璃层的 32bpp DIB（v83 踩过）：
 		//   GDI 的 ClearType 在 `CreateDIBSection` 出来的 32bpp 表面上**渲染不出
-		//   深色字** —— 实测整屏文字变成白色（浅底上几乎看不见），而且不报任何错。
-		//   ⇒ 玻璃层只当"背景图"用，`BitBlt` 到兼容位图，内容还是画在兼容位图上。
-		//   代价是多一次整幅拷贝（~1ms），换来的是文字渲染路径零变化。
+		//   深色字** —— 实测整屏文字变成白色，而且不报任何错。
+		//   v86 之后 GL 那条路上文字根本不经 GDI（走字形图集），但**经典模式
+		//   和 CPU 回落**仍然要用 GDI 重放场景（`g_scene.PaintGdi`），
+		//   所以这张兼容位图必须留着。
 		// -----------------------------------------------------------------
 		HDC buffer = CreateCompatibleDC(dc);
 		HBITMAP bitmap = CreateCompatibleBitmap(dc, client.right, client.bottom);
 		HGDIOBJ oldBitmap = SelectObject(buffer, bitmap);
 
-		if (g_glass.active) {
-			// 玻璃层（背景 + 面板）已成品，直接盖到双缓冲上，随后画内容。
-			BitBlt(buffer, 0, 0, client.right, client.bottom, g_glass.layer.dc, 0, 0, SRCCOPY);
-		} else {
-			// ---- 兜底：原来的不透明渐变（`R3SHIELDCORE_GLASS=off` / 玻璃不可用）----
+		// ★ v85：控件库的"本帧画布"。必须在这里同步 —— 下面所有 UiCtl::*
+		//   都往 g_ui 上登记面板，dpi 也必须和这一帧的窗口一致。
+		SyncUiSurface(buffer);
+
+		if (!glassActive) {
+			// ---- 兜底：原来的不透明渐变（经典模式 / 玻璃不可用）----
 			TRIVERTEX bodyVertices[2] = {
 				{ 0, 0, 0xF100, 0xF700, 0xFC00, 0x0000 },
 				{ client.right, client.bottom, 0xE800, 0xF100, 0xFA00, 0x0000 }
@@ -3853,23 +5280,70 @@ namespace
 			GradientFill(buffer, headerVertices, 2, &headerGradient, 1, GRADIENT_FILL_RECT_V);
 		}
 
+		// ★ v85：顶栏 = 一块**两端留边、四角全圆**的玻璃条（参考项目的做法）。
+		//   为什么要留边而不是通栏：通栏玻璃条的左右两端被窗口边切掉，
+		//   圆角就没了，"浮起来"的感觉也就没了 —— 而这是液态玻璃的全部。
+		if (g_glass.active) {
+			// ★ v85：左边距统一 8 —— 顶栏、页签凹槽、内容卡、底部状态条
+			//   全部对齐到同一条竖线。差 2px 在自绘界面上**看得见**
+			//   （相邻两块玻璃的边缘不齐，比"都靠边"更显脏）。
+			const int pad = 8;
+			const int top = 8;
+			const int bottom = 58;
+			UiCtl::Piece(g_ui, pad, top, client.right - pad, bottom,
+				20.0f * dpi, 0.62f, UiCtl::CardTone, UiCtl::KPiece);
+		}
+
 		// 标题文字区右边界要给右侧的「默认置顶 / 超级置顶 / 模式徽章」让位，
 		// 否则拉宽/收窄时文字会钻到按钮底下。
 		const int headerTextRight = TopMostButtonRect().left - 16;
-		RECT headerText = { Padding, 14, headerTextRight, 38 };
-		DrawTextSimple(buffer, GuiTitle, headerText, g_titleFont, ColorTextPrimary,
+		// ★ v87：标题/副标题各上移 2px，副标题不再贴着玻璃条下沿。
+		RECT headerText = { Padding, 12, headerTextRight, 36 };
+		DrawTextSimple(buffer, GuiTitle, headerText, g_titleFont,
+			g_glass.active ? UiCtl::ToColor(UiCtl::Ink) : ColorTextPrimary,
 			DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
-		RECT subtitle = { Padding, 38, headerTextRight, 56 };
-		DrawTextSimple(buffer, L"实时行为监控  ·  注入状态  ·  高危决策  ·  事件取证",
-			subtitle, g_labelFont, ColorTextSecondary, DT_LEFT | DT_SINGLELINE);
+		RECT subtitle = { Padding, 36, headerTextRight, 55 };
+		// ★ v91：有提示时**占用副标题这一行**显示（同一矩形，不会和标题打架）。
+		//   为什么复用这一行而不是新开一块：副标题是装饰性文案，让位成本最低；
+		//   新开一块要么压页签、要么压底部统计条，都会引入新的重叠问题。
+		//
+		// ★★★ v100：**必须先拷贝再画**。`g_notice` 由 `app.cpp` 主循环线程写，
+		//   这里是窗口线程读 —— 原来直接 `g_notice.c_str()` 交给 `DrawText`，
+		//   主循环只要在这期间重新赋值（释放堆块），就是 use-after-free +
+		//   并发进出 CRT 堆 ⇒ 堆死锁，主循环永久卡死（2026-10-23 事故）。
+		//   锁只包住"判断 + 拷贝"，`DrawText` 在锁外做。
+		bool noticeActive = false;
+		std::wstring noticeText;
+		{
+			std::lock_guard<std::mutex> lock(g_noticeMutex);
+			noticeActive = !g_notice.empty() && GetTickCount64() < g_noticeUntil;
+			if (noticeActive) {
+				noticeText = g_notice;
+			}
+		}
+		if (noticeActive) {
+			DrawTextSimple(buffer, noticeText.c_str(), subtitle, g_labelFont,
+				g_glass.active ? RGB(190, 60, 50) : ColorBlocked,
+				DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS);
+		}
+		else {
+			DrawTextSimple(buffer, L"实时行为监控  ·  注入状态  ·  高危决策  ·  事件取证",
+				subtitle, g_labelFont,
+				g_glass.active ? UiCtl::ToColor(UiCtl::Faint) : ColorTextSecondary,
+				DT_LEFT | DT_SINGLELINE);
+		}
 
 		DrawTopMostButtons(buffer);
 		DrawModeBadge(buffer, ModeBadgeTop);
+		DrawCaptionButtons(buffer);
 
-		RECT headerLine = { 0, 61, client.right, 62 };
-		HBRUSH lineBrush = CreateSolidBrush(ColorBorder);
-		FillRect(buffer, &headerLine, lineBrush);
-		DeleteObject(lineBrush);
+		// 分隔线：玻璃模式下不画（玻璃条的投影本身就是分隔）
+		if (!g_glass.active) {
+			RECT headerLine = { 0, 61, client.right, 62 };
+			HBRUSH lineBrush = CreateSolidBrush(ColorBorder);
+			SceneFillRect(buffer, &headerLine, lineBrush);
+			DeleteObject(lineBrush);
+		}
 
 		// 页签栏在标题区下方，六个页面共用。
 		DrawTabBar(buffer);
@@ -3894,33 +5368,102 @@ namespace
 			R3ShieldCoreStats::Snapshot snapshot = R3ShieldCoreStats::GetSnapshot();
 			ULONG injectedTotal = static_cast<ULONG>(InterlockedCompareExchange(&g_injectedTotal, 0, 0));
 
-			// 布局：底部询问统计栏固定贴底占 PromptSummaryHeight()，
-			// 「操作分布」和「触发最多的进程」在这之上平分剩余空间。
-			// 窗口可以被拉小（WS_THICKFRAME），所以行数必须按真实客户区高度算，
-			// 否则底部那一栏会被内容顶出可视区。
+			// 布局：底部询问统计栏固定贴底占 PromptSummaryHeight()。
 			const int contentBottom = client.bottom - PromptSummaryHeight() - 8;
-			constexpr int rowsPerSection = 6;              // 每段最多 6 行
-			constexpr int rowHeight = 24;                  // 每行 24px
-			constexpr int sectionHeaderHeight = 26 + 12;   // 标题 26 + 尾部间距 12
 
-			// 起点要从页签栏下方开始，否则概览会被页签压住。
-			int y = TabBarTop + TabBarHeight + 20;
-			DrawOverview(buffer, y, snapshot, injectedTotal);
-			DrawDecisionBreakdown(buffer, y, snapshot);
+			// ★★★ v87：概览页改成 **3 + 2 + 1 的卡片网格**（参考项目
+			//   `LiquidGlassControls` 的节奏）。
+			//
+			//   原来这里是"两张通栏大卡铺满整窗"：玻璃占了 90% 的面积，卡与卡之间
+			//   只有 10px 的缝，缝里什么都看不见 —— 于是"玻璃"和"背景"是同一片灰，
+			//   材质写得再准也读不出层次（用户的原话是"好黑啊/边缘很黑"，
+			//   但真正的问题是这个：**没有背景可透**）。
+			//
+			//   参考项目一屏 6 张卡、缝 14~18px，缝里能看见模糊过的桌面。
+			//   玻璃的价值全在那条缝里。所以这里第一件事是**留缝**。
+			constexpr int gap = 14;
+			const int left0 = Padding - 12;
+			const int right0 = ClientWidth() - Padding + 12;
+			const int avail = right0 - left0;
+			const int colW = (avail - gap * 2) / 3;
 
-			// 两段都要画，先给每段留出标题高度，剩下的行数平均分。
-			int remaining = contentBottom - y - sectionHeaderHeight * 2;
-			int rows = remaining > 0 ? remaining / (rowHeight * 2) : 0;
-			if (rows > rowsPerSection) {
-				rows = rowsPerSection;
+			int y = TabBarTop + TabBarHeight + 16;
+
+			// ---- 第一行：三个指标，各自一张卡 ----
+			RECT metricCards[3] = {};
+			for (int i = 0; i < 3; i++) {
+				const int x = left0 + i * (colW + gap);
+				metricCards[i] = { x, y, x + colW, y + 88 };
+				if (g_glass.active) {
+					UiCtl::Card(g_ui, metricCards[i], 0.44f);
+				}
 			}
-			if (rows < 0) {
-				rows = 0;
+
+			// ---- 第二行：决策分布（1/3）+ 操作分布（2/3）；第三行：进程 ----
+			const int row2Top = y + 88 + gap;
+			const int remain = contentBottom - row2Top - gap;
+			int row2H = (remain * 52) / 100;
+			int row3H = remain - row2H;
+			// 窗口可以被拉小（WS_THICKFRAME）。给两行各留一个下限，
+			// 拉得再小也不会出现"标题被卡片裁掉"这种半张脸。
+			if (row2H < 156) {
+				row2H = 156;
+			}
+			if (row3H < 120) {
+				row3H = 120;
 			}
 
-			DrawOpBreakdown(buffer, y, snapshot, rows);
-			DrawTopProcesses(buffer, y, snapshot, rows);
+			// ★ v87：第二行不是 1/3 + 2/3，而是 **40% + 60%**。
+			//   决策分布只有 4 行、标签最长 11 个字符，1/3（333px）扣掉标签列后
+			//   柱子只剩 90px，"比例"根本看不出来；操作分布的名字长
+			//   （SetInformationKey 这类 17 个字符），反而需要更宽。
+			const int row2LeftW = (avail - gap) * 40 / 100;
+			RECT cardDecision = { left0, row2Top, left0 + row2LeftW, row2Top + row2H };
+			RECT cardOps = { left0 + row2LeftW + gap, row2Top, right0, row2Top + row2H };
+			RECT cardProc = { left0, row2Top + row2H + gap, right0, row2Top + row2H + gap + row3H };
+
+			// ★★★ 登记顺序 = 合成顺序（后登记的压在上面）。
+			//   卡片必须在柱状条之前登记 —— 反过来会把整页的条形全部盖住，
+			//   症状是"柱状图不见了"，而卡片本身看着完全正常（v85 踩过）。
+			if (g_glass.active) {
+				UiCtl::Card(g_ui, cardDecision, 0.44f);
+				UiCtl::Card(g_ui, cardOps, 0.44f);
+				UiCtl::Card(g_ui, cardProc, 0.44f);
+			}
+
+			// 行数按卡片高度算（每行 26px，去掉内边距和标题）。
+			// ★ v88：行距 26 → 32（与两张分布卡内部的 `y += 32` 一致）。
+			//   原来算行数用 26、画的时候也是 26，是对的；改行距时**必须同步**，
+			//   否则会多算一行，最后一行压在卡片底边上。
+			const int opsRows = (row2H - CardPad * 2 - 28) / 32;
+			const int procRows = (row3H - CardPad * 2 - 28) / 32;
+
+			DrawOverview(buffer, metricCards, snapshot, injectedTotal);
+			DrawDecisionBreakdown(buffer, cardDecision, snapshot);
+			DrawOpBreakdown(buffer, cardOps, snapshot, opsRows);
+			DrawTopProcesses(buffer, cardProc, snapshot, procRows);
 			DrawPromptSummary(buffer, client.bottom, snapshot);
+		}
+
+		// -----------------------------------------------------------------
+		// ④ 合成：背景 + 玻璃 [+ 内容] 一次画完。
+		//
+		//   ★ 必须在**所有页画完之后**才调 —— 内容就是在这里画进 layer 的
+		//     （GL 后端把场景回调进着色器管线；CPU 后端则完全不碰内容）。
+		// -----------------------------------------------------------------
+		g_glass.Compose();
+
+		if (glassActive) {
+			// 玻璃层（背景 + 面板，GL 时连内容一起）已成品，盖到双缓冲上。
+			BitBlt(buffer, 0, 0, client.right, client.bottom, g_glass.layer.dc, 0, 0, SRCCOPY);
+		}
+
+		// ★ CPU 合成 / 经典模式：内容还没画出来 ⇒ 用 GDI 把整个场景重放一遍。
+		//   （GL 那条路上内容已经在 layer 里了，再画一遍会变成"文字描两遍"，
+		//     深色字会显得发胖。）
+		const bool contentInLayer = glassActive && g_glass.glCompose != nullptr;
+		if (!contentInLayer) {
+			g_scene.PaintGdi(buffer, true);
 		}
 
 		// ★ 诊断：设了 `R3SHIELDCORE_GLASS_DUMP=<路径>` 时，把本帧画好的缓冲
@@ -3952,13 +5495,12 @@ namespace
 			}
 		}
 
-		if (g_glass.active) {
-			// ★ 本帧记下的面板表若与"已合成的那张"不一致 ⇒ 再刷一帧
-			//   （详见 ui_material.h 里 GlassSurface::CommitPanels 的两帧收敛说明）。
-			//   典型触发：切页签、窗口缩放、悬停态变化。
-			if (g_glass.CommitPanels()) {
-				InvalidateRect(hwnd, nullptr, FALSE);
-			}
+		if (glassActive) {
+			// ★ v88：这里是 **SyncPanels**（不是 CommitPanels）。
+			//   主程序是"先画内容、后 Compose"，合成已经吃过本帧的 `cur[]` 了，
+			//   所以只要把 `used[]` 同步过去当对照即可 —— 用 CommitPanels
+			//   会把 layerDirty 置起来，CPU 回落路径就会每帧重跑一遍 box blur。
+			g_glass.SyncPanels();
 		}
 
 		SelectObject(buffer, oldBitmap);
@@ -3968,6 +5510,45 @@ namespace
 		EndPaint(hwnd, &ps);
 	}
 
+	// =====================================================================
+	//  v101：退出看门狗 —— 「退不出去」的最后一道保险
+	// =====================================================================
+	//
+	// 背景（2026-10-24 真机）：`g_quitRequest` 只是一个**标志**，真正退进程
+	// 的动作在 `app.cpp` 主循环里。主循环一旦被卡住（那天是被 procwatch 的
+	// "每个进程问一次引擎"卡在启动路径上），用户点退出就**只置了标志**：
+	// 窗口照常响应、照常重绘，但进程永远不退 —— 观感就是
+	// 「点了完全没反应 / 退不出去」，而日志里连一行错误都没有。
+	//
+	// 设计取舍（每一条都是刻意的）：
+	//   · 只在**用户明确要退出**时武装（按钮 / 托盘二次确认），不是常驻线程；
+	//   · 15 秒后无条件 `TerminateProcess(自己)`。
+	//     为什么敢硬杀：v89 拆进程之后，注入的 DLL 活在**引擎进程**里，
+	//     界面进程里一个 hook 都没有 ⇒ 硬杀界面**不会**留下悬空的 hook，
+	//     反注入本来也是引擎做。（拆进程之前不能这么干 —— 那会把被挂起的
+	//     进程留在半死状态，正是铁律 107 要防的。）
+	//   · 15 秒这个数：正常收尾最坏路径 ≈ 引擎 Stop 2s + 等引擎退出 3s +
+	//     procwatch 线程 join ≤4s ≈ 10s，留 5s 余量。正常情况根本走不到。
+	void ArmExitWatchdog()
+	{
+		static volatile LONG s_armed = 0;
+		if (InterlockedExchange(&s_armed, 1) != 0) {
+			return;   // 已武装（用户连点多次，不重复起线程）
+		}
+		HANDLE h = CreateThread(nullptr, 0, [](LPVOID) -> DWORD {
+			Sleep(15000);
+			// 走到这里 = 主循环 15 秒内没把进程收掉。
+			printf("[quit] 退出看门狗触发：主循环 15 秒内未完成收尾，强制结束界面进程"
+				"（引擎是独立进程，会继续防护）\n");
+			fflush(stdout);
+			TerminateProcess(GetCurrentProcess(), 0);
+			return 0;
+		}, nullptr, 0, nullptr);
+		if (h) {
+			CloseHandle(h);   // 线程自己会跑完；句柄用完即关
+		}
+	}
+
 	// 执行一个按钮动作。
 	//
 	// 只在 **WM_LBUTTONUP 且松手时鼠标仍停在同一个按钮上** 才调用 ——
@@ -3975,12 +5556,21 @@ namespace
 	//（对「退出引擎」这种破坏性动作尤其危险）。
 	void PerformHeaderAction(HWND hwnd, HeaderAction action)
 	{
+		// ★ v100 诊断：把"按钮确实触发了"留在日志里。没有这行的话，
+		//   "点了没反应"永远分不清是 ① 鼠标没到窗口 ② 命中了别的控件
+		//   ③ 置位了但主循环没消费 —— 三者都表现为"什么都没发生"。
+		printf("[btn] 触发 action=%d\n", static_cast<int>(action));
+		fflush(stdout);
+
 		switch (action) {
 		case HeaderAction::ExitEngine:
 			// 只置位，真正的收尾在 app.cpp 主循环里做
 			//（反注入 → 关窗口 → 退出进程）。界面线程绝不直接退进程 ——
 			// 否则引擎还没来得及反注入，被注入的进程里会留下悬空的 hook。
 			InterlockedExchange(&g_quitRequest, 1);
+			// ★ v101：武装看门狗。主循环要是 15 秒内没动静（2026-10-24 那次
+			//   就是卡在 procwatch 的启动扫描上），至少还能死得掉。
+			ArmExitWatchdog();
 			return;
 
 		case HeaderAction::CopyAllLogs:
@@ -4097,6 +5687,13 @@ namespace
 	//   `SetForegroundWindow` 只作为"能拿到就拿"的补充。
 	void TrayRestoreFromTray(HWND hwnd)
 	{
+		// ★ v84：从托盘还原时窗口还是隐藏的 ⇒ 可以重新抓一次真实背景
+		//   （用户可能已经切到别的窗口/换了壁纸，重新抓比一直用启动时那张准）。
+		if (g_uiStyle == Style::Glass) {
+			RECT crc = {};
+			GetClientRect(hwnd, &crc);
+			g_glass.CaptureBackdropBeforeShow(hwnd, crc.right, crc.bottom);
+		}
 		ShowWindow(hwnd, SW_SHOW);
 		if (IsIconic(hwnd)) {
 			ShowWindow(hwnd, SW_RESTORE);
@@ -4141,6 +5738,9 @@ namespace
 		//    ⚠️ 第一版写成了"设标志 + DestroyWindow(hwnd)" —— 那会让 GUI 窗口
 		//       在反注入**之前**就被毁掉，等于绕过了有序收尾（正是这条铁律要防的）。
 		InterlockedExchange(&g_quitRequest, 1);
+		// ★ v101：和「退出引擎」按钮走**同一条**收尾路径，所以看门狗也要武装。
+		//   用户明确说了要退出，就不能出现"窗口收了、进程还在"这种观感。
+		ArmExitWatchdog();
 	}
 
 	// 托盘图标的回调（鼠标事件都塞在 `lParam` 里 —— 这是 NOTIFYICON_VERSION_4 的约定）。
@@ -4199,6 +5799,50 @@ namespace
 		}
 	}
 
+	// ------------------------------------------------------------------
+	// ★ v94：切页签（点击 / 按住拖动共用这一个入口）
+	//
+	//   为什么要抽出来：参考项目里 dock 是**分段控件**，鼠标按下后按住
+	//   横向拖动，滑过哪段就切到哪段（`g_dragId` + `K_SEG` 那段）。
+	//   本项目原来只有"点"，拖动时什么都不发生 —— 手感差一截。
+	//   两条路径共用同一个函数，才不会出现"点着切了、拖着没切"这种分叉。
+	// ------------------------------------------------------------------
+	void SelectTab(int tab)
+	{
+		if (tab < 0 || tab >= TabCount || tab == g_activeTab) {
+			return;
+		}
+		g_activeTab = tab;
+
+		// ★ v93：换页清一次动画表。key 里已经带了页号（不会串），
+		//   但不清的话 6 个页面的 key 会一直累积，撑满 192 个槽之后
+		//   新控件会静默退化成"不动画"—— 那种 bug 极难看出来。
+		//   页签滑块的两个弹簧**不在**表里（见 g_tabThumbX0/X1），
+		//   所以滑动不受影响。
+		g_anim.Clear();
+
+		// ★ v94：挤压。参考项目切换时把 dock 宽度**瞬间**加 12px
+		//   （`g_dockW.v = 122.0f`）再把目标设回 110 ⇒ 先胖一下再收回来。
+		//   这里同样：直接改 `v`（不是 tgt），所以是"起手就宽"。
+		g_tabSqueeze.v = 12.0f;
+		g_tabSqueeze.tgt = 0.0f;
+
+		EnsureAnimTimer();
+
+		if (tab == 1) {
+			// 首次进日志页直接贴底，不用手动滚。
+			g_logScroll = 0;
+			g_logFollowTail = true;
+		}
+		if (tab == 4) {
+			// 首次进 ARK 页立刻拉一次，别让用户看着空列表等一个扫描周期。
+			RefreshArkCache(true);
+		}
+		if (g_window) {
+			InvalidateRect(g_window, nullptr, FALSE);
+		}
+	}
+
 	LRESULT CALLBACK GuiWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
 	{
 		// ★ 托盘回调消息 —— **必须**在 switch **之前**用 if 判断（铁律 **250**）。
@@ -4238,9 +5882,89 @@ namespace
 			InvalidateRect(hwnd, nullptr, FALSE);
 			return 0;
 
+		// -----------------------------------------------------------------
+		// ★★★ v98：自绘标题栏的两个必备消息
+		//
+		//   `WM_NCCALCSIZE` 返回 0 ⇒ **客户区 = 整个窗口矩形**，系统标题栏
+		//   和边框不再占位，玻璃从窗口最上沿开始铺。这是"去掉标题栏但保留
+		//   缩放边框"的标准做法（比 `WS_POPUP` 无边框干净，DWM 阴影和
+		//   圆角都还在）。
+		//
+		//   `WM_NCHITTEST` 负责把"系统原本替我们做的事"补回来：
+		//     · 四周 8px 还给缩放；
+		//     · 顶栏那条（y < 58）还给拖动（HTCAPTION，双击即最大化）；
+		//     · 按钮上必须返回 HTCLIENT，否则点不到（HTCAPTION 会把
+		//       点击吞成"拖窗口"）。
+		//
+		//   ⚠️ 顺序不能反：先判按钮，再判拖动区。
+		// -----------------------------------------------------------------
+		case WM_NCCALCSIZE:
+			if (wParam == TRUE && g_uiStyle == Style::Glass) {
+				// ★ v98：最大化时必须**扣掉窗口边框**。
+				//
+				//   最大化时系统会把窗口矩形撑到"工作区 + 一圈边框"，
+				//   而客户区 = 窗口矩形 ⇒ 四周各溢出 7~8px，界面的
+				//   最外一圈（圆角、卡片边缘）被切到屏幕外。
+				//   实测：不扣的时候最大化客户区是 1934x1094 且原点 (-7,-7)。
+				//   非最大化时不能扣 —— 那样又会露出一圈桌面缝。
+				NCCALCSIZE_PARAMS* params = reinterpret_cast<NCCALCSIZE_PARAMS*>(lParam);
+				if (params && IsZoomed(hwnd)) {
+					// 直接用**工作区矩形**（屏幕坐标），不要用"减边框"的算术：
+					// 边框宽度和系统实际膨胀量差 1px，减出来的结果四周会各少 1px。
+					MONITORINFO mi = {};
+					mi.cbSize = sizeof(mi);
+					if (GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mi)) {
+						params->rgrc[0] = mi.rcWork;
+					}
+				}
+				return 0;   // 客户区 = 窗口矩形（最大化时 = 工作区）
+			}
+			break;
+
+		case WM_NCHITTEST: {
+			if (g_uiStyle != Style::Glass) {
+				break;   // 经典模式还有系统标题栏，交回默认处理
+			}
+			POINT screenPt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+			POINT pt = screenPt;
+			ScreenToClient(hwnd, &pt);
+
+			RECT client = {};
+			GetClientRect(hwnd, &client);
+			const bool zoomed = IsZoomed(hwnd) != FALSE;
+			// 最大化时不留缩放边（留了会在屏幕边缘出现"拖不动但能触发"的死区）
+			const int b = zoomed ? 0 : 8;
+
+			if (b > 0) {
+				const bool left = pt.x < b;
+				const bool right = pt.x >= client.right - b;
+				const bool top = pt.y < b;
+				const bool bottom = pt.y >= client.bottom - b;
+				if (top && left) return HTTOPLEFT;
+				if (top && right) return HTTOPRIGHT;
+				if (bottom && left) return HTBOTTOMLEFT;
+				if (bottom && right) return HTBOTTOMRIGHT;
+				if (left) return HTLEFT;
+				if (right) return HTRIGHT;
+				if (top) return HTTOP;
+				if (bottom) return HTBOTTOM;
+			}
+
+			// 标题栏拖动区 = 顶栏玻璃条那一带（0..58），按钮除外
+			if (pt.y < 58) {
+				if (HitTestCapButton(pt) != CapBtn::None) {
+					return HTCLIENT;
+				}
+				if (HitTestHeaderAction(pt) != HeaderAction::None) {
+					return HTCLIENT;
+				}
+				return HTCAPTION;
+			}
+			return HTCLIENT;
+		}
+
 		case WM_GETMINMAXINFO: {
-			MINMAXINFO* info = reinterpret_cast<MINMAXINFO*>(lParam);
-			// 最小宽度 1040：页签占满左侧（Padding 20 + 5×(84+8) - 8 = 472），
+			MINMAXINFO* info = reinterpret_cast<MINMAXINFO*>(lParam);			// 最小宽度 1040：页签占满左侧（Padding 20 + 5×(84+8) - 8 = 472），
 			// 右侧动作簇现在有 5 个按钮（退出引擎 / 复制全部日志 / 复制日志路径 /
 			// 清空统计 / 切换模式），最左的「退出引擎」左边界 = 客户区宽 - 532。
 			// 472 + 532 = 1004，再加边框与非客户区 ⇒ 窗口 1040。
@@ -4310,6 +6034,30 @@ namespace
 			}
 
 			const POINT point = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+			// ★ v103：记住最后位置 —— `DrawConfigPage` 判断「应用」按钮悬停要用。
+			//   放在拖动分支**之前**：拖动中也该更新，否则松手后悬停停在旧位置。
+			g_mousePoint = point;
+
+			// ★ v94：按住页签拖动 —— 划过哪段就切到哪段（参考项目 K_SEG 的行为）。
+			//   必须在悬停判定**之前**处理：拖动过程中用户看的是滑块跟手，
+			//   不是"哪个页签变色"。
+			if (g_tabDrag >= 0) {
+				const int over = HitTestTab(point);
+				if (over >= 0) {
+					SelectTab(over);
+				}
+				return 0;
+			}
+
+			// ★ v98：自绘标题栏按钮的悬停（它们不在 HeaderAction 那套里 ——
+			//   窗口按钮的语义和业务动作不同，也不该走 PerformHeaderAction）。
+			const CapBtn capOver = (g_uiStyle == Style::Glass)
+				? HitTestCapButton(point) : CapBtn::None;
+			if (capOver != g_capHover) {
+				g_capHover = capOver;
+				InvalidateRect(hwnd, nullptr, FALSE);
+			}
+
 			const HeaderAction hovered = HitTestHeaderAction(point);
 			// 页签单独判：它和按钮不同行，也不共用 HeaderAction。
 			const int hoveredTab = (hovered == HeaderAction::None) ? HitTestTab(point) : -1;
@@ -4340,6 +6088,9 @@ namespace
 				g_hoverTab = hoveredTab;
 				g_arkHoverAction = hoveredArk;
 				g_advLaunchHover = hoveredLaunch;
+				// ★ v93：悬停是**逐帧插值**的（参考项目 14/s 指数逼近），
+				//   所以状态一变就要把动画时钟叫起来，否则目标值改了但没人推进。
+				EnsureAnimTimer();
 				InvalidateRect(hwnd, nullptr, FALSE);
 			}
 			return 0;
@@ -4347,6 +6098,8 @@ namespace
 
 		case WM_MOUSELEAVE:
 			g_trackingMouseLeave = false;
+			g_capHover = CapBtn::None;   // v98：窗口按钮的悬停也要一起清
+			EnsureAnimTimer();   // 让悬停态淡出，而不是"啪"一下消失
 			if (g_hoverButton != HeaderAction::None || g_hoverTab >= 0
 				|| g_arkHoverAction != ArkButtonNone || g_advLaunchHover != -1) {
 				g_hoverButton = HeaderAction::None;
@@ -4360,6 +6113,12 @@ namespace
 		case WM_CAPTURECHANGED:
 			// 捕获被抢走（弹了 UAC、别的窗口抢了鼠标）⇒ 清掉按下态，
 			// 否则按钮会永远停在"按下"的样子。
+			// ★ v94：页签拖动也一样 —— 不清的话 `g_tabDrag` 会一直 >= 0，
+			//   之后每一次 WM_MOUSEMOVE 都在"拖动分支"里提前 return，
+			//   表现是"整个界面的悬停全部失灵"，而且看不出原因。
+			if (g_tabDrag >= 0) {
+				g_tabDrag = -1;
+			}
 			if (g_pressedButton != HeaderAction::None || g_arkPressedAction != ArkButtonNone
 				|| g_advLaunchPressed != -1) {
 				g_pressedButton = HeaderAction::None;
@@ -4372,30 +6131,51 @@ namespace
 		case WM_LBUTTONDOWN: {
 			POINT point = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
 
+			// ★ v98：自绘标题栏的窗口按钮。**按 Windows 惯例立即执行**
+			//   （不等 WM_LBUTTONUP）—— 标题栏按钮是可以"按下去就生效、
+			//   拖走也不取消"的，和普通按钮的语义不同。
+			const CapBtn capBtn = (g_uiStyle == Style::Glass)
+				? HitTestCapButton(point) : CapBtn::None;
+			if (capBtn == CapBtn::Min) {
+				ShowWindow(hwnd, SW_MINIMIZE);
+				return 0;
+			}
+			if (capBtn == CapBtn::Max) {
+				ShowWindow(hwnd, IsZoomed(hwnd) ? SW_RESTORE : SW_MAXIMIZE);
+				return 0;
+			}
+			if (capBtn == CapBtn::Close) {
+				// 与系统 ✕ 完全同义：走 WM_CLOSE ⇒ 收进托盘（引擎继续跑）。
+				PostMessageW(hwnd, WM_CLOSE, 0, 0);
+				return 0;
+			}
+
 			// 按钮：按下只进入"按下态" + 捕获鼠标，**真正的动作留到 WM_LBUTTONUP**。
 			// 标准按钮语义 —— 按下后拖出去再松手不触发，按错了能反悔。
 			const HeaderAction action = HitTestHeaderAction(point);
+			// ★ v100 诊断：按下时命中到哪个 header 按钮（None=-1 表示没命中）。
+			//   和 `[btn] 触发` 配对看，就能区分"按下没命中"和"松手被判成拖走"。
+			printf("[btn] 按下 (%d,%d) -> action=%d\n", static_cast<int>(point.x),
+				static_cast<int>(point.y), static_cast<int>(action));
+			fflush(stdout);
 			if (action != HeaderAction::None) {
 				g_pressedButton = action;
 				g_hoverButton = action;
+				EnsureAnimTimer();   // v93：按下缩 2.8% 是弹簧，要有人推进
 				SetCapture(hwnd);
 				InvalidateRect(hwnd, nullptr, FALSE);
 				return 0;
 			}
 
 			int tab = HitTestTab(point);
-			if (tab >= 0 && tab != g_activeTab) {
-				g_activeTab = tab;
-				if (tab == 1) {
-					// 首次进日志页直接贴底，不用手动滚。
-					g_logScroll = 0;
-					g_logFollowTail = true;
-				}
-				if (tab == 4) {
-					// 首次进 ARK 页立刻拉一次，别让用户看着空列表等一个扫描周期。
-					RefreshArkCache(true);
-				}
-				InvalidateRect(hwnd, nullptr, FALSE);
+			if (tab >= 0) {
+				// ★ v94：按住页签 = 进入拖动。参考项目 dock 是分段控件，
+				//   按下后横向划过哪段就切到哪段；本项目原来只有"点"。
+				//   `g_tabDrag` 记着"这次按下是从页签条开始的"，
+				//   WM_MOUSEMOVE 里据此连续切页。
+				g_tabDrag = tab;
+				SetCapture(hwnd);
+				SelectTab(tab);
 				return 0;
 			}
 
@@ -4427,6 +6207,95 @@ namespace
 					}
 				}
 				InvalidateRect(hwnd, nullptr, FALSE);
+				return 0;
+			}
+
+			// ★★★ v103：「配置」页的开关（用户："开关用不了，点不动"）。
+			//
+			//   语义**故意和别的按钮不同**：这里点一下就立刻拨、立刻重画，
+			//   不需要"按下→松手仍在同一处"那套。理由：
+			//     · 开关不是"执行一个动作"，是"改一个值" —— 参考项目的开关
+			//       也是按下即生效（`Switch` 在 K_SWITCH 的 WM_LBUTTONDOWN 里）；
+			//     · 拨动后**并不真的生效**（要按「应用」），所以不存在"误触
+			//       造成后果"这回事，可以做得跟手一点。
+			//
+			//   ★ 拨动只改寄存区，**不写文件、不发 IPC** —— UI 线程上做 I/O
+			//     会卡住整屏重绘（v101 的教训）。
+			if (g_activeTab == 3) {
+				RECT client = {};
+				GetClientRect(hwnd, &client);
+
+				ConfigField field = ConfigField::None;
+				if (HitTestConfigToggle(point, client, &field)) {
+					const bool before = DisplayConfigValue(field);
+					SetPendingConfig(field, !before);
+					// ★ v103 诊断：`R3SHIELDCORE_CFG_TRACE=1` 时把每次拨动打出来。
+					//   加它的理由：这台机器上截屏会被 IDE 窗口遮住（前台锁），
+					//   像素判据跑不起来；日志是唯一能自证"这一下点到了"的通道。
+					//   ★ 写文件而不是 printf —— WINDOWS 子系统没有 stdout。
+					if (ConfigTraceEnabled()) {
+						char trace[256] = {};
+						_snprintf_s(trace, _countof(trace), _TRUNCATE,
+							"toggle field=%d %d->%d dirty=%d diff=%d",
+							static_cast<int>(field), before ? 1 : 0,
+							DisplayConfigValue(field) ? 1 : 0,
+							g_pendingConfig.dirty ? 1 : 0,
+							HasPendingConfigDiff() ? 1 : 0);
+						ConfigTrace(trace);
+					}
+					// ★★ 拨完之后**立刻重算一次差异**，让「应用」按钮当场出现/消失。
+					//
+					//   不这么做的话：拨开 → 按钮出现（因为 `HasPendingConfigDiff`
+					//   在绘制时算）；拨回去 → 下一次绘制时按钮消失。看起来也对，
+					//   但 `g_pendingConfig.dirty` 会一直挂着 true，`DisplayConfigValue`
+					//   就一直走寄存区分支 —— 一旦这期间 `SetOptions` 没被调用
+					//   （比如引擎没连上），界面就永远显示寄存区里的陈旧值。
+					//   这里借 `BuildConfigApplyRequest` 的"无差异就清 dirty"逻辑
+					//   把状态收干净，这是它唯一的副作用。
+					BuildConfigApplyRequest();
+					EnsureAnimTimer();
+					InvalidateRect(hwnd, nullptr, FALSE);
+					return 0;
+				}
+
+				if (HitTestConfigApply(point, client)) {
+					// 把寄存区拼成请求。**真正的写法在 app.cpp**：
+					// 它要写 ini、要干净地停引擎、要重新 LoadLibrary 注入。
+					BuildConfigApplyRequest();
+					if (ConfigTraceEnabled()) {
+						char trace[256] = {};
+						_snprintf_s(trace, _countof(trace), _TRUNCATE,
+							"apply clicked valid=%d lines=%zu",
+							g_configApply.valid ? 1 : 0, g_configApply.lines.size());
+						ConfigTrace(trace);
+					}
+					if (g_configApply.valid) {
+						// ★ 顺序不能反：**先写数据、后置标志**。
+						//   反过来的话主循环可能看到标志却读到半份数据
+						//   （`lines` 还在被 push_back）—— 正是铁律 291 那类
+						//   "看起来只是慢一点"的竞态。
+						InterlockedExchange(&g_configApplyPending, 1);
+						// ★ 限定名调用：`ShowNotice` 属于 `R3ShieldCoreGui`，
+						//   而这里在文件顶部的匿名命名空间里。不带限定会去
+						//   找匿名命名空间的那个（不存在）⇒ `C3861`；
+						//   自己再声明一个 ⇒ `LNK2019`（两个不同的符号）。
+						R3ShieldCoreGui::ShowNotice(L"正在写入配置并重启引擎…", 4000);
+					}
+					SetCapture(hwnd);
+					InvalidateRect(hwnd, nullptr, FALSE);
+					return 0;
+				}
+
+				// 配置页没有别的可点区域。**必须吃掉这次点击** ——
+				// 否则会落到下面「日志页」那条按 x 分界的分支（旧版本就靠这个
+				// 巧合躲过去了；一旦以后加了别的页，就会变成跨页误触）。
+				if (ConfigTraceEnabled()) {
+					char trace[256] = {};
+					_snprintf_s(trace, _countof(trace), _TRUNCATE,
+						"miss at %ld,%ld (client=%ldx%ld)",
+						point.x, point.y, client.right, client.bottom);
+					ConfigTrace(trace);
+				}
 				return 0;
 			}
 
@@ -4472,6 +6341,16 @@ namespace
 
 		case WM_LBUTTONUP: {
 			const POINT point = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+
+			// ★ v94：页签拖动结束。捕获必须在这里放开，否则窗口会一直
+			//   吃鼠标消息（表现为"整个桌面点不动"）—— 比动画不对严重得多。
+			if (g_tabDrag >= 0) {
+				g_tabDrag = -1;
+				if (GetCapture() == hwnd) {
+					ReleaseCapture();
+				}
+				return 0;
+			}
 
 			// ★ v80：「高级」页的跳转按钮（与 ARK 那套同样单独处理 ——
 			//   它不在 HeaderAction 那套枚举里）。
@@ -4678,6 +6557,38 @@ namespace
 				}
 				return 0;
 			}
+			// ★ v93：动画时钟（16ms）。推进一帧 → 重画 → 全部收敛就停表。
+			//   这一条必须在下面"无脑重画"之前分流：那条路只重画不推进弹簧，
+			//   动画会永远停在第一帧。
+			if (wParam == AnimTimerId) {
+				const ULONGLONG now = GetTickCount64();
+				const float dt = g_animLastMs
+					? static_cast<float>(now - g_animLastMs) / 1000.0f
+					: 0.0f;
+				g_animLastMs = now;
+
+				// ⚠️ 页签滑块的两个弹簧**不在** g_anim 表里（它们不是"控件状态"，
+				//   而是页面级的），必须在这里单独推进 —— 忘了这一步的表现是
+				//   "点了页签，页面换了，但滑块还停在上一页"，而且不报错。
+				g_tabThumbX0.Step(dt);
+				g_tabThumbX1.Step(dt);
+				g_tabSqueeze.Step(dt, 190.0f, 15.0f);   // 参考项目 dock 的挤压参数
+				const bool busyBank = g_anim.Tick(dt);
+				// ★ v95：背景还在变（观察窗内）就**不许停表** ——
+				//   停了就退回 300ms 常态，背后拖窗口会一顿一顿。
+				const bool bgWatching = now < g_bgWatchUntil;
+				const bool busy = busyBank || bgWatching
+					|| g_tabThumbX0.Busy() || g_tabThumbX1.Busy()
+					|| g_tabSqueeze.Busy();
+
+				InvalidateRect(hwnd, nullptr, FALSE);
+				if (!busy) {
+					// 收敛：停表。最后一帧已经 Invalidate 了，界面停在终值上。
+					KillTimer(hwnd, AnimTimerId);
+					g_animRunning = false;
+				}
+				return 0;
+			}
 			// ★ v62：ARK 动作自检由**定时器**驱动，不能只靠 WM_PAINT。
 			//   最小化窗口永远收不到 WM_PAINT —— 只挂在绘制路径上的话，
 			//   自动化一用 `-WindowStyle Minimized` 起引擎，"自检没发"
@@ -4753,6 +6664,16 @@ namespace
 			else if (n > 0 && _wcsicmp(tabEnv, L"advanced") == 0) {
 				g_activeTab = 5;
 			}
+			// ★ v85：补上 `process` / `config` —— 探针一直支持这两个页签参数
+			//   （见 gui_preview_probe.cpp 的用法说明），但这里从来没实现过：
+			//   传 config 会**静默**停在概览页，而截图"看起来完全正常"。
+			//   ⇒ 这不是新功能，是补一条"探针说在核对某一页、其实没核对"的假绿。
+			else if (n > 0 && _wcsicmp(tabEnv, L"process") == 0) {
+				g_activeTab = 2;
+			}
+			else if (n > 0 && _wcsicmp(tabEnv, L"config") == 0) {
+				g_activeTab = 3;
+			}
 		}
 
 		g_window = CreateWindowEx(
@@ -4784,13 +6705,17 @@ namespace
 						g_gl.info[0] ? g_gl.info : "(unknown)",
 						R3ShieldCoreUi::kGlMarker);
 				} else {
-					printf("[glass] OpenGL 不可用（阶段=%d）⇒ 退回 CPU 合成 标记=%ls\n",
+					printf("[glass] OpenGL 不可用（阶段=%d）-> 退回 CPU 合成 标记=%ls\n",
 						g_gl.failStage, R3ShieldCoreUi::kGlMarker);
 				}
 			} else {
 				printf("[ui] 界面风格：经典（不铺玻璃层）标记=%ls\n",
 					R3ShieldCoreUi::kStyleMarker);
 			}
+			// ★ v98：玻璃风格 ⇒ 去掉系统标题栏（自绘）。必须在
+			//   `ApplyGlassWindow` **之前**：切风格会 SWP_FRAMECHANGED
+			//   重算一次非客户区，之后设的 DWM 圆角/标题栏配色才落在最终形态上。
+			ApplyCustomFrame(g_window);
 			ApplyGlassWindow(g_window);
 			// ★ v83：外框圆角（"背景透明圆角"）。
 			//   优先 DWM 的 `DWMWA_WINDOW_CORNER_PREFERENCE`（Win11 22H2+，由合成器
@@ -4836,6 +6761,22 @@ namespace
 				(screenWidth - width) / 2, (screenHeight - height) / 2,
 				0, 0, SWP_NOSIZE | SWP_NOZORDER);
 
+			// ★★★ v89：**删掉了**"窗口显示之前抓一次背景快照"。
+			//
+			//   那一版的设计意图是"显示前抓，抓到的就是透过窗口该看到的东西"，
+			//   但实测在这台机器上是**反的**：
+			//       [glass] 快照诊断 请求=1024x701 实际=1024x701 原点=448,201 均值=0
+			//       [glass] 背景快照抓取失败 ⇒ 用内置背景兜底
+			//   显示前那次抓到的是**全黑**（均值 0），于是直接掉进
+			//   `BuildDesignedFull` 的程序化渐变；而 `EnsureBackdrop` 又被
+			//   `backdrop.valid` 锁死不再重抓 ⇒ 屏幕上那层"玻璃"透视的
+			//   一直是程序自己画的一张图，**不是桌面**。
+			//
+			//   现在改成和参考项目 `LiquidGlassControls` 一致：
+			//   窗口显示之后，由 `EnsureBackdrop` 每 150ms 抓一次
+			//   （抓的瞬间才 `SetWindowDisplayAffinity(0x11)` 排除自己）。
+			//   第一次成功抓取就把内置背景永久换掉。
+
 			ShowWindow(g_window, SW_SHOW);
 			UpdateWindow(g_window);
 			SetFocus(g_window); // 收键盘消息用（End 回底、PgUp/PgDn 翻页）
@@ -4857,6 +6798,18 @@ namespace
 			}
 
 			SetTimer(g_window, 1, 300, nullptr);
+			// ★ v95：背景跟随间隔（见 g_bgFollowMs）。只在启动时读一次。
+			{
+				wchar_t msEnv[16] = {};
+				if (GetEnvironmentVariableW(L"R3SHIELDCORE_GLASS_FOLLOW_MS",
+						msEnv, _countof(msEnv)) > 0) {
+					const int v = _wtoi(msEnv);
+					if (v >= 16 && v <= 2000) {
+						g_bgFollowMs = static_cast<ULONGLONG>(v);
+						printf("[glass] 背景跟随间隔 = %dms（环境变量覆盖）\n", v);
+					}
+				}
+			}
 			// ★ v63：ARK 页的刷新定时器。间隔来自 `ark_refresh_ms`；
 			//   不在 ARK 页时它只做一次判断就返回（见 WM_TIMER），几乎零成本。
 			SetTimer(g_window, ArkRefreshTimerId, ArkRefreshIntervalMs(), nullptr);
@@ -4944,13 +6897,36 @@ namespace
 
 namespace R3ShieldCoreGui
 {
+	// ★★★ v103：`Options::LogPath` 的**深拷贝存储**。
+	//
+	// 为什么必须有：`LogPath` 是裸 `const WCHAR*`，调用方（app.cpp）传进来的
+	// 是**栈上 `Policy` 结构体内部**的缓冲。以前 `g_options = options;`
+	// 只拷指针 —— 那个 Policy 一出作用域，`g_options.LogPath` 就成了野指针，
+	// 而日志页 / 配置页会去画它（Dereference 一个已经归还的栈帧）。
+	// 一直没炸只是因为 app.cpp 里那份 Policy 活得比界面久。
+	// ★ v103 新增的「应用配置后刷新」会从**函数栈**里喂一份新的 ⇒ 必须真拷。
+	static WCHAR g_optionsLogPath[1024] = {};
+
+	void ApplyOptions(const Options& options)
+	{
+		g_options = options;
+		if (options.LogPath != nullptr && options.LogPath[0] != L'\0') {
+			wcsncpy_s(g_optionsLogPath, options.LogPath, _TRUNCATE);
+			g_options.LogPath = g_optionsLogPath;
+		}
+		else {
+			g_optionsLogPath[0] = L'\0';
+			g_options.LogPath = nullptr;
+		}
+	}
+
 	bool Start(const Options& options) noexcept
 	{
 		if (g_guiThread) {
 			return true;
 		}
 
-		g_options = options;
+		ApplyOptions(options);
 		InterlockedExchange(&g_displayMode, static_cast<LONG>(options.Mode));
 		InterlockedExchange(&g_pendingMode, -1);
 		InterlockedExchange(&g_uiAccessRestartRequest, 0);
@@ -5056,6 +7032,38 @@ namespace R3ShieldCoreGui
 		InterlockedExchange(&g_injectedTotal, static_cast<LONG>(injectedTotal));
 	}
 
+	// ★★★ v103：「配置」页应用完、引擎重启之后，把新的真值喂回界面。
+	//
+	// ★ 这里**必须**清掉待提交寄存区（`g_pendingConfig.dirty = false`）——
+	//   这是"开关不弹回旧值"的**唯一**正确时机：
+	//     · 早了（按下「应用」那一刻就清）⇒ 引擎还没重启完，
+	//       `g_options` 仍是旧值 ⇒ 开关先弹回旧值，看起来像没生效；
+	//     · 晚了 / 不清 ⇒ 用户下次进来看到的是自己拨的位置，
+	//       但引擎里根本不是那个值 —— 界面在撒谎。
+	//   只有"新值已经到了"这一刻清，`DisplayConfigValue` 才会从
+	//   `g_options` 读出**新值**，视觉上无缝。
+	void SetOptions(const Options& options) noexcept
+	{
+		ApplyOptions(options);
+
+		g_pendingConfig.dirty = false;
+		for (int i = 0; i < static_cast<int>(ConfigField::Count); i++) {
+			g_pendingConfig.value[i] = false;
+		}
+		g_configApply = ConfigApplyRequest{};
+		InterlockedExchange(&g_configApplyPending, 0);
+
+		// 弹簧的旧值也要跟着跳过去（不然会从旧位置滑一段）。
+		// ⇒ 直接重画，让 `DrawConfigRow` 用新目标值重建 Slot 的目标。
+		if (g_window) {
+			EnsureAnimTimer();
+			InvalidateRect(g_window, nullptr, FALSE);
+		}
+		printf("[ui] 配置选项已刷新（hook_file=%d hook_reads=%d）\n",
+			options.HookFile ? 1 : 0, options.HookReads ? 1 : 0);
+		fflush(stdout);
+	}
+
 	bool TakePendingMode(R3ShieldCore::Mode& mode) noexcept
 	{
 		// 一次原子取走（顺带清成 -1）。用 Exchange 而不是"读 + 清"两步：
@@ -5079,11 +7087,76 @@ namespace R3ShieldCoreGui
 		return InterlockedExchange(&g_quitRequest, 0) != 0;
 	}
 
+	// ★★★ v103：把「应用并重启引擎」的请求交给主程序。
+	//
+	// 与 `TakeQuitRequest` 同样的模式：UI 线程**只置一个待处理标记**，
+	// 真正的写 ini + 停引擎 + 重新注入由 `app.cpp` 主循环做。
+	//
+	// ★ 为什么用「标记 + 数据」两段而不是队列：全项目只有**一个**消费者
+	//   （主循环），且请求是"整份替换"语义（后一次覆盖前一次）——
+	//   用户连点两次「应用」只该应用一次。队列在这里纯属多余。
+	//
+	// ★ 锁与标记声明在**上方**（`ConfigApplyRequest` 旁边）——
+	//   `BuildConfigApplyRequest` 和点击处理都要用它们。
+	bool TakeConfigApplyRequest(std::vector<std::wstring>& lines,
+		bool& arkPresent, bool& arkEnabled) noexcept
+	{
+		if (InterlockedCompareExchange(&g_configApplyPending, 0, 0) == 0) {
+			return false;   // 常见路径：没请求，**不加锁**
+		}
+		std::lock_guard<std::mutex> lock(g_configApplyMutex);
+		if (!g_configApply.valid) {
+			InterlockedExchange(&g_configApplyPending, 0);
+			return false;
+		}
+		lines = g_configApply.lines;
+		arkPresent = g_configApply.arkPresent;
+		arkEnabled = g_configApply.arkEnabled;
+
+		// 取走即清空 —— 否则同一份改动会被应用第二次（重复重启引擎）。
+		g_configApply = ConfigApplyRequest{};
+		InterlockedExchange(&g_configApplyPending, 0);
+		return true;
+	}
+
 	void SetMode(R3ShieldCore::Mode mode) noexcept
 	{
 		InterlockedExchange(&g_displayMode, static_cast<LONG>(mode));
 
 		// 立刻重画，别等 300ms 的 WM_TIMER —— 点了按钮要马上看到徽章变。
+		if (g_window) {
+			InvalidateRect(g_window, nullptr, FALSE);
+		}
+	}
+
+	// ★ v91：引擎连接状态（主循环每轮喂一次，只在变化时重画）。
+	void SetEngineConnected(bool connected) noexcept
+	{
+		const LONG next = connected ? 1 : 0;
+		if (InterlockedExchange(&g_engineConnected, next) == next) {
+			return;
+		}
+		if (g_window) {
+			InvalidateRect(g_window, nullptr, FALSE);
+		}
+	}
+
+	// ★ v91：窗口内的一次性提示（8 秒）。
+	//
+	// 为什么需要它：界面没有控制台，`printf` 的失败原因用户永远看不到。
+	// 现在"模式切换失败：引擎未连接"这类结论会**直接画在标题栏副标题那一行**，
+	// 不再只写进一个运行期打不开的日志文件。
+	void ShowNotice(const std::wstring& text, ULONGLONG durationMs) noexcept
+	{
+		// ★ 写侧加锁（读侧见 `PaintWindow`）。**`InvalidateRect` 必须留在锁外**：
+		//   它会把窗口线程唤醒去重绘，而重绘要拿同一把锁 ——
+		//   持锁发重绘请求会让两个线程互相等（虽然 InvalidateRect 本身异步，
+		//   但没有理由冒这个险，临界区越短越好）。
+		{
+			std::lock_guard<std::mutex> lock(g_noticeMutex);
+			g_notice = text;
+			g_noticeUntil = GetTickCount64() + (durationMs ? durationMs : 8000);
+		}
 		if (g_window) {
 			InvalidateRect(g_window, nullptr, FALSE);
 		}
@@ -5152,6 +7225,60 @@ namespace R3ShieldCoreGui
 	{
 		Options options = {};
 		options.Mode = R3ShieldCore::Mode::Log;
+
+		// ★★ v89：预览模式下背景**抓成功一次就冻住**。
+		//
+		//   为什么不能和生产一样持续重抓：抓背景必须先
+		//   `SetWindowDisplayAffinity(hwnd, 0x11)` 把自己排除掉，抓完再恢复。
+		//   而本项目的验收探针 `tools/gui_preview_probe.cpp` 是**从屏幕
+		//   BitBlt** 截这个窗口的 —— 若每 150ms 就开一次"隐身窗口"，
+		//   探针有概率正好落在那 16ms 里，截到一张"窗口是个洞"的图，
+		//   闸门会随机假红（而且极难查）。
+		//   ⇒ 预览模式只抓一次：既能让截图反映"真实桌面被模糊了"，
+		//     又不会和探针抢那个窗口。
+		//
+		// ★★ v90：但"冻住"对人眼验收是错的 —— 拖着窗口走，玻璃里还是
+		//   起步位置那张背景，看起来像贴了一张图（正是 v89 之前那个毛病
+		//   的观感）。
+		//
+		// ★★★ v92：所以**默认改成实时**，反过来给自动化一个"冻住"开关：
+		//     · 人看效果（默认）：实时重抓，玻璃跟着窗口/背后的内容走；
+		//     · 跑闸门/探针截图：`R3SHIELDCORE_PREVIEW_FREEZEBG=1` 冻住。
+		//       （`tools/test_gui_preview.sh` 已经在导出这个变量。）
+		//
+		//   为什么方向要反过来：默认值决定"用户第一眼看到什么"。
+		//   冻背景是给截图用的技术妥协，不该是用户看到的第一印象 ——
+		//   v90 之前默认冻住，用户第一反应就是"拖动背景不变"。
+		//
+		//   ⚠️ v95 改：**实时模式改成"永久排除自身抓屏"**（和正式版一致）。
+		//
+		//   原来这里是 `permanentWda = false`（每次抓的瞬间开关），理由是想让
+		//   预览窗口还能被系统截图拍到。实测这个折中**两头不讨好**：
+		//     · 每次开关都要 `DwmFlush` 等一次合成（~16ms×2），300ms 一次也就算了；
+		//     · 更要命的是**它自己扰动了自己**：排除/恢复之间抓到的画面
+		//       在"桌面"和"自己"之间来回跳，指纹每次都变 ⇒ v95 的
+		//       "背景变了就提速"观察窗**永远关不掉**，静止时也会一直
+		//       以 25fps 抓屏+调色+模糊，实测 **23% 单核**。
+		//     · 而且探针仍有可能截到那个"洞"。
+		//   ⇒ 实时模式设永久排除（生产路径本来就是这样，抓屏成本降到一次 BitBlt）；
+		//     需要截图时用 `preview.bat <tab> freeze`（冻结模式仍走"抓完就恢复"，
+		//     所以截图里窗口是完整的）。
+		g_glass.liveCapture = true;
+		g_glass.permanentWda = true;
+		{
+			wchar_t env[8] = {};
+			const DWORD n = GetEnvironmentVariableW(
+				L"R3SHIELDCORE_PREVIEW_FREEZEBG", env, _countof(env));
+			if (n > 0 && _wcsicmp(env, L"1") == 0) {
+				g_glass.liveCapture = false;
+				// 冻结：只抓一次，之后再也不碰屏幕 ⇒ 不设永久排除，
+				// 截图（含验收探针的屏幕 BitBlt）才能拍到窗口。
+				g_glass.permanentWda = false;
+				printf("[gui-preview] 背景已冻结（供截图判据使用，不跟随窗口）\n");
+			} else {
+				printf("[gui-preview] 实时背景（玻璃跟随窗口/背后内容变化）\n");
+			}
+		}
 
 		// ★ v80：预览模式下**模拟点一下「高级」页的跳转按钮**。
 		//

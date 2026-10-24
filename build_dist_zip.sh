@@ -41,6 +41,7 @@ PY="$PYTHON"   # 由 scripts_env.sh 自动探测（见文件头）
 # ★ 显式清单：少一个就失败（防止"打包漏文件"这种最难发现的发布事故）。
 ENTRIES=(
     "R3 ShieldCore.exe"
+    "r3shieldcore-engine.exe"
     "r3shieldcore_svc.exe"
     "64/r3shieldcore-lib.dll"
     "32/r3shieldcore-lib.dll"
