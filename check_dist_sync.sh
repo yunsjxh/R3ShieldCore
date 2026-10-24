@@ -2108,6 +2108,50 @@ else
 fi
 [ "$v128_ok" -eq 1 ] || fail=1
 
+# === v129：block 模式下隐私面不拦 ===
+#
+# 为什么挂在这里：v129 改的是**四个 guard 的判定分支**，不是配置、不是界面 ——
+# 它最容易出的错是"改了源码忘了重编"（dist 里还是旧 DLL ⇒ 用户开 block 仍然
+# 粘贴失效，而所有源码判据都绿）。所以除了形态判据，还要钉 **DLL 产物里
+# 真的有这段行为**：用 `tools/check_privacy_face.sh`（含两条变异负对照）。
+echo ""
+echo "=== v129 隐私面分流（block 不拦隐私面）==="
+if bash "$PROJECT_ROOT/tools/check_privacy_face.sh" >/dev/null 2>&1; then
+    echo "[ OK ] 四个隐私面都在 block 下分流，破坏类没有被误放"
+else
+    echo "[FAIL] 隐私面分流判据失败 —— 跑 bash tools/check_privacy_face.sh 看详情"
+    fail=1
+fi
+
+# 产物侧：**双架构** DLL 必须比 v129 的源码新（防"改了源码没重编"）。
+#
+# ★ 这里**不能**查符号名：`IsPrivacyFace` 是 `inline`，-O2 下被内联展开，
+#   DLL 的字符串表里**根本没有它** —— 第一版就是这么写的，两个架构全报
+#   "没有 IsPrivacyFace"，其实是判据本身错（拿"字面存在"验"代码编进去了"）。
+#   能反映"编没编"的事实只有**时间戳**：build.sh 直接产出 Release 下的 DLL，
+#   mtime 就是编译时间；dist 那份与 Release 的 md5 一致由 deploy_dist.sh 保证。
+V129_LIBDIR="$PROJECT_ROOT/R3ShieldCore/R3ShieldCoreLib"
+for v129_arch in 32 64; do
+    V129_REL="$PROJECT_ROOT/R3ShieldCore/Release/$v129_arch/r3shieldcore-lib.dll"
+    if [ ! -f "$V129_REL" ]; then
+        echo "[FAIL] 找不到 $V129_REL（没构建过？）"
+        fail=1
+        continue
+    fi
+    v129_stale=0
+    for v129_src in camera_guard.cpp clipboard_guard.cpp screen_guard.cpp input_hook_guard.cpp; do
+        [ "$V129_REL" -nt "$V129_LIBDIR/$v129_src" ] || v129_stale=1
+    done
+    [ "$V129_REL" -nt "$PROJECT_ROOT/R3ShieldCore/shared/r3shieldcore/r3shieldcore_shared.h" ] \
+        || v129_stale=1
+    if [ "$v129_stale" -eq 0 ]; then
+        echo "[ OK ] $v129_arch 位 DLL 比 v129 的四处 guard + shared.h 都新"
+    else
+        echo "[FAIL] $v129_arch 位 DLL 比某个 v129 源文件旧 —— 改了源码没重编（跑 build.sh）"
+        fail=1
+    fi
+done
+
 echo ""
 if [ "$fail" -eq 0 ]; then
     echo "结果: PASS —— dist 与构建产物一致，双架构同代次，且带 v66/v67/v69/v70/v71/v72/v73/v74/v75/v77/v78/v79/v80/v81/v82/v83/v84/v85/v86/v88/v89 标记，cfg 带 v114~v128 界面标记。"

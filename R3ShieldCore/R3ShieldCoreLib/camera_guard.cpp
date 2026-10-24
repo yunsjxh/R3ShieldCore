@@ -301,6 +301,19 @@ namespace
 		const bool canAsk = allowAsk && (mode == static_cast<ULONG>(R3ShieldCore::Mode::Ask));
 		if (!canAsk) {
 			if (mode == static_cast<ULONG>(R3ShieldCore::Mode::Block)) {
+				// ★ v129：隐私面在 block 下**不硬拒**。
+				//   摄像头/麦克风是"知情类"（不是破坏类），硬拒的表现是
+				//   "视频通话打不开" —— 用户会当成软件坏了，而不是被拦了。
+				//   这里只记录 + 标 WouldBlock；真要连隐私面一起拦用 mode=block_all。
+				//
+				//   ⚠️ 四个隐私 guard（camera / clipboard / screen / input_hook）
+				//      用**同一段判断**，不各写一份 —— 抄两份必漂。
+				if (R3ShieldCore::IsPrivacyFace(
+						static_cast<R3ShieldCore::ObjectType>(event.ObjectType))) {
+					event.Decision = static_cast<ULONG>(R3ShieldCore::Decision::WouldBlock);
+					return Action::Record;
+				}
+
 				// ★ v73：block 模式下的高危拒绝 —— 能替换的入口在这里升级成 Spoof。
 				return RejectOrSpoof(event, canSpoof);
 			}

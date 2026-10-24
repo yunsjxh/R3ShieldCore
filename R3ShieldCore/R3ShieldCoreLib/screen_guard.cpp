@@ -274,6 +274,16 @@ namespace
 		const bool canAsk = allowAsk && (mode == static_cast<ULONG>(R3ShieldCore::Mode::Ask));
 		if (!canAsk) {
 			if (mode == static_cast<ULONG>(R3ShieldCore::Mode::Block)) {
+				// ★ v129：隐私面在 block 下**不硬拒**。
+				//   截屏是"知情类"：截图工具、录屏、会议共享都会走这里，
+				//   硬拒的表现是"黑屏 / 截出来是空的"，用户会当成软件坏了。
+				//   只记录 + 标 WouldBlock；真要拦用 mode=block_all。
+				if (R3ShieldCore::IsPrivacyFace(
+						static_cast<R3ShieldCore::ObjectType>(event.ObjectType))) {
+					event.Decision = static_cast<ULONG>(R3ShieldCore::Decision::WouldBlock);
+					return Action::Record;
+				}
+
 				// ★ v67：这里本应直接拒 —— 开关打开时改为"成功 + 黑帧"。
 				return RejectOrSpoof(event);
 			}
@@ -660,3 +670,26 @@ namespace ScreenGuard
 		return true;
 	}
 }
+
+// ==================================================================
+// ★ v129：单测专用入口（宏 SCREENGUARD_GUARD_UT 打开）
+// ==================================================================
+//
+// `Evaluate` 在本文件的匿名 namespace 里，外部 TU 拿不到；而 v129 要验的
+// 恰恰是"block 模式下**要不要走到** RejectOrSpoof" —— 只断言 RejectOrSpoof
+// 的返回值等于假设它被调到了，那正好是要验的东西。
+// 用编译宏隔离（`build_guard_ut.sh` 带、`build.sh` 不带）⇒ 导出表不变。
+#ifdef SCREENGUARD_GUARD_UT
+namespace ScreenGuardTest
+{
+	int EvaluateForTest(ULONG op, int* decisionOut, ULONG* flagsOut) noexcept
+	{
+		R3ShieldCore::Event event = {};
+		const Action action = Evaluate(static_cast<R3ShieldCore::ScreenOp>(op),
+			event, /*allowAsk=*/false);
+		if (decisionOut) *decisionOut = static_cast<int>(event.Decision);
+		if (flagsOut)    *flagsOut = event.Flags;
+		return static_cast<int>(action);
+	}
+}
+#endif // SCREENGUARD_GUARD_UT

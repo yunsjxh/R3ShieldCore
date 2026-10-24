@@ -379,6 +379,36 @@ enum class ObjectType : ULONG
 	HostHijack = 17, // 宿主劫持 / 加载器（注册表全局注入键 + 加载器侧加载 + 远程映射 + 凭据宿主）
 };
 
+	// ------------------------------------------------------------------
+	// 「知情类」面：mode=block 下**不硬拒**，只记录。
+	//
+	// 为什么需要这个区分：
+	//   这几类的判据不是"会破坏数据"，而是"需要用户知情"（见上面
+	//   ObjectType 的注释）。而 block 是**默认预设**，它一硬拒，
+	//   用户看到的是"功能坏了"，不是"被拦了"：
+	//     · 剪贴板 Read —— 每次 Ctrl+V 都走这里 ⇒ 粘贴直接失效
+	//     · 屏幕 BitBlt —— 截图 / 录屏 / 部分 UI 自绘 ⇒ 黑屏
+	//     · 摄像头 / 麦克风 —— 视频通话打不开
+	//     · 输入钩子 —— 输入法 / 游戏 / 远控全废
+	//   所以 block 对它们的语义是"看得见、不打断"（记录 + WouldBlock）。
+	//   真要连隐私面一起拦，用 mode=block_all（它本来就"不看豁免、不问"）。
+	//
+	// ⚠️ 破坏类面**不在此列**，block 下照拦：注册表持久化 / 系统文件 /
+	//    服务 / 驱动 / 计划任务 / COM 劫持 / 令牌窃取 / 跨进程注入。
+	inline bool IsPrivacyFace(ObjectType type) noexcept
+	{
+		switch (type)
+		{
+		case ObjectType::Camera:
+		case ObjectType::InputHook:
+		case ObjectType::Screen:
+		case ObjectType::Clipboard:
+			return true;
+		default:
+			return false;
+		}
+	}
+
 	// 文件的写类操作。数值从 1 开始，与注册表的 Op 各自独立
 	// （靠 Event::ObjectType 区分是哪一个枚举）。
 	//
