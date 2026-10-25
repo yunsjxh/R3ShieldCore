@@ -50,12 +50,18 @@ bad() { echo "  [FAIL] $1"; fail=$((fail+1)); }
 # ⚠️ 这些字段的含义与取值必须与 `tools/spoof_e2e_target.cpp` 的输出**同构**
 #    （同样的 key、同样的量纲）—— 否则自测验的是"另一个程序"。
 #
-#   A（block, spoof=0）：屏幕被拒 / 剪贴板被拒 / 注册表**真值**
-#   B（block, spoof=1）：屏幕成功+全黑 / 剪贴板成功+空 / 注册表成功+空
-#   C（log,   spoof=1）：屏幕真 / 剪贴板真 / 注册表**仍空**（模式无关）
-BASE_A='RESULT bitblt=0 err=5 lines=0 first=0x123456 nonblack=0/12288 getpixel0=0x00F2F2F2 getpixelmid=0x00F2F2F2 getpixel_nonblack=192 getpixel_full_nonblack=508/510 clip_put=1 clip_read=0 clip_err=5 clip_strlen=0 clip_match=0 reg_read=1 reg_err=0 reg_strlen=19 reg_match=1'
-BASE_B='RESULT bitblt=1 err=0 lines=96 first=0x00000000 nonblack=0/12288 getpixel0=0x00F2F2F2 getpixelmid=0x00F2F2F2 getpixel_nonblack=192 getpixel_full_nonblack=508/510 clip_put=1 clip_read=1 clip_err=0 clip_strlen=0 clip_match=0 reg_read=1 reg_err=0 reg_strlen=0 reg_match=0'
-BASE_C='RESULT bitblt=1 err=0 lines=96 first=0xFFF2F2F2 nonblack=12288/12288 getpixel0=0x00F2F2F2 getpixelmid=0x00F2F2F2 getpixel_nonblack=192 getpixel_full_nonblack=508/510 clip_put=1 clip_read=1 clip_err=0 clip_strlen=31 clip_match=1 reg_read=1 reg_err=0 reg_strlen=0 reg_match=0'
+#   A（block, spoof=0）：屏幕被拒 / 剪贴板被拒 / 注册表**真值** / 文件**真内容**
+#   B（block, spoof=1）：屏幕成功+全黑 / 剪贴板成功+空 / 注册表成功+空 / 文件成功+全 0
+#   C（log,   spoof=1）：屏幕真 / 剪贴板真 / 注册表**仍空** / 文件**仍全 0**（模式无关）
+#
+# ★ v133 文件面的三个量必须**同构**地出现在合成行里：
+#     file_bytes > 0（这次读真的发生了）/ file_strlen=0（内容被清空）/ file_match=0
+#   少任何一个，judge 里对应的那半条件就永远取到空串 ⇒ 断言恒 FAIL（自测立刻发现）。
+F_FILE_REAL='file_open=1 file_oerr=0 file_read=1 file_rerr=0 file_bytes=31 file_strlen=31 file_match=1'
+F_FILE_ZERO='file_open=1 file_oerr=0 file_read=1 file_rerr=0 file_bytes=31 file_strlen=0 file_match=0'
+BASE_A="RESULT bitblt=0 err=5 lines=0 first=0x123456 nonblack=0/12288 getpixel0=0x00F2F2F2 getpixelmid=0x00F2F2F2 getpixel_nonblack=192 getpixel_full_nonblack=508/510 clip_put=1 clip_read=0 clip_err=5 clip_strlen=0 clip_match=0 reg_read=1 reg_err=0 reg_strlen=19 reg_match=1 $F_FILE_REAL"
+BASE_B="RESULT bitblt=1 err=0 lines=96 first=0x00000000 nonblack=0/12288 getpixel0=0x00F2F2F2 getpixelmid=0x00F2F2F2 getpixel_nonblack=192 getpixel_full_nonblack=508/510 clip_put=1 clip_read=1 clip_err=0 clip_strlen=0 clip_match=0 reg_read=1 reg_err=0 reg_strlen=0 reg_match=0 $F_FILE_ZERO"
+BASE_C="RESULT bitblt=1 err=0 lines=96 first=0xFFF2F2F2 nonblack=12288/12288 getpixel0=0x00F2F2F2 getpixelmid=0x00F2F2F2 getpixel_nonblack=192 getpixel_full_nonblack=508/510 clip_put=1 clip_read=1 clip_err=0 clip_strlen=31 clip_match=1 reg_read=1 reg_err=0 reg_strlen=0 reg_match=0 $F_FILE_ZERO"
 
 base_result() { case "$1" in A) printf '%s' "$BASE_A" ;; B) printf '%s' "$BASE_B" ;; C) printf '%s' "$BASE_C" ;; esac; }
 base_mode()   { case "$1" in A|B) printf 'BLOCK' ;; C) printf 'LOG' ;; esac; }
@@ -161,21 +167,33 @@ check_case() {
     fi
 }
 
-# ---- A 格：本应拒绝却没拒 / 注册表被误替换 ----
+# ---- A 格：本应拒绝却没拒 / 注册表被误替换 / 文件被误替换 ----
 check_case "A: 屏幕没被拒（bitblt 0->1）"          A "$(mutate "$BASE_A" bitblt 1)"              "A[屏幕]"
 check_case "A: 剪贴板没被拒（clip_read 0->1）"     A "$(mutate "$BASE_A" clip_read 1)"           "A[剪贴板]"
 check_case "A: 注册表被误替换（reg_match 1->0）"   A "$(mutate "$BASE_A" reg_match 0)"           "A[注册表]"
+# ★ v133 文件面：A 格是 spoof_file=0，读到真内容才对。改成"假内容"必须红。
+check_case "A: 文件被误替换（file_match 1->0）"    A "$(mutate "$BASE_A" file_match 0)"          "A[文件]"
 
 # ---- B 格：替换没生效 / 判别力前提不成立 ----
 check_case "B: 屏幕没变黑（nonblack 0->100）"      B "$(mutate "$BASE_B" nonblack '100/12288')"  "B[屏幕]"
 check_case "B: 剪贴板没变空（clip_strlen 0->5）"   B "$(mutate "$BASE_B" clip_strlen 5)"         "B[剪贴板]"
 check_case "B: 注册表没变空（reg_strlen 0->19）"   B "$(mutate "$BASE_B" reg_strlen 19)"         "B[注册表]"
 check_case "B: 剪贴板判别力前提不成立（clip_put 1->0）" B "$(mutate "$BASE_B" clip_put 0)"       "clip_put=0"
+# ★★ v133 文件面两条，分别打**两个不同的半条件**：
+#   ① file_strlen 0->31  ⇒ 替换没生效
+#   ② file_bytes  31->0  ⇒ **这次读根本没发生**（空真）。这条专门验
+#      "bytes>0" 那个半条件真的在起作用 —— 只把 strlen 改回去是抓不到它的，
+#      因为此时 strlen 仍是 0、只看 strlen 的判据会**照样绿**。
+check_case "B: 文件没变全 0（file_strlen 0->31）"  B "$(mutate "$BASE_B" file_strlen 31)"        "B[文件]"
+check_case "B: 文件读取根本没发生（file_bytes 31->0）" B "$(mutate "$BASE_B" file_bytes 0)"      "B[文件]"
 
-# ---- C 格：替换越界到 log / 注册表被 mode 门控 ----
+# ---- C 格：替换越界到 log / 注册表/文件被 mode 门控 ----
 check_case "C: 屏幕被越界替换（nonblack 12288->0）" C "$(mutate "$BASE_C" nonblack '0/12288')"   "C[屏幕]"
 check_case "C: 剪贴板被越界替换（clip_match 1->0）" C "$(mutate "$BASE_C" clip_match 0)"         "C[剪贴板]"
 check_case "C: 注册表替换被 mode 门控（reg_strlen 0->19）" C "$(mutate "$BASE_C" reg_strlen 19)"  "C[注册表]"
+# ★ v133：文件面在 log 下**必须仍被零化**（读路径替换，与 mode 无关）。
+#   篡改成"读到真内容" ⇒ 必须红在 C[文件]。
+check_case "C: 文件替换被 mode 门控（file_strlen 0->31）" C "$(mutate "$BASE_C" file_strlen 31)" "C[文件]"
 
 # ---- 配置口径：引擎读了**别人那份**配置 ⇒ 该格结论不可信 ----
 echo ""

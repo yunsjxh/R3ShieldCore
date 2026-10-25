@@ -298,18 +298,35 @@ namespace
 		//    一个永远不来的答复（实测表现：LOG 模式下被当成 Deny，
 		//    直接 BLOCK 掉，LOG 模式不该拦任何东西）。
 		//    这是本项目踩过的坑，别把这一层去掉。
-		const bool canAsk = allowAsk && (mode == static_cast<ULONG>(R3ShieldCore::Mode::Ask));
+		// ★ v132：这一面的处置档由配置决定（ini: privacy_camera=record|ask|block）。
+		//   Record（默认）/ Ask（弹窗，block 下也能问）/ Block（直接拒）。
+		const R3ShieldCore::ObjectType face =
+			static_cast<R3ShieldCore::ObjectType>(event.ObjectType);
+		const R3ShieldCore::PrivacyAction privacy =
+			R3ShieldCore::PrivacyActionOf(policy ? policy->Flags2 : 0, face);
+		const bool privacyAsk = R3ShieldCore::IsPrivacyFace(face)
+			&& privacy == R3ShieldCore::PrivacyAction::Ask
+			&& mode == static_cast<ULONG>(R3ShieldCore::Mode::Block);
+
+		const bool canAsk = allowAsk
+			&& (mode == static_cast<ULONG>(R3ShieldCore::Mode::Ask) || privacyAsk);
 		if (!canAsk) {
 			if (mode == static_cast<ULONG>(R3ShieldCore::Mode::Block)) {
-				// ★ v129：隐私面在 block 下**不硬拒**。
+				// ★ v132：非 Block 档（Record / 问不了的 Ask）⇒ 只记录。
 				//   摄像头/麦克风是"知情类"（不是破坏类），硬拒的表现是
 				//   "视频通话打不开" —— 用户会当成软件坏了，而不是被拦了。
-				//   这里只记录 + 标 WouldBlock；真要连隐私面一起拦用 mode=block_all。
 				//
 				//   ⚠️ 四个隐私 guard（camera / clipboard / screen / input_hook）
-				//      用**同一段判断**，不各写一份 —— 抄两份必漂。
-				if (R3ShieldCore::IsPrivacyFace(
-						static_cast<R3ShieldCore::ObjectType>(event.ObjectType))) {
+				//      用**同一套判断**，不各写一份 —— 抄两份必漂。
+				if (R3ShieldCore::IsPrivacyFace(face)
+						&& privacy != R3ShieldCore::PrivacyAction::Block) {
+					// ★ 但**先看能不能替换**：Spoof 是"调用成功、数据是假的"，
+					//   既不打断使用、也不泄露真实画面 —— 比"只记录"更好。
+					//   v129 第一版在这里直接 return Record，把替换路径也挡住了
+					//   （开了 spoof_camera=1 不生效），是回归。
+					if (canSpoof && SpoofCameraEnabled()) {
+						return RejectOrSpoof(event, canSpoof);
+					}
 					event.Decision = static_cast<ULONG>(R3ShieldCore::Decision::WouldBlock);
 					return Action::Record;
 				}

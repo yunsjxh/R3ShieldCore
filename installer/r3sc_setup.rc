@@ -31,8 +31,8 @@
  *  语言块 080404b0 = 简体中文(0x0804) + Unicode(0x04b0)
  *  Translation 的值必须和语言块对应，否则资源管理器里"详细信息"是空的。 */
 VS_VERSION_INFO VERSIONINFO
- FILEVERSION    65,0,0,0
- PRODUCTVERSION 65,0,0,0
+ FILEVERSION    1,0,1,0
+ PRODUCTVERSION 1,0,1,0
  FILEFLAGSMASK  0x3fL
  FILEFLAGS      0x0L
  FILEOS         0x40004L
@@ -45,12 +45,12 @@ BEGIN
         BEGIN
             VALUE "CompanyName",      "R3 ShieldCore"
             VALUE "FileDescription",  "R3 ShieldCore 安装程序"
-            VALUE "FileVersion",      "65.0.0.0"
+            VALUE "FileVersion",      "1.0.1.0"
             VALUE "InternalName",     "r3shieldcore-setup"
             VALUE "LegalCopyright",   "R3 ShieldCore"
             VALUE "OriginalFilename", "R3ShieldCore-Setup.exe"
             VALUE "ProductName",      "R3 ShieldCore"
-            VALUE "ProductVersion",   "65.0.0.0"
+            VALUE "ProductVersion",   "1.0.1.0"
         END
     END
     BLOCK "VarFileInfo"

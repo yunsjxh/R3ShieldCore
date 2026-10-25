@@ -81,6 +81,49 @@ namespace
 		return lower == "1" || lower == "true" || lower == "yes" || lower == "on";
 	}
 
+	// ★ v132：隐私面处置档解析（ini: privacy_camera=record|ask|block）。
+	//
+	// 认三种写法：
+	//   record / log / notify  → 只记录（不打断）
+	//   ask    / prompt        → 弹窗询问
+	//   block  / deny / 1      → 直接拒绝
+	//
+	// ⚠️ 不认识的写法**保持默认**（record）并返回 false，让调用方决定
+	//    要不要报错 —— 静默改成 block 会让用户"打了个错字，粘贴就废了"。
+	bool ParsePrivacyAction(const std::string& value, R3ShieldCore::PrivacyAction& out)
+	{
+		const std::string lower = ToLower(value);
+
+		if (lower == "record" || lower == "log" || lower == "notify" || lower == "0") {
+			out = R3ShieldCore::PrivacyAction::Record;
+			return true;
+		}
+		if (lower == "ask" || lower == "prompt" || lower == "1") {
+			out = R3ShieldCore::PrivacyAction::Ask;
+			return true;
+		}
+		if (lower == "block" || lower == "deny" || lower == "2") {
+			out = R3ShieldCore::PrivacyAction::Block;
+			return true;
+		}
+		return false;
+	}
+
+	// 把「面 → ini 键名」集中在一处：解析、写回、自检打印都从这张表取，
+	// 免得三处各写一份字符串（抄错一个字母 = 那个键静默失效）。
+	struct PrivacyKeyDef
+	{
+		const char* key;
+		R3ShieldCore::ObjectType face;
+	};
+
+	constexpr PrivacyKeyDef kPrivacyKeys[] = {
+		{ "privacy_camera",     R3ShieldCore::ObjectType::Camera },
+		{ "privacy_input_hook", R3ShieldCore::ObjectType::InputHook },
+		{ "privacy_screen",     R3ShieldCore::ObjectType::Screen },
+		{ "privacy_clipboard",  R3ShieldCore::ObjectType::Clipboard },
+	};
+
 }   // ← 匿名 namespace 到此为止
 
 // ★ v66：本函数**必须**对外可见（app.cpp 的启动横幅要把它印出来，让用户一眼
@@ -469,6 +512,32 @@ namespace R3ShieldCoreConfig
 					policy.Flags2 &= ~R3ShieldCore::FlagSpoofScreen;
 				}
 			}
+			else if (key == "spoof_screen_image") {
+				// ★ v134：截屏替换的**外部图片来源**（默认空 = 黑帧）。
+				//
+				// 语义：`spoof_screen=1` 且本项非空 => 被截取的区域被**拉伸铺满**
+				//   这张图，而不是涂黑。空 => 保持 v67 的黑帧（行为一字不改）。
+				//
+				// 格式：只认 `LoadImageW` 能解的（**BMP** / ICO / CUR）。
+				//   PNG/JPG 要 WIC 或 GDI+，两者都要在**被注入进程**里
+				//   初始化 COM / GDI+，而这段代码活在 `BitBlt` 热路径上
+				//   => v134 不做（理由见 `screen_spoof_image.h` 的长注释）。
+				//   要 PNG 的下一步是"引擎侧解码成 BMP 落缓存、
+				//   下发缓存路径"，而不是在注入进程里强上 WIC。
+				//
+				// ⚠️ 超长路径**整条拒绝**（不截断）：截断后的路径会指向
+				//   另一个文件 —— "替换成错的东西"比"不替换"糟得多。
+				// ⚠️ 这里**不校验文件存在**：本函数跑在引擎 `LoadLibrary`
+				//   那一刻；在这里校验会把"引擎起来时图片还没备好"
+				//   变成"配置静默丢失"。读不到就由 screen_guard **回落黑帧**。
+				std::wstring wide = Utf8ToWide(value);
+				if (wide.size() >= R3ShieldCore::MaxProtectPathChars) {
+					policy.SpoofScreenImagePath[0] = L'\0';
+				}
+				else {
+					wcsncpy_s(policy.SpoofScreenImagePath, wide.c_str(), _TRUNCATE);
+				}
+			}
 			else if (key == "spoof_clipboard") {
 				// ★ v70：剪贴板**替换**（默认**关**）。
 				//
@@ -648,6 +717,65 @@ namespace R3ShieldCoreConfig
 					policy.Flags2 &= ~R3ShieldCore::FlagSpoofCamera;
 				}
 			}
+			else if (key == "spoof_file") {
+				// ★ v133：文件**读替换**（默认**关**）。
+				//
+				// 语义：读**受保护路径**（`protect_file=` 前缀命中）的文件时，
+				//   `NtReadFile` 照常**成功返回**，但调用方缓冲区被写入
+				//   **全 0 字节**（`Decision::Spoofed`）。长度、状态码、
+				//   `IoStatusBlock->Information` 全部保持真值。
+				//
+				// ★★ 为什么"同长度清零"而不是"换成一段指定文本"：
+				//   文件是**按块、带偏移**读的（`ByteOffset` 由调用方给，
+				//   甚至可以为 NULL 表示"接着上次的位置"）。换成固定字符串会
+				//   **破坏偏移语义** —— 调用方要第 N 字节，我们给的是字符串的
+				//   第 N 字节；而且"分块读"和"一次读整文件"得到的内容还不一样。
+				//   清零是唯一对**任意偏移、任意分块、任意并发**都自洽的替代物。
+				//   与 v71 注册表值"同长度、数据区清零"是同一条规则。
+				//
+				// ⚠️ 清零后**结构合法但内容不可解析**（文本变 NUL、PE 头全 0）——
+				//   这正是本功能的目的，**不是缺陷**。对外口径不能说"返回一个
+				//   假文件"，只能说"长度一样、内容为零"（铁律 97）。
+				//
+				// ★★ 触发面**只有** `protect_file=`（用户显式声明的保护路径），
+				//   **不用**内置高危文件表 —— 后者含 `hosts`、`System32\drivers\*`
+				//   这类正常软件天天读的路径，拿来当替换触发面会大面积误伤。
+				//   ⇒ 名单为空时本开关**空转**（配了等于没配）。
+				//
+				// ★★★ 与前五个面的**根本不同**：那些都是"一次调用、一进一出"，
+				//   文件是"先拿句柄、之后任意次读"，而 `NtReadFile` 的参数里
+				//   **没有路径**。所以实现上要多维护一张"句柄 → 是否受保护"的
+				//   进程级小表（`file_guard.cpp`），并在 `NtClose` 时擦掉
+				//   （否则句柄值被复用会误清**无关**读的缓冲区 = 静默数据损坏）。
+				//   ⇒ 打开本开关会**连带安装 4 个 hook**
+				//     （`NtCreateFile` / `NtOpenFile` / `NtReadFile` / `NtClose`）。
+				//     这正是它默认关的原因之一：文件 I/O 是整机最热的路径
+				//     （`hook_file` 默认关也是同一个理由）。
+				//
+				// ★ 覆盖范围：**读路径，与 `mode` 无关**（与 v71 注册表同构）。
+				//   文件读**从来不会被拒**（拒了全系统都起不来）⇒ 这里不存在
+				//   "本应拒绝"这个前提。⚠️ 因此 `mode=log` 下**也会**清零 ——
+				//   与 `spoof_screen`/`spoof_clipboard`（只在应拒时替换）**不同**。
+				//   差异是真实的，`tools/spoof_e2e.sh` 的 C 格就是专门证这条的。
+				//
+				// ⚠️ **不覆盖**（都是真实的绕过路径，见 shared 头 FlagSpoofFile）：
+				//   · **内存映射**（`NtCreateSection` + `NtMapViewOfSection`）——
+				//     走页错误不走 `NtReadFile`，**完全不经过我们**。这是最大的洞；
+				//   · **异步/重叠 I/O**（`NtReadFile` 返回 `STATUS_PENDING`）——
+				//     数据稍后由内核写进缓冲区，此刻清零没用；
+				//     不能"先拒掉"（I/O 已提交，调用方释放缓冲区后内核再写
+				//     = 目标进程内存损坏）⇒ 只能放行真内容并**如实记日志**；
+				//   · `NtReadFileScatter` / 进程启动前就打开的句柄（继承、复制）
+				//     / 直 syscall / `CopyFile` 的内核拷贝路径 —— 均未覆盖；
+				//   · 别的进程读同一个文件 —— 只在**被注入进程内**生效。
+				//   定位与其余五个面一致：**提高成本，不是硬边界**。
+				if (IsTrue(value)) {
+					policy.Flags2 |= R3ShieldCore::FlagSpoofFile;
+				}
+				else {
+					policy.Flags2 &= ~R3ShieldCore::FlagSpoofFile;
+				}
+			}
 			else if (key == "hook_dll_load") {
 				// DLL 加载/劫持监控（LdrLoadDll + NtMapViewOfSection）。
 				// 默认开 —— 白加黑（DLL 侧加载）是当前主流的绕过手法。
@@ -668,6 +796,43 @@ namespace R3ShieldCoreConfig
 				}
 				else {
 					policy.Flags &= ~R3ShieldCore::FlagHookClipboard;
+				}
+			}
+			else if (key == "privacy_camera" || key == "privacy_input_hook"
+				|| key == "privacy_screen" || key == "privacy_clipboard") {
+				// ★ v132：隐私面**命中高危之后**怎么处置（每面独立，默认 record）。
+				//
+				//   record —— 记录 + WouldBlock，不打断（v129 的行为）
+				//   ask    —— 弹窗询问（block 模式下也会弹）
+				//   block  —— 直接拒绝（v128 之前 block 的老行为）
+				//
+				// ⚠️ 与 `hook_camera` 等开关是**两件事**：
+				//    hook_*    = 要不要监控（装不装 hook）
+				//    privacy_* = 监控到了、判定高危之后怎么办
+				//    想"完全不看摄像头"就关 hook_camera；想"看了但只记录"保持
+				//    privacy_camera=record（默认）。
+				//
+				// ⚠️ 值只在 **mode=block** 下起作用：log 恒记录、ask 恒询问、
+				//    block_all 恒拒（全拦模式不看这一层，铁律 165）。
+				R3ShieldCore::PrivacyAction action = R3ShieldCore::PrivacyAction::Record;
+				if (ParsePrivacyAction(value, action)) {
+					for (const PrivacyKeyDef& def : kPrivacyKeys) {
+						if (key == def.key) {
+							policy.Flags2 = R3ShieldCore::SetPrivacyAction(
+								policy.Flags2, def.face, action);
+							break;
+						}
+					}
+				}
+				else {
+					// 不认识的写法：**保持默认**（record）。
+					//
+					// ⚠️ 故意不报错、不改行为：本文件在日志系统打开之前就被
+					//    调用了（`LOG` 在这里不可用），而且"写错一个字"最坏
+					//    的后果应该是"没生效"，不是"粘贴突然失效"。
+					//    cfg 界面用的是下拉框，不会走到这里；只有手改 ini
+					//    才可能拼错。
+					(void)action;
 				}
 			}
 			else if (key == "hook_spawn") {

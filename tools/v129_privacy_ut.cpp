@@ -38,7 +38,8 @@ namespace GuardStub
 namespace ClipboardGuardTest
 {
 	void SetCloseHookReady(bool ready) noexcept;
-	int EvaluateForTest(ULONG op, UINT format, int* decisionOut, int* flagsOut) noexcept;
+	int EvaluateForTest(ULONG op, UINT format, bool allowAsk,
+		int* decisionOut, int* flagsOut) noexcept;
 }
 
 // registry_guard.cpp 尾部的单测入口（宏 REGUARD_GUARD_UT 打开）。
@@ -51,13 +52,13 @@ namespace RegistryGuardTest
 // screen_guard.cpp / input_hook_guard.cpp 尾部的单测入口（v129 新增）。
 namespace ScreenGuardTest
 {
-	int EvaluateForTest(ULONG op, int* decisionOut, ULONG* flagsOut) noexcept;
+	int EvaluateForTest(ULONG op, bool allowAsk, int* decisionOut, ULONG* flagsOut) noexcept;
 }
 
 namespace InputHookGuardTest
 {
 	int EvaluateForTest(ULONG op, int idHook, ULONG threadId, bool rawSink,
-		int* decisionOut, ULONG* flagsOut) noexcept;
+		bool allowAsk, int* decisionOut, ULONG* flagsOut) noexcept;
 }
 
 static int g_pass = 0;
@@ -93,6 +94,7 @@ int main()
 
 	const int   kActionRecord = static_cast<int>(R3ShieldCore::Action::Record);
 	const int   kActionBlock  = static_cast<int>(R3ShieldCore::Action::Block);
+	const int   kActionSpoof  = static_cast<int>(R3ShieldCore::Action::Spoof);
 	const ULONG kWouldBlock   = static_cast<ULONG>(R3ShieldCore::Decision::WouldBlock);
 	const ULONG kBlocked      = static_cast<ULONG>(R3ShieldCore::Decision::Blocked);
 	const ULONG kClipRead     = static_cast<ULONG>(R3ShieldCore::ClipboardOp::Read);
@@ -110,7 +112,7 @@ int main()
 		GuardStub::SetMode(kBlock);
 		int decision = -1;
 		int flags = 0;
-		const int action = ClipboardGuardTest::EvaluateForTest(kClipRead, CF_UNICODETEXT,
+		const int action = ClipboardGuardTest::EvaluateForTest(kClipRead, CF_UNICODETEXT, /*allowAsk=*/false,
 			&decision, &flags);
 		printf("  ① block + 读剪贴板 → %s (decision=%d)\n", ActionName(action), decision);
 		Check("① block 下读剪贴板不拦（Action=Record）", action == kActionRecord);
@@ -123,7 +125,7 @@ int main()
 		GuardStub::SetMode(kBlockAll);
 		int decision = -1;
 		int flags = 0;
-		const int action = ClipboardGuardTest::EvaluateForTest(kClipRead, CF_UNICODETEXT,
+		const int action = ClipboardGuardTest::EvaluateForTest(kClipRead, CF_UNICODETEXT, /*allowAsk=*/false,
 			&decision, &flags);
 		printf("  ② block_all + 读剪贴板 → %s (decision=%d)\n", ActionName(action), decision);
 		Check("② block_all 下读剪贴板仍然拦（全拦模式不受影响）",
@@ -135,7 +137,7 @@ int main()
 		GuardStub::SetMode(kLog);
 		int decision = -1;
 		int flags = 0;
-		const int action = ClipboardGuardTest::EvaluateForTest(kClipRead, CF_UNICODETEXT,
+		const int action = ClipboardGuardTest::EvaluateForTest(kClipRead, CF_UNICODETEXT, /*allowAsk=*/false,
 			&decision, &flags);
 		printf("  ③ log + 读剪贴板 → %s (decision=%d)\n", ActionName(action), decision);
 		Check("③ log 下读剪贴板仍只记录（旧行为没变）",
@@ -165,7 +167,7 @@ int main()
 		int decision = -1;
 		ULONG flags = 0;
 		const int action = ScreenGuardTest::EvaluateForTest(
-			static_cast<ULONG>(R3ShieldCore::ScreenOp::BitBlt), &decision, &flags);
+			static_cast<ULONG>(R3ShieldCore::ScreenOp::BitBlt), /*allowAsk=*/false, &decision, &flags);
 		printf("  ⑤ block + BitBlt 截屏 → %s (decision=%d)\n", ActionName(action), decision);
 		Check("⑤ block 下截屏不拦（Action=Record）", action == kActionRecord);
 	}
@@ -177,9 +179,33 @@ int main()
 		ULONG flags = 0;
 		const int action = InputHookGuardTest::EvaluateForTest(
 			static_cast<ULONG>(R3ShieldCore::HookOp::SetKeyboardHook),
-			WH_KEYBOARD_LL, /*threadId=*/0, /*rawSink=*/false, &decision, &flags);
+			WH_KEYBOARD_LL, /*threadId=*/0, /*rawSink=*/false, /*allowAsk=*/false, &decision, &flags);
 		printf("  ⑥ block + 全局键盘钩子 → %s (decision=%d)\n", ActionName(action), decision);
 		Check("⑥ block 下全局键盘钩子不拦（Action=Record）", action == kActionRecord);
+	}
+
+	// ---- ⑦ block + 开了 spoof_clipboard → 走替换，不是"只记录" ----
+	//
+	// ★ 这条是 v131 补的：v129 第一版在隐私分支里**直接 return Record**，
+	//   把 `RejectOrSpoof` 整段挡住了 ⇒ 用户开了 `spoof_clipboard=1` 也不生效
+	//   （替换路径成了死代码）。这条用例专门钉"替换没被挡"。
+	//
+	//   语义差别：Record = 真实内容照常返回（只是记了一笔）；
+	//            Spoof  = 调用成功、但内容是假的 —— 这才叫"不影响使用又保护数据"。
+	{
+		GuardStub::ResetPolicy();
+		GuardStub::SetHighRisk(true);
+		GuardStub::SetMode(kBlock);
+		// 替换的前置条件：CloseClipboard 挂上了（否则替换块无人回收，开关会自锁）。
+		ClipboardGuardTest::SetCloseHookReady(true);
+		GuardStub::PolicyPtr()->Flags2 |= R3ShieldCore::FlagSpoofClipboard;
+
+		int decision = -1;
+		int flags = 0;
+		const int action = ClipboardGuardTest::EvaluateForTest(kClipRead, CF_UNICODETEXT, /*allowAsk=*/false,
+			&decision, &flags);
+		printf("  ⑦ block + spoof_clipboard=1 + 读剪贴板 → %s\n", ActionName(action));
+		Check("⑦ block 下开了替换就走 Spoof（v129 曾把这条路径挡住）", action == kActionSpoof);
 	}
 
 	printf("\n%d passed, %d failed\n", g_pass, g_fail);

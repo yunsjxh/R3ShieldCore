@@ -3,98 +3,26 @@
 #include "r3shieldcore_prompt.h"
 #include "r3shieldcore_channel.h"
 #include "r3shieldcore_toast.h"
+#include "r3shieldcore_decision_cache.h"
 #include "logger.h"
 
 #include <commctrl.h>
 
 namespace
 {
-	constexpr ULONG MaxRules = 256;
-
-	// 决策缓存。只有 UI 线程碰它，所以不需要加锁。
+	// ★ v130：决策缓存抽到 `r3shieldcore_decision_cache.h`（header-only）。
 	//
-	// ⚠️ objectType / op 必须参与匹配。
-	//   早期版本只比 (进程路径, 目标路径前缀) —— 后果是用户在
-	//   「CreateFile（打开/创建）」上点一次「始终允许」，同一个进程对该
-	//   目标的「删除 / 改名 / 改 ACL / 截断」也全部自动放行，因为它们
-	//   共享同一条规则。语义上是"我信任它打开这个文件"≠"我信任它删这个文件"，
-	//   必须区分。踩过的实例：误点 hosts 的 CreateFile「始终允许」后，
-	//   该进程后续对 hosts 的任何操作都不再弹窗。
-	struct Rule
-	{
-		bool used;
-		bool allow;
-		ULONG objectType;	// R3ShieldCore::ObjectType，必须一致
-		ULONG op;			// 各自枚举空间下的操作码，必须一致
-		WCHAR processPath[R3ShieldCore::MaxProcessPathChars];
-		WCHAR keyPath[R3ShieldCore::MaxKeyPathChars];
-	};
-
-	Rule g_rules[MaxRules];
-	ULONG g_nextRuleSlot = 0;
+	// 为什么抽出去：它是纯逻辑（"同参数不再问，不同参数照问"），
+	// 留在本文件就得跟 toast / comctl32 / UI 线程绑在一起 ——
+	// 单测为了验三个函数要链一整套窗口代码。抽走后
+	// `tools/v130_decision_cache_ut.cpp` 只 include 头文件，毫秒级跑完。
+	using R3ShieldCoreDecisionCache::AddRule;
+	using R3ShieldCoreDecisionCache::LookupCached;
 
 	HANDLE g_uiThread = nullptr;
 	volatile LONG g_stop = 0;
 	ULONG g_timeoutMs = 30000;
 	R3ShieldCore::Verdict g_timeoutVerdict = R3ShieldCore::Verdict::Deny;
-
-	// 前缀匹配，但要求边界落在 '\' 上，
-	// 否则规则 ...\Software\Foo 会误命中 ...\Software\FooBar
-	bool IsKeyPrefixMatch(PCWSTR prefix, PCWSTR path) noexcept
-	{
-		size_t prefixLength = wcslen(prefix);
-		if (prefixLength == 0 || _wcsnicmp(prefix, path, prefixLength) != 0) {
-			return false;
-		}
-
-		WCHAR next = path[prefixLength];
-		return next == L'\0' || next == L'\\';
-	}
-
-	bool LookupCached(const R3ShieldCore::PromptSlot& request, R3ShieldCore::Verdict& verdict) noexcept
-	{
-		for (ULONG i = 0; i < MaxRules; i++) {
-			if (!g_rules[i].used) {
-				continue;
-			}
-
-			if (_wcsicmp(g_rules[i].processPath, request.ProcessPath) != 0) {
-				continue;
-			}
-
-			// 对象类型 + 操作类型都必须一致。
-			// 「允许打开」不等于「允许删除」，不能复用同一条决策。
-			if (g_rules[i].objectType != request.ObjectType) {
-				continue;
-			}
-
-			if (g_rules[i].op != request.Op) {
-				continue;
-			}
-
-			if (!IsKeyPrefixMatch(g_rules[i].keyPath, request.KeyPath)) {
-				continue;
-			}
-
-			verdict = g_rules[i].allow ? R3ShieldCore::Verdict::Allow : R3ShieldCore::Verdict::Deny;
-			return true;
-		}
-
-		return false;
-	}
-
-	void AddRule(const R3ShieldCore::PromptSlot& request, bool allow) noexcept
-	{
-		Rule& rule = g_rules[g_nextRuleSlot % MaxRules];
-		g_nextRuleSlot++;
-
-		rule.used = true;
-		rule.allow = allow;
-		rule.objectType = request.ObjectType;
-		rule.op = request.Op;
-		wcsncpy_s(rule.processPath, request.ProcessPath, _TRUNCATE);
-		wcsncpy_s(rule.keyPath, request.KeyPath, _TRUNCATE);
-	}
 
 	// 进程名（含扩展名），用于通知标题。
 	PCWSTR ProcessNameOf(PCWSTR processPath) noexcept

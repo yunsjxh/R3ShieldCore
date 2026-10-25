@@ -8,9 +8,15 @@
 #   ① **面**（API 层）：六个自挂 hook 的探针，各回答"真调原函数 -> 换成假数据 ->
 #      返回成功"在**真 Windows API** 上到底行不行：
 #        注册表值 / 注册表枚举 / 剪贴板 / 屏幕(GetDIBits) / 事务注册表(KTM) / 摄像头
+#        / 文件读（v133）
 #   ② **规则**（codec 层）：`spoof_all_rules_ut` 把规则文件里**每一条**都用
 #      生产同源 codec 真跑一遍，打印"改前 -> 改后"的真实字节。
 #      还会报出**被遮蔽**的规则（first-match wins，前面有条同面规则顶掉它）。
+#   ③ **DSL 面覆盖**（codec 层，固定夹具）：`v135_rules_faces_ut` 证明
+#      五个面（注册表值/枚举/剪贴板/文件/截屏）都能解析、能求值，
+#      且不相容的组合（如"文件面的隐藏"）**在解析期就被拒**。
+#      ★ 与 ② 不重复：② 只验"这个规则文件里写了的东西"，一条文件规则都没写
+#        时它照样全绿 —— ③ 才回答"这两个面本身还通不通"（空真，铁律 110）。
 #
 # ★ 为什么不需要引擎：这六个探针**自己挂自己**的 hook（铁律 175 的豁免），
 #   `spoof_all_rules_ut` 只调生产 codec。所以本脚本**不注入任何进程**，
@@ -69,12 +75,13 @@ run_one() {
     TOTAL=$((TOTAL + 1))
 }
 
-echo "=== ① 六个面（自挂 hook，真 Windows API，不经过引擎）==="
+echo "=== ① 七个面（自挂 hook，真 Windows API，不经过引擎）==="
 run_one "注册表值"   ./tools/spoof_reg_probe.exe
 run_one "注册表枚举" ./tools/spoof_reg_enum_probe.exe
 run_one "剪贴板"     ./tools/spoof_clipboard_probe.exe
 run_one "屏幕DIB"    ./tools/spoof_retdata_probe.exe
 run_one "事务注册表" ./tools/spoof_reg_ktm_probe.exe
+run_one "文件读"     ./tools/spoof_file_probe.exe
 if [ "$CAMERA" -eq 1 ]; then
     run_one "摄像头"   ./tools/spoof_camera_probe.exe --use-camera
 else
@@ -88,6 +95,18 @@ if [ -n "$RULES" ]; then
 else
     run_one "规则文件" ./tools/spoof_all_rules_ut.exe
 fi
+
+# ======================================================================
+# ③ 规则 DSL 本身（v135：文件面 / 截屏面）
+# ======================================================================
+# ★ 为什么 ② 之外还要这一段：② 跑的是**某个具体规则文件**。
+#   文件里一条「文件」规则都没写的时候，② 照样全绿 —— 而"文件面根本没被
+#   覆盖"这件事，② 一个字都不会提（空真，铁律 110）。
+#   这一段跑的是**固定夹具**：两个新面的解析/求值/不相容组合的负对照，
+#   与用户写了什么规则无关。
+echo ""
+echo "=== ③ 规则 DSL 面覆盖（文件 / 截屏，固定夹具）==="
+run_one "DSL 面" ./tools/v135_rules_faces_ut.exe
 
 echo ""
 if [ "$FAILED" -eq 0 ]; then

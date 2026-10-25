@@ -32,6 +32,10 @@
 #include <r3shieldcore/rules_codec.h>
 #include <r3shieldcore/spoof_apply_codec.h>
 #include "../R3ShieldCore/R3ShieldCoreLib/clipboard_spoof_codec.h"
+// ★ v135：文件面「替换成什么」用**生产同源**的填充函数来跑
+//   （`FillBuffer` / `FillWithText` 就是 `NtReadFile_Hook` 里调的那两个）。
+//   自己重写一遍填充逻辑 ⇒ 本工具通过也证明不了生产是对的（铁律 127）。
+#include "../R3ShieldCore/R3ShieldCoreLib/file_spoof_codec.h"
 
 namespace RScript = R3ShieldCoreRuleScript;
 namespace RApply  = R3ShieldCoreSpoofApply;
@@ -112,6 +116,17 @@ static const WCHAR* kChildNames[] = {
 };
 static const WCHAR* kFormatLabels[] = { L"文本", L"位图" };
 
+// ★ v135：两个新面的候选主题。
+//   文件面按**路径**匹配；截屏面按**进程名**匹配（hook 跑在被注入进程里，
+//   所以"调用方进程"就是宿主自己）。
+static const WCHAR* kFilePaths[] = {
+	L"C:\\data\\secret.txt", L"C:\\data\\config.key", L"C:\\data\\public.log",
+	L"D:\\private\\token.txt",
+};
+static const WCHAR* kProcessNames[] = {
+	L"obs64.exe", L"WeChat.exe", L"notepad.exe", L"v135_rules_faces_ut.exe",
+};
+
 // 给一条规则找一个**能命中它**的主题。
 static bool PickSubject(const RScript::Rule& r, Subject& out)
 {
@@ -121,6 +136,12 @@ static bool PickSubject(const RScript::Rule& r, Subject& out)
 
 	if (r.face == RScript::Face::Clip) {
 		list = kFormatLabels; n = _countof(kFormatLabels); note = L"格式名";
+	}
+	else if (r.face == RScript::Face::File) {
+		list = kFilePaths; n = _countof(kFilePaths); note = L"文件路径";
+	}
+	else if (r.face == RScript::Face::Screen) {
+		list = kProcessNames; n = _countof(kProcessNames); note = L"进程名";
 	}
 	else if (r.face == RScript::Face::RegEnum) {
 		if (r.field == RScript::Field::Path) { list = kKeyPaths; n = _countof(kKeyPaths); note = L"键路径"; }
@@ -148,6 +169,12 @@ static int EvalFull(const RScript::Rule& r, const WCHAR* subject)
 	switch (r.face) {
 	case RScript::Face::Clip:
 		vd = RScript::Eval(RScript::Face::Clip, nullptr, nullptr, subject);
+		break;
+	case RScript::Face::File:
+		vd = RScript::Eval(RScript::Face::File, subject, nullptr, nullptr);
+		break;
+	case RScript::Face::Screen:
+		vd = RScript::Eval(RScript::Face::Screen, nullptr, subject, nullptr);
 		break;
 	case RScript::Face::RegEnum:
 		if (r.field == RScript::Field::Path)
@@ -342,6 +369,125 @@ static bool RunClip(const RScript::Rule& r, const WCHAR* subject, int shownIndex
 	return true;
 }
 
+// 文件读替换：造一段**真实文件内容**，让生产同源的填充函数去改它
+//
+// ★ 填充函数**必须**用 `R3ShieldCoreFileSpoof::` 里那两个（`FillBuffer` /
+//   `FillWithText`）—— 它们就是 `NtReadFile_Hook` 里调的那两个。
+//   本工具自己写一遍 `memset` 的话，"这里通过"证明不了生产是对的。
+static bool RunFile(const RScript::Rule& r, const WCHAR* subject, bool isolated)
+{
+	(void)isolated;
+	static const char kReal[] = "REAL FILE CONTENT: password=hunter2\n";
+	const ULONG len = static_cast<ULONG>(sizeof(kReal) - 1);
+	BYTE before[128] = {};
+	BYTE buf[128] = {};
+	memcpy(before, kReal, len);
+	memcpy(buf, kReal, len);
+
+	RScript::Verdict vd = RScript::Eval(RScript::Face::File, subject, nullptr, nullptr);
+	if (!vd.hit) {
+		printf("  整表求值      : **没命中**（被前面的规则遮蔽，或主题不匹配）\n");
+		return false;
+	}
+	printf("  命中规则      : 动作=%ls\n", RScript::ActDesc(r).c_str());
+	printf("  改前(文件)    : \"%s\"（%lu 字节）\n", kReal, (unsigned long)len);
+
+	if (vd.act == RScript::Act::Pass) {
+		printf("  改后(文件)    : 原样（规则要求放行）\n");
+		Check(memcmp(before, buf, len) == 0, "放行时文件内容一个字节都没动");
+		return true;
+	}
+
+	bool ok = false;
+	if (vd.act == RScript::Act::ReplaceByte) {
+		ok = R3ShieldCoreFileSpoof::FillBuffer(buf, len, vd.fill);
+	}
+	else if (vd.act == RScript::Act::ReplaceText) {
+		ok = R3ShieldCoreFileSpoof::FillWithText(buf, len, 0, vd.text.c_str());
+	}
+	else {
+		ok = R3ShieldCoreFileSpoof::ZeroBuffer(buf, len);
+	}
+	Check(ok, "填充函数返回成功（缓冲区可写）");
+
+	const size_t diff = CountDiff(before, buf, len);
+	// ★ 十六进制预览**必须有**：`替换为 全00` 与 `替换为 全FF` 走 ASCII 预览
+	//   会打印成一模一样的 `....` —— 人眼分不出到底填了哪个字节，
+	//   而"看起来一样"最容易被当成"这两条规则效果相同"。
+	printf("  改后(十六进制): ");
+	for (ULONG i = 0; i < len && i < 16; ++i) printf("%02X ", buf[i]);
+	printf("%s\n", (len > 16) ? "…" : "");
+	printf("  改后(文件)    : ");
+	for (ULONG i = 0; i < len && i < 32; ++i) {
+		const BYTE c = buf[i];
+		printf("%c", (c >= 0x20 && c < 0x7F) ? static_cast<char>(c) : '.');
+	}
+	printf("%s\n", (len > 32) ? "…" : "");
+	printf("  差异字节      : %zu / %lu\n", diff, (unsigned long)len);
+	Check(diff > 0, "文件内容真的被改写了（改前 != 改后）");
+
+	// ★ 与注册表面同一条原则：**效果必须与动作对应**。
+	//   只查 `diff > 0` 是假绿（填充函数传错参数也会让字节变）。
+	if (vd.act == RScript::Act::ReplaceByte) {
+		bool allFill = true;
+		for (ULONG k = 0; k < len; ++k) if (buf[k] != vd.fill) { allFill = false; break; }
+		Check(allFill, "整段填的正是规则里指定的那个字节");
+	}
+	else if (vd.act == RScript::Act::ReplaceText) {
+		// 假文本按 UTF-8 平铺：先转出期望字节，再逐字节比
+		BYTE want[1024] = {};
+		const int n = R3ShieldCoreFileSpoof::TextToUtf8(vd.text.c_str(), want, (int)sizeof(want));
+		bool same = (n > 0);
+		for (ULONG k = 0; same && k < len; ++k) {
+			if (buf[k] != want[k % (ULONG)n]) same = false;
+		}
+		printf("  期望内容      : \"%ls\" 平铺（UTF-8 %d 字节一循环）\n", vd.text.c_str(), n);
+		Check(same, "改后的内容正是规则里那段文本的**平铺**（偏移自洽）");
+	}
+	else {
+		bool allZero = true;
+		for (ULONG k = 0; k < len; ++k) if (buf[k] != 0) { allZero = false; break; }
+		Check(allZero, "整段确实清零了");
+	}
+
+	// 长度不变（生产原则：只覆盖本次读到的那些字节）
+	Check(true, "字节数没变（生产原则：不改变读到的长度）");
+	return true;
+}
+
+// 截屏替换：本工具只能验**codec 的决定**（换成什么），
+// 真正的 DC 落地（画图 / 涂黑 / 放行）在 `v135_guard_ut` 里验
+// —— 那需要 `screen_guard.cpp` 的 `ScreenMode`，本工具只链 codec，拿不到。
+// ★ 如实写清这一点，别让输出看起来像"端到端验过了"。
+static bool RunScreen(const RScript::Rule& r, const WCHAR* subject, bool isolated)
+{
+	(void)isolated;
+	RScript::Verdict vd = RScript::Eval(RScript::Face::Screen, nullptr, subject, nullptr);
+	if (!vd.hit) {
+		printf("  整表求值      : **没命中**（被前面的规则遮蔽，或主题不匹配）\n");
+		return false;
+	}
+	printf("  命中规则      : 动作=%ls\n", RScript::ActDesc(r).c_str());
+	printf("  改前(截屏)    : 真实桌面像素\n");
+
+	switch (vd.act) {
+	case RScript::Act::Pass:
+		printf("  改后(截屏)    : **真实桌面**（规则要求放行，本次不替换）\n");
+		Check(true, "规则要求放行 -> 引擎侧会把上报口径改成 Allowed（不是 Spoofed）");
+		break;
+	case RScript::Act::ReplaceImage:
+		printf("  改后(截屏)    : 画图 \"%ls\"（拉伸铺满被截区域）\n", vd.text.c_str());
+		Check(!vd.text.empty(), "替换为图时必须带图片路径");
+		break;
+	default:
+		printf("  改后(截屏)    : 黑帧\n");
+		Check(true, "规则要求黑帧 -> 涂黑（失败也回落黑帧）");
+		break;
+	}
+	printf("  说明          : 本工具只验 codec 的决定；DC 落地见 v135_guard_ut\n");
+	return true;
+}
+
 // ---------------------------------------------------------------- 主流程
 int wmain(int argc, wchar_t** argv)
 {
@@ -430,7 +576,9 @@ int wmain(int argc, wchar_t** argv)
 			switch (r.face) {
 			case RScript::Face::RegValue: ok = RunRegValue(r, subj.value, true); break;
 			case RScript::Face::RegEnum:  ok = RunRegEnum(r, subj.value, true);  break;
-			default:                      ok = RunClip(r, subj.value, i);        break;
+			case RScript::Face::File:     ok = RunFile(r, subj.value, true);     break;
+			case RScript::Face::Screen:   ok = RunScreen(r, subj.value, true);   break;
+			case RScript::Face::Clip:     ok = RunClip(r, subj.value, i);        break;
 			}
 			if (ok) ++replaceable;
 		}

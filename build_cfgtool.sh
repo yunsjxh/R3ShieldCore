@@ -61,7 +61,11 @@ unset _old_path _rest _seg
 hash -r 2>/dev/null || true
 
 OUT_DIR="dist/R3ShieldCore-x64"
-OUT_EXE="$OUT_DIR/r3shieldcore-cfg.exe"
+# ★ 允许用 `CFG_OUT_EXE` 覆盖产物路径 —— 唯一用途是"cfg 正开着、exe 被占用"
+#   的时候仍然能把改动**真编一遍**（否则只能看到 LNK1104，无法判断代码对不对）。
+#   默认值不变，正常构建行为与以前完全一致。
+#   ⚠️ 用它构建出来的产物**不在 dist 里** ⇒ 别指望 deploy/闸门会看到它。
+OUT_EXE="${CFG_OUT_EXE:-$OUT_DIR/r3shieldcore-cfg.exe}"
 OBJ_DIR="obj/cfgtool-$ARCH"
 
 # ★ INCLUDE / LIB 必须在**调用 rc.exe 之前**导出（rc 只认 INCLUDE 环境变量，

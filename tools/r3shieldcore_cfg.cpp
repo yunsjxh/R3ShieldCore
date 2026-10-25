@@ -220,6 +220,24 @@ const wchar_t* kOptLevel[] = { L"0", L"1", L"2", nullptr };
 const wchar_t* kLblOverlay[] = { L"0 —— 关闭", L"1 —— 开·不问直接执行", L"2 —— 开·每级弹窗询问", nullptr };
 const wchar_t* kLblAlert[] = { L"0 —— 关闭", L"1 —— 仅记录", L"2 —— 记录 + 界面提示", nullptr };
 
+// ★ v132：隐私面处置档（每面独立）。
+//
+// ⚠️ 取值必须与引擎侧 `ParsePrivacyAction()` 认的字符串**完全一致**
+//    （record / ask / block）。多写一个空格或大小写不同 ⇒ 引擎那边
+//    落到"不认识的写法 ⇒ 保持 record"，而界面显示的是用户选的那档 ——
+//    这种"界面说 A、实际是 B"是配置类最贵的 bug。
+//
+// ⚠️ 标签长度受**字段宽**限制（实测约 30 个半角字符）。v132 第一版写的是
+//    「record —— 只记录，不打断使用（默认）」，截图里被截成「…（默认」——
+//    少一个右括号。**下拉框宽度不会跟着文字长**，所以标签必须短。
+const wchar_t* kOptPrivacy[] = { L"record", L"ask", L"block", nullptr };
+const wchar_t* kLblPrivacy[] = {
+	L"record —— 只记录，不打断",
+	L"ask —— 弹窗询问",
+	L"block —— 直接拒绝",
+	nullptr
+};
+
 // ---- 各分组 ----
 const KeyDef kSecMode[] = {
 	{ L"mode", L"运行模式", Kind::Enum, L"log", kOptMode, kLblMode, 0, 0,
@@ -263,9 +281,50 @@ const KeyDef kSecReg[] = {
 
 const KeyDef kSecFile[] = {
 	{ L"hook_file", L"文件操作", Kind::Bool, L"0", nullptr, nullptr, 0, 0,
-	  L"建/写/删/改名/截断/改ACL。比注册表热得多，默认关（噪音大）。" },
+	  L"建/写/删/改名/截断/改ACL。比注册表热得多，默认关（噪音大）。"
+	  L"与「替换 · 文件」无关，那个不需要它打开。" },
 	{ L"hook_raw_disk", L"裸盘 / 引导区写入", Kind::Bool, L"1", nullptr, nullptr, 0, 0,
 	  L"写 \\\\.\\PhysicalDrive0 等 = 改引导区（bootkit），默认拦。" },
+};
+
+// ★★★ v133 续：六个 `spoof_*` 从「ini-only」升成**可拨开关**。
+//
+// 为什么必须**进 schema**（不是"顺手多画几个复选框"）：
+//   控件的初值（`SetFieldFromConfig`）与"到底改没改"的判定（`HarvestSection`）
+//   都走 `ConfigFile::GetScalar`，而它只认 `FindKey()` 认识的键（= schema 里有的）。
+//   键不进 schema ⇒ 复选框一律显示**默认值**（关），而用户 ini 里明明是 1
+//   ⇒ 他一按「保存」，`spoof_*=0` 就被写回去，**静默关掉他开着的替换**。
+//   这比"压根没有控件"严重得多（铁律 97 / 184 同族：口径假 + 静默改用户数据）。
+//   ⇒ 进 schema 是**前提**，不是装饰。
+//
+// 为什么单独一个分区、而不是塞进「注册表」「文件」各自的分区：
+//   这六个是**同一件事**（回传数据替换）的六个面。用户排查"规则写了没生效"
+//   时要一眼看全；分散到五个分区里就看不全了。
+//   而且它们与高级页那行「总闸(ini)」是**同一份清单**（铁律 127）。
+//
+// ★ 默认值一律 `"0"`（关）—— 必须与引擎的默认一致：
+//   `GetScalar` 在"ini 里没有这个键"时返回 `def`，而 `HarvestSection` 拿它
+//   当作"文件里的原值"来比。def 若写 `"1"` 而引擎默认是关，用户一打开这个
+//   分区就会被判成"改过了"，保存后凭空写出 `spoof_*=1`（把防护悄悄打开）。
+const KeyDef kSecSpoof[] = {
+	{ L"spoof_reg", L"替换 · 注册表值", Kind::Bool, L"0", nullptr, nullptr, 0, 0,
+	  L"读值成功但数据区清零（长度不变）。规则「替换为」也走它；必须配 protect_reg=。" },
+	{ L"spoof_reg_enum", L"替换 · 枚举隐藏", Kind::Bool, L"0", nullptr, nullptr, 0, 0,
+	  L"枚举受保护位置时，把命中 protect_reg= 的项从列表里去掉。" },
+	{ L"spoof_clipboard", L"替换 · 剪贴板", Kind::Bool, L"0", nullptr, nullptr, 0, 0,
+	  L"读剪贴板成功但拿到中性内容。只在「本应拒绝」时生效，需 privacy_clipboard=block。" },
+	{ L"spoof_screen", L"替换 · 屏幕", Kind::Bool, L"0", nullptr, nullptr, 0, 0,
+	  L"截屏成功但拿到黑帧（GetPixel 路不在覆盖内）。只在「本应拒绝」时生效。" },
+	// ★ v134：截屏替换的**内容来源**。放在 spoof_screen 正下面 ——
+	//   两个键是一件事的两半（开不开 / 用什么代替），隔开了就得来回找。
+	//   ⚠️ `Kind::Text`（单行输入框）而不是 `Kind::List`：这里**只支持一张图**。
+	//      多图（随机选一张）是另一个需求，而 List 会让人以为"填几行就轮播"。
+	{ L"spoof_screen_image", L"替换 · 屏幕来源图", Kind::Text, L"", nullptr, nullptr, 0, 0,
+	  L"留空 = 黑帧；填 BMP 路径 = 截图被拉伸铺满这张图（只认 BMP）。" },
+	{ L"spoof_camera", L"替换 · 摄像头", Kind::Bool, L"0", nullptr, nullptr, 0, 0,
+	  L"取帧成功但拿到中性帧。只在「本应拒绝」时生效，需 privacy_camera=block。" },
+	{ L"spoof_file", L"替换 · 文件", Kind::Bool, L"0", nullptr, nullptr, 0, 0,
+	  L"读文件成功但内容全 0（长度不变）。与 mode 无关；必须配 protect_file=。" },
 };
 
 const KeyDef kSecProc[] = {
@@ -294,6 +353,25 @@ const KeyDef kSecPrivacy[] = {
 	{ L"hook_audio", L"音频采集", Kind::Bool, L"1", nullptr, nullptr, 0, 0, L"环回 / 麦克风。" },
 	{ L"hook_clipboard", L"剪贴板读取", Kind::Bool, L"1", nullptr, nullptr, 0, 0, L"Open 只记录，取走数据才高危。" },
 	{ L"hook_input_inject", L"合成输入 / 锁屏勒索", Kind::Bool, L"1", nullptr, nullptr, 0, 0, L"SendInput / BlockInput / ClipCursor。" },
+};
+
+// ★ v132：命中之后怎么办 —— **单独一个分组**，不塞进「隐私采集」。
+//
+// 为什么不并在一起（第一版就是并的，截图发现两个问题）：
+//   ① 「隐私采集」原有 6 行开关，再加 4 行下拉 + 4 行提示 ⇒ 内容高度
+//      超过客户区，**第 4 个下拉框（剪贴板）落在可视区外**，而配置页
+//      没有滚动 —— 用户根本调不到它（功能等于只做了 3/4）。
+//   ② 语义上也是两件事：上面是"要不要监控"，这里是"监控到了怎么办"。
+//      混在一页里，用户会以为把 hook_camera 关掉就能改处置。
+const KeyDef kSecPrivacyAction[] = {
+	{ L"privacy_camera", L"摄像头命中时", Kind::Enum, L"record", kOptPrivacy, kLblPrivacy, 0, 0,
+	  L"只在 block 模式下生效。选 block 会让视频通话打不开。" },
+	{ L"privacy_input_hook", L"输入钩子命中时", Kind::Enum, L"record", kOptPrivacy, kLblPrivacy, 0, 0,
+	  L"只在 block 模式下生效。选 block 会让输入法 / 游戏 / 远控装不上钩子。" },
+	{ L"privacy_screen", L"截屏命中时", Kind::Enum, L"record", kOptPrivacy, kLblPrivacy, 0, 0,
+	  L"只在 block 模式下生效。选 block 会让截图 / 录屏 / 会议共享拿不到画面。" },
+	{ L"privacy_clipboard", L"剪贴板命中时", Kind::Enum, L"record", kOptPrivacy, kLblPrivacy, 0, 0,
+	  L"只在 block 模式下生效。剪贴板读是每次 Ctrl+V 都走的热路径，选 block 会让粘贴失效。" },
 };
 
 const KeyDef kSecPersist2[] = {
@@ -338,7 +416,8 @@ const KeyDef kSecWhite[] = {
 const KeyDef kSecProtectA[] = {
 	{ L"protect_reg", L"自定义保护：注册表", Kind::List, L"", nullptr, nullptr, 0, 0,
 	  L"每行一条。相对写法（SOFTWARE\\X）与完整写法等价；命中即视为高危。" },
-	{ L"protect_file", L"自定义保护：文件", Kind::List, L"", nullptr, nullptr, 0, 0, L"每行一条前缀。" },
+	{ L"protect_file", L"自定义保护：文件", Kind::List, L"", nullptr, nullptr, 0, 0,
+	  L"每行一条前缀（目录要带结尾 \\）。它只让「写」变高危；读替换见「回传数据替换」。" },
 };
 
 const KeyDef kSecProtectB[] = {
@@ -359,10 +438,18 @@ const Section kSections[] = {
 	{ L"注入与盲区", kSecInject, _countof(kSecInject) },
 	{ L"注册表", kSecReg, _countof(kSecReg) },
 	{ L"文件", kSecFile, _countof(kSecFile) },
+	// ★ v133 续：六个 `spoof_*` 的可拨开关。放在「文件」**后面**不是随意的：
+	//   `spoof_file` 的触发面 `protect_file=` 在「自定义保护 · 注册表等」里，
+	//   而 `hook_file` 就在上面一格 —— 三个相关的东西在同一屏附近，用户不用来回找。
+	//   ⚠️ 左栏标题宽度：`回传数据替换` = 6 个汉字 ≈ 78px，列表可用宽 ~152px（v124 量过）
+	//      ⇒ 余量很足，不会触发 `DT_END_ELLIPSIS`。（对比踩过坑的那条
+	//      `自定义保护 · 注册表等` 量出来 154px > 152px。）
+	{ L"回传数据替换", kSecSpoof, _countof(kSecSpoof) },
 	{ L"进程 / 线程 / 内存", kSecProc, _countof(kSecProc) },
 	{ L"驱动 / 服务", kSecDriver, _countof(kSecDriver) },
 	{ L"网络", kSecNet, _countof(kSecNet) },
 	{ L"隐私采集", kSecPrivacy, _countof(kSecPrivacy) },
+	{ L"隐私面处置", kSecPrivacyAction, _countof(kSecPrivacyAction) },
 	{ L"持久化 / 劫持", kSecPersist2, _countof(kSecPersist2) },
 	{ L"窗口反制", kSecOverlay, _countof(kSecOverlay) },
 	{ L"高危进程提示", kSecHighRisk, _countof(kSecHighRisk) },
@@ -417,6 +504,21 @@ int EnumIndexFromValue(const KeyDef& k, const std::string& raw) {
 	}
 	if (key == L"prompt_default") {
 		return (v == "allow") ? 1 : 0;
+	}
+	// ★ v132：隐私面处置 —— 别名表必须与引擎 `ParsePrivacyAction()` 一致。
+	//
+	//   为什么不能只靠下面那条"opts 里找得到就用"的通用分支：
+	//   引擎还认 log / notify / prompt / deny / 0 / 1 / 2 这些别名。
+	//   手写 `privacy_camera=notify` 时通用分支找不到 "notify" ⇒ 落到
+	//   index 0（record）—— 恰好对；但手写 `=2`（= block）也会落到
+	//   index 0（record）—— **界面显示 record、引擎实际 block**。
+	//   一保存就把用户的值改成 record，静默改掉他的配置。
+	if (key == L"privacy_camera" || key == L"privacy_input_hook"
+		|| key == L"privacy_screen" || key == L"privacy_clipboard") {
+		if (v == "record" || v == "log" || v == "notify" || v == "0") { return 0; }
+		if (v == "ask" || v == "prompt" || v == "1") { return 1; }
+		if (v == "block" || v == "deny" || v == "2") { return 2; }
+		return 0;
 	}
 	if (key == L"neutralize_overlay" || key == L"high_risk_process_alert") {
 		if (v == "0" || v == "false" || v == "no" || v == "off") { return 0; }
@@ -556,6 +658,42 @@ struct ConfigFile {
 		if (it == firstActive.end()) { return def; }
 		const ParsedLine pl = ParseLine(StripCr(lines[it->second]));
 		return pl.isAssign ? pl.value : def;
+	}
+
+	//
+	// 直接扫全文取值 —— **不经过** `firstActive` 的"已注册键"过滤。
+	//
+	// ★★★ 为什么必须另开一个（v133 实测，这是老缺陷）：`GetScalar` 走
+	//   `firstActive`，而那张表由 `RebuildIndex` 填充时**只收 `FindKey()`
+	//   认识的键**（= 配置页上真有一行控件的那些）。
+	//
+	//   当年 `spoof_reg` / `spoof_reg_enum` / `spoof_clipboard` / `spoof_screen` /
+	//   `spoof_camera` / `spoof_file` 全是 **ini-only**（没有控件）⇒ 一个都不在表里
+	//   ⇒ `GetScalar(key,"0")` **恒返回 "0"** ⇒ 高级页那行"总闸"**恒显示全关**。
+	//   而它的全部意义就是告诉用户"你写的规则没生效，是因为 ini 里的总闸关着"
+	//   —— 恒显示假信息比不显示更糟（铁律 97：口径必须与实际一致）。
+	//   实测证据：测试 ini 里写着 `spoof_reg=1 spoof_screen=1 spoof_file=1`，
+	//   界面上仍然是"注册表关 屏幕关 文件关"。
+	//
+	// ★ v133 续：这六个已经**进了 schema**（配置页上有「回传数据替换」分区），
+	//   所以 `GetScalar` 现在也读得到它们了。**但本函数继续保留、总闸行继续用它**，
+	//   理由变了但依然成立：
+	//     ① 总闸行要的是"**ini 文件里到底写着什么**"，不该依赖"这一页有没有控件"
+	//        —— 哪天某个面从 schema 里撤掉（比如做成只读展示），总闸行会**悄悄
+	//        变成恒显示关**，而没有人会注意到；
+	//     ② 它读的是 `g_cfg`（磁盘那份），**不看** `g_pending`（用户已勾但没保存
+	//        的改动）。这正是 "总闸(ini)" 这个名字该有的语义；
+	//     ③ 用户手改 ini 加了本工具不认识的开关时，总闸行仍能如实显示。
+	//
+	// ★ 取值口径与 `GetScalar` 完全一致（都走 `ParseLine`，行尾注释会被剥掉），
+	//   唯一差别是**不做 FindKey 过滤**。多行同名键取**第一条**（与引擎一致）。
+	//
+	std::string GetScalarRaw(const std::string& key, const std::string& def) const {
+		for (const std::string& line : lines) {
+			const ParsedLine pl = ParseLine(StripCr(line));
+			if (pl.isAssign && pl.key == key) { return pl.value; }
+		}
+		return def;
 	}
 
 	std::vector<std::string> GetList(const std::string& key) const {
@@ -3775,22 +3913,29 @@ void ChooseLogTarget(int comboIdx, bool initial) {
 	// ★ 点「面」＝插入一整条骨架；点「算子」「动作」＝在光标处插入该词。
 	//   骨架用**中文 DSL 原文**（不是直接拼 Rule 结构体）—— 必须走用户手敲
 	//   那条**同一条解析路径**（铁律 22）。
-	PCWSTR kAdvFaceChips[3] = {
+	// ★★ v135：面从 3 个变 5 个（加了「文件」「截屏」）。
+	//   骨架里的**默认字段**必须与 codec 的默认一致（文件→路径、截屏→进程）——
+	//   骨架写错字段的话用户点一下就是一条"解析报错"或"永远不命中"的规则。
+	PCWSTR kAdvFaceChips[5] = {
 		L"当 注册表值 的 值名 含 \"\" 时 替换为 \"\"",
 		L"当 注册表枚举 的 子键名 含 \"\" 时 隐藏",
 		L"当 剪贴板 的 格式 等于 文本 时 替换为 \"\"",
+		L"当 文件 的 路径 含 \"\" 时 替换为 全零",
+		L"当 截屏 的 进程 含 \"\" 时 替换为图 \"\"",
 	};
-	PCWSTR kAdvFaceChipLabel[3] = { L"注册表值", L"注册表枚举", L"剪贴板" };
+	PCWSTR kAdvFaceChipLabel[5] = { L"注册表值", L"注册表枚举", L"剪贴板", L"文件", L"截屏" };
 
 	PCWSTR kAdvOpChips[5] = { L"等于", L"含", L"匹配 /正则/", L"开头", L"结尾" };
 	PCWSTR kAdvOpChipText[5] = { L"等于", L"含", L"匹配 //", L"开头", L"结尾" };
 
-	PCWSTR kAdvActChips[6] = { L"替换为 \"\"", L"替换为 空", L"替换为 全零",
-		L"隐藏", L"拒绝", L"放行" };
+	// ★★ v135：加了 `替换为 全FF`（原来只有 全零，想填 FF 只能手敲十六进制）
+	//   与 `替换为图 ""`（截屏面专用；只对截屏面成立，其余面点了会在提示行报错）。
+	PCWSTR kAdvActChips[8] = { L"替换为 \"\"", L"替换为 空", L"替换为 全零", L"替换为 全FF",
+		L"替换为图 \"\"", L"隐藏", L"拒绝", L"放行" };
 
-	constexpr int kAdvChipRowA = 3;    // 面
+	constexpr int kAdvChipRowA = 5;    // 面
 	constexpr int kAdvChipRowB = 5;    // 算子
-	constexpr int kAdvChipRowC = 6;    // 动作
+	constexpr int kAdvChipRowC = 8;    // 动作
 	constexpr int kAdvChipCount = kAdvChipRowA + kAdvChipRowB + kAdvChipRowC;
 
 	PCWSTR AdvChipLabel(int index)
@@ -4361,14 +4506,24 @@ void ChooseLogTarget(int comboIdx, bool initial) {
 
 	// ---------------- 示例规则 ----------------
 	//
-	// ★ 三条覆盖三个面 × 三种动作：
+	// ★ v135：从 3 条扩到 5 条，把新加的两个面也铺上。
+	//   为什么必须铺：示例是**唯一**让用户看见"这个面到底怎么写"的地方 ——
+	//   只加模板按钮的话，用户点出来的骨架里字段名是空的，仍要猜。
 	//   #0 注册表值  ：正则匹配 -> 替换为文本（真会写进数据区）
 	//   #1 剪贴板    ：等于    -> 替换为文本
 	//   #2 注册表枚举：含      -> 隐藏（从列表里去掉）
+	//   #3 文件      ：含      -> 替换为 全零（文件读到的内容变全零）
+	//   #4 截屏      ：含      -> 替换为图（按**调用方进程名**匹配）
+	//
+	// ★★ 注意 #3/#4 只是**规则**，不是开关：`spoof_file` / `spoof_screen`
+	//   这两个 ini 开关没开时，规则再怎么写也不会生效（叠加关系，v135 设计）。
+	//   示例里挑的是"用户一看就知道是演示"的模式串，不会误伤真实文件/程序。
 	PCWSTR kAdvDemoRules[] = {
 		L"当 注册表值 的 值名 匹配 /Pass.*/ 时 替换为 \"***\"",
 		L"当 剪贴板 的 格式 等于 文本 时 替换为 \"[已替换]\"",
 		L"当 注册表枚举 的 子键名 含 \"Secret\" 时 隐藏",
+		L"当 文件 的 路径 含 \"\\\\demo\\\\secret\" 时 替换为 全零",
+		L"当 截屏 的 进程 含 \"DemoCapture\" 时 替换为图 \"C:\\\\demo\\\\fake.bmp\"",
 	};
 
 	void AdvLoadDemoRules()
@@ -4658,7 +4813,14 @@ void ChooseLogTarget(int comboIdx, bool initial) {
 		case AdvButtonLoad:       AdvLoadRules(); break;
 		case AdvButtonSeed:
 			AdvLoadDemoRules();
-			g_advStatus = L"已重置为 3 条示例规则。";
+			// ★ 条数从数组取，不写死 —— 写死的话下次加示例就变成
+			//   "点了重置、提示说 3 条、表里有 5 条"（口径与实际不一致）。
+			{
+				WCHAR msg[96] = {};
+				swprintf_s(msg, L"已重置为 %d 条示例规则。",
+					(int)(sizeof(kAdvDemoRules) / sizeof(kAdvDemoRules[0])));
+				g_advStatus = msg;
+			}
 			break;
 		case AdvButtonClear:
 			RRule::Clear();
@@ -4942,24 +5104,87 @@ void ChooseLogTarget(int comboIdx, bool initial) {
 	//   （`g_cfg` 就是配置页正在编辑的那一份）。判据用 `IsTrueA`，与配置页
 	//   勾选框**同一个函数**（铁律 127）—— 否则会出现"配置页显示开、
 	//   高级页显示关"这种自相矛盾，而两边都不报错。
+	//
+	// ★★★ v133：必须用 `GetScalarRaw`，**不能**用 `GetScalar`。
+	//   当年 `spoof_*` 六个开关全是 ini-only（配置页没有控件）⇒ `GetScalar`
+	//   会让本行**恒显示全关**，也就是"这行字永远是假的"（实测踩过）。
+	//   ★ v133 续这六个已进 schema，`GetScalar` 现在也能读到 —— **但不要改回去**：
+	//     本行要回答的是"**ini 文件里**写着什么"，而 `GetScalar` 的可见性
+	//     取决于"这一页有没有控件"。哪天某个面从 schema 撤掉，这里会**悄悄**
+	//     变成恒显示关，而且没有任何报错（铁律 142：只查"能取到值"⇒ 假绿）。
+	//     用 Raw 版本 ⇒ 与 schema 解耦，永远反映文件真相。
 	bool AdvSwitchOn(const char* key)
 	{
-		return IsTrueA(g_cfg.GetScalar(key, "0"));
+		return IsTrueA(g_cfg.GetScalarRaw(key, "0"));
 	}
 
 	// 把开关状态画成一行（"总闸"）—— 用户"写了规则没生效"时第一个要看的东西。
+	//
+	// ★★★ v133：**表驱动**，六个开关一个都不能漏。
+	//
+	//   之前的写法是三个 `AdvSwitchOn` 硬编码 + 一段 `swprintf_s`，
+	//   只画了 `spoof_reg` / `spoof_reg_enum` / `spoof_clipboard` ——
+	//   `spoof_screen` / `spoof_camera` **从来没显示过**，v133 又多了
+	//   `spoof_file`。后果不是"少显示一行"，而是**假信息**：
+	//   用户写了屏幕替换规则、发现不生效，看这行"总闸"全是关的也看不出
+	//   问题在哪（因为真正关着的那个开关**根本没画出来**）。
+	//   这与铁律 97（口径必须与实际一致）是同一类错误，只是载体是像素。
+	//
+	//   ⇒ 改成一张表：加开关时只加一行数据，**画的地方不用动**
+	//     （铁律 127：同一份清单别在两处各写一遍）。
+	//
+	struct AdvGateDef
+	{
+		const char* key;
+		const WCHAR* label;
+	};
+
+	const AdvGateDef kAdvGates[] = {
+		{ "spoof_reg",       L"注册表" },
+		{ "spoof_reg_enum",  L"枚举" },
+		{ "spoof_clipboard", L"剪贴板" },
+		{ "spoof_screen",    L"屏幕" },
+		{ "spoof_camera",    L"摄像头" },
+		{ "spoof_file",      L"文件" },
+	};
+
 	void AdvDrawGates(HDC dc, int left, int right, int y)
 	{
-		const bool gateReg  = AdvSwitchOn("spoof_reg");
-		const bool gateClip = AdvSwitchOn("spoof_clipboard");
-		const bool gateEnum = AdvSwitchOn("spoof_reg_enum");
-		WCHAR buf[256] = {};
-		swprintf_s(buf, L"总闸（ini）：spoof_reg=%s  spoof_clipboard=%s  spoof_reg_enum=%s",
-			gateReg ? L"开" : L"关",
-			gateClip ? L"开" : L"关",
-			gateEnum ? L"开" : L"关");
-		const bool anyOn = gateReg || gateClip || gateEnum;
-		DrawTextSimple(dc, buf, { left, y, right, y + 18 },
+		// ★ 标签一律取**短名**（2~3 个汉字）：这一行要和"总闸(ini)："前缀
+		//   一起塞进左栏，用 `spoof_reg=` 那种长名会直接触发
+		//   `DT_END_ELLIPSIS` 静默截断 —— 而被截掉的恰好是**最右边**的
+		//   那几个开关，也就是最新加的那些。
+		//
+		// ★★★ 宽度是**量过的**，不是估的（v133，Microsoft YaHei UI -13px，
+		//   ANTIALIASED）：六个开关全列出来 = **354px**。
+		//   可用宽度 = `rulesPanel` 宽 - 32：
+		//     client 1024 -> 472px（余量 118）
+		//     client  900 -> 407px（余量  53）
+		//     client  800 -> 355px（余量   1）★ 窗口最小宽度就是 800
+		//       （`WM_GETMINMAXINFO` 的 `ptMinTrackSize.x`）
+		//   ⇒ **再加一个字就会在最小窗口下被截掉**。要加开关/改标签时，
+		//     先把这两组数字重新量一遍（`GetTextExtentPoint32W` + 上面的
+		//     可用宽度公式），别凭感觉。
+		//   ⚠️ 为什么 CJK 的宽度是稳的：汉字在等宽点阵/矢量字体里都近似
+		//     "字号见方"，13px 字号的汉字≈13px 宽，换字体几乎不变 ——
+		//     所以这 354px 不随 `R3SHIELDCORE_CFG_FONT` 漂。
+		std::wstring line = L"总闸(ini)：";
+		bool anyOn = false;
+
+		for (size_t i = 0; i < _countof(kAdvGates); i++)
+		{
+			const bool on = AdvSwitchOn(kAdvGates[i].key);
+			anyOn = anyOn || on;
+
+			if (i > 0)
+			{
+				line += L' ';
+			}
+			line += kAdvGates[i].label;
+			line += on ? L"开" : L"关";
+		}
+
+		DrawTextSimple(dc, line.c_str(), { left, y, right, y + 18 },
 			g_fontUI, anyOn ? kTextPrimary : kBlocked,
 			DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS);
 	}
@@ -7915,7 +8140,14 @@ int RunSelfTest(const std::wstring& workDirIn) {
 		W2U8(L"exclude=C:\\Old\r\n") +
 		W2U8(L"exclude=D:\\Old2\r\n") +
 		W2U8(L"# exclude=C:\\Example（示例注释，不该被动）\r\n") +
-		W2U8(L"log=r3shieldcore-events.log\r\n");
+		W2U8(L"log=r3shieldcore-events.log\r\n") +
+		// ★ v133：`spoof_*` 曾经是 ini-only 的键。
+		//   v133 续之后它们**进了 schema**（配置页有「回传数据替换」分区），
+		//   但夹具里照样要放它们 —— 下面要同时验两件事：
+		//     · GetScalarRaw **永远**读得到（与 schema 无关，总闸行靠它）
+		//     · GetScalar 的可见性**跟着 schema 变**（所以它不能当总闸的依据）
+		W2U8(L"spoof_reg=1               # 行尾注释要被剥掉\r\n") +
+		W2U8(L"spoof_file=0\r\n");
 
 	const std::wstring fixturePath = workDir + L"\\r3shieldcore_cfg_selftest.ini";
 	{
@@ -7936,6 +8168,50 @@ int RunSelfTest(const std::wstring& workDirIn) {
 	Check(cfg.GetScalar("mode", "") == "log", "parse mode=log");
 	Check(cfg.GetScalar("hook_file", "") == "0", "parse hook_file=0");
 	Check(cfg.GetScalar("log", "") == "r3shieldcore-events.log", "parse log=...");
+
+	// ★★★ v133 续：六个 spoof_* 已从「ini-only」升成配置页的**可拨开关**。
+	//   这一段是"进了 schema"的**行为判据**，不是装饰 —— 理由见 `kSecSpoof` 的长注释：
+	//   键不进 schema ⇒ 复选框恒显示默认值（关），用户一按保存就把 ini 里的 1
+	//   写成 0，**静默关掉他开着的替换**。所以这三条必须真的去问 `FindKey`。
+	const char* kSpoofKeys[] = {
+		"spoof_reg", "spoof_reg_enum", "spoof_clipboard",
+		"spoof_screen", "spoof_camera", "spoof_file",
+	};
+	bool spoofAllIn = true, spoofAllBool = true, spoofAllDef0 = true;
+	for (const char* key : kSpoofKeys) {
+		const KeyDef* k = FindKey(key);
+		if (!k) { spoofAllIn = false; continue; }
+		if (k->kind != Kind::Bool) { spoofAllBool = false; }
+		if (W2U8(k->def) != "0") { spoofAllDef0 = false; }
+	}
+	Check(spoofAllIn, "六个 spoof_* 都在配置页 schema 里（不进 schema 会让保存把 1 写回 0）");
+	Check(spoofAllBool, "六个 spoof_* 的控件类型都是 Bool");
+	Check(spoofAllDef0, "六个 spoof_* 默认值都是 0（与引擎的「默认关」一致）");
+
+	// ★★ v134：`spoof_screen_image` 也必须在 schema 里 —— 理由同上，但**后果更重**：
+	//   它是 `Kind::Text`（单行输入框），不在 schema 时控件恒显示**空串**，
+	//   而 `HarvestSection` 会判成"改过了" => 保存把用户填的路径**清空**。
+	//   现象是"明明配了图，重启后又变黑帧了"——比开关被关掉更难查（开关至少看得到）。
+	{
+		const KeyDef* k = FindKey("spoof_screen_image");
+		Check(k != nullptr, "spoof_screen_image 在 schema 里（否则保存会清空用户填的路径）");
+		Check(k != nullptr && k->kind == Kind::Text, "spoof_screen_image 的控件类型是 Text");
+	}
+
+	// ---- 取值口径：两条路各司其职 ----
+	//   ① Raw：与 schema **解耦**，永远读得到 ⇒ 高级页「总闸(ini)」那一行靠它。
+	Check(cfg.GetScalarRaw("spoof_reg", "") == "1",
+		"GetScalarRaw 读到 spoof_reg=1（行尾注释已剥）");
+	Check(cfg.GetScalarRaw("spoof_file", "") == "0",
+		"GetScalarRaw 区分 0/1（spoof_file=0）");
+	//   ② GetScalar：依赖 schema。正是**控件初值**用的那条（`SetFieldFromConfig`）
+	//      ⇒ 进 schema 之后必须读得到，否则复选框显示"关"、保存就把 1 写回 0。
+	Check(cfg.GetScalar("spoof_reg", "__MISSING__") == "1",
+		"正例：进了 schema 后 GetScalar 也读得到 spoof_reg=1（控件初值靠它）");
+	//   ③ 负对照换成一个**真**不在 schema 里的键 —— 证明 GetScalar 仍在过滤，
+	//      所以「总闸行继续用 GetScalarRaw」这个选择仍然是对的。
+	Check(cfg.GetScalar("no_such_key_zzz", "__MISSING__") == "__MISSING__",
+		"负对照：GetScalar 仍然过滤 schema 外的键（总闸行继续用 GetScalarRaw 是对的）");
 
 	{
 		const std::vector<std::string> ex = cfg.GetList("exclude");
@@ -7960,6 +8236,12 @@ int RunSelfTest(const std::wstring& workDirIn) {
 	Check(content.find("hook_file=1") != std::string::npos, "value replaced: hook_file=1");
 	Check(content.find("ark_enabled=1") != std::string::npos, "untouched key preserved");
 	Check(content.find("log=r3shieldcore-events.log") != std::string::npos, "untouched log= preserved");
+	// ★★★ v133 续：`spoof_reg` 现在是**配置页上的键**。这条钉住最贵的那个失败模式：
+	//   用户只改了 mode、点保存 => 替换开关必须**原样留着**。
+	//   若哪天有人把这六个键从 schema 里撤掉，复选框会恒显示“关”，
+	//   而 `HarvestSection` 会判成“改过了” => 保存把 1 写成 0（静默关掉防护）。
+	Check(content.find("spoof_reg=1") != std::string::npos,
+		"未改动的替换开关 spoof_reg=1 原样保留（只改 mode 不会把替换关掉）");
 	Check(content.find("exclude=E:\\New") != std::string::npos, "list rewritten");
 	Check(content.find("exclude=C:\\Old") == std::string::npos, "old list entry removed");
 	Check(content.find("exclude=D:\\Old2") == std::string::npos, "second old list entry removed");
@@ -7997,6 +8279,32 @@ int RunSelfTest(const std::wstring& workDirIn) {
 		std::wstring err;
 		const bool ok = bad.SaveContent("x=1\r\n", err);
 		Check(!ok, "negative control: save to missing dir fails");
+	}
+
+	// =====================================================================
+	// ★ v132：隐私面处置键的 round-trip
+	//
+	//   为什么单独钉这四个键：它们是**枚举**（record/ask/block），
+	//   而枚举在界面上显示的取值来自 `kOptPrivacy`，引擎侧认的是
+	//   `ParsePrivacyAction()` 里的字面量。两处只要差一个字母/大小写，
+	//   症状就是"界面显示 ask、实际是 record" —— 而所有行为单测都是绿的
+	//   （它们直接调函数，不经过 ini）。
+	//
+	//   ★ 这条只证明"界面能把值写进 ini"；"引擎认得这个值"由
+	//     `tools/check_privacy_face.sh` 的字面量一致性判据负责。
+	// =====================================================================
+	{
+		std::map<std::string, std::string> p;
+		p["privacy_camera"] = "ask";
+		p["privacy_clipboard"] = "block";
+		const std::string c2 = cfg.BuildNewContent(p, {});
+		Check(c2.find("privacy_camera=ask") != std::string::npos,
+			"v132: privacy_camera=ask 写入 ini");
+		Check(c2.find("privacy_clipboard=block") != std::string::npos,
+			"v132: privacy_clipboard=block 写入 ini");
+		// 负对照：没设的键不能被顺手写进去（否则等于把默认值"固化"了）
+		Check(c2.find("privacy_screen=") == std::string::npos,
+			"v132: 没设的 privacy_screen 不被追加");
 	}
 
 	// =====================================================================
@@ -8064,6 +8372,63 @@ int RunSelfTest(const std::wstring& workDirIn) {
 		const int after2 = RRule::Count();
 		Check(after1 == 2, "rules: LoadFile first read = 2");
 		Check(after2 == 4, "rules: LoadFile appends (UI must Clear first)");
+		RRule::Clear();
+	}
+	{
+		// =============================================================
+		// ★★★ v135：示例规则 + 模板骨架 **必须全部解析通过**。
+		//
+		//   为什么值得单测：这两个数组是"用户点一下就落进规则表"的东西。
+		//   写错一条（比如 `替换为全FF` 少了空格 —— 分词后是一个词，
+		//   撞不上动作词），用户点「重置为示例规则」得到的是一张
+		//   **带坏行的表**；坏行在保存时被静默丢掉，而用户会以为
+		//   "我明明点了重置" ⇒ 这是典型的"看着加上了其实没用"。
+		//
+		//   ★ 面骨架是**完整规则**，直接逐条 Add 即可。
+		//   ★ 动作芯片只是片段，必须拼进一条**该动作合法的面**里才测得出来
+		//     （`隐藏` 只对枚举面、`替换为图` 只对截屏面，拼错面会假红）。
+		const int demoCount = (int)(sizeof(kAdvDemoRules) / sizeof(kAdvDemoRules[0]));
+		int badDemo = 0;
+		RRule::Clear();
+		for (PCWSTR line : kAdvDemoRules) {
+			std::wstring e;
+			if (!RRule::Add(line, e, nullptr)) { ++badDemo; }
+		}
+		Check(badDemo == 0, "v135: 示例规则全部解析通过");
+		Check(RRule::Count() == demoCount, "v135: 示例规则条数与数组一致");
+		RRule::Clear();
+
+		int badFace = 0;
+		for (PCWSTR line : kAdvFaceChips) {
+			std::wstring e;
+			if (!RRule::Add(line, e, nullptr)) { ++badFace; }
+		}
+		Check(badFace == 0, "v135: 模板骨架全部解析通过");
+		RRule::Clear();
+
+		// 动作芯片 -> 一个**该动作合法**的面骨架前缀
+		int badAct = 0;
+		for (int i = 0; i < kAdvChipRowC; i++) {
+			const PCWSTR chip = kAdvActChips[i];
+			PCWSTR prefix = L"当 注册表值 的 值名 含 \"X\" 时 ";
+			if (wcsncmp(chip, L"替换为图", 4) == 0) {
+				prefix = L"当 截屏 的 进程 含 \"X\" 时 ";
+			}
+			else if (wcsncmp(chip, L"隐藏", 2) == 0) {
+				prefix = L"当 注册表枚举 的 子键名 含 \"X\" 时 ";
+			}
+			std::wstring full = std::wstring(prefix) + chip;
+			std::wstring e;
+			if (!RRule::Add(full.c_str(), e, nullptr)) {
+				++badAct;
+				// ★ 把失败的那条和**解析器给的原因**打出来 ——
+				//   只说"有 N 条坏了"等于没测：改的人还得自己一条条试。
+				const std::string msg = std::string("v135: 动作芯片解析失败 -> ")
+					+ W2U8(full.c_str()) + "  —— " + W2U8(e.c_str());
+				Check(false, msg.c_str());
+			}
+		}
+		Check(badAct == 0, "v135: 动作芯片拼进合法规则后全部解析通过");
 		RRule::Clear();
 	}
 

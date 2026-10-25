@@ -29,6 +29,11 @@
 #include <r3shieldcore/r3shieldcore_shared.h>
 #include "registry_enum_codec.h"
 #include "r3shieldcore_rules.h"
+#include <r3shieldcore/rules_codec.h>
+// ★ v133：规则脚本的**加载状态机**。
+//   单测必须能把它“钉住”，否则第一次 `Evaluate` 会**懒加载本机真实规则文件**，
+//   把刚清空的表又填回去（见 `PinEmptyRuleScript`）。
+#include "rules_script_runtime.h"
 
 // registry_guard.cpp 尾部的单测入口（宏 REGUARD_GUARD_UT 打开）。
 namespace RegistryGuardTest
@@ -54,6 +59,49 @@ static void Check(const char* name, bool ok)
 {
 	printf("  [%s] %s\n", ok ? "PASS" : "FAIL", name);
 	if (ok) g_pass++; else g_fail++;
+}
+
+// ------------------------------------------------------------------ 夹具
+//
+// ★★★ v133：把**规则脚本的加载状态**钉死，让本单测与“这台机器上装了什么规则”完全解耦。
+//
+//   为什么 `Clear()` 一个人不够（v133 实测踩到，不是推理出来的）：
+//     `registry_guard.cpp` 的 `Evaluate` **第一次**被调用时会走
+//     `R3ShieldCoreRuleScriptRuntime::EnsureLoadedSafe()` —— 那是**懒加载**，
+//     它从 `%ProgramData%\R3 Shield Core\r3shieldcore-rules.txt` 把**本机真实的**
+//     规则读进表里。于是：
+//         单测开头 `Clear()`   => 表空
+//         第一次 `Evaluate`    => 懒加载把表**填回去**
+//         “无关键 -> 不 Spoofed”  => 因为本机有一条枚举规则，
+//                                    `HasFace(RegEnum)` 恒真 => 断言**恒 FAIL**
+//     更阴的是“自己变绿”：换一台**没有**枚举规则的机器，同一条
+//     断言就过了。依赖环境的断言比没有断言更糟 —— 它把“真回归”与
+//     “这台机器的规则文件不一样”混在一起（铁律 184 同族）。
+//
+//   解法：`ForceLoadFrom(<一定不存在的路径>)` —— 它内部
+//     ① `Clear()` 清表 ② 读失败（表仍空）③ 把状态机置成“已加载完毕”。
+//   状态被钉住之后，后面**任何** `Evaluate` 都不会再去读真实文件。
+//   ⇒ 这是 `rules_script_runtime.h` 里明写“单测 / 端到端夹具用”的那个入口。
+static void PinEmptyRuleScript()
+{
+	WCHAR noSuchFile[MAX_PATH] = {};
+	const DWORD n = GetTempPathW(MAX_PATH, noSuchFile);
+	if (n == 0 || n >= MAX_PATH) { wcscpy_s(noSuchFile, L".\\"); }
+	// 刻意**不创建**它 —— 我们要的就是“读不到”。
+	wcscat_s(noSuchFile, L"r3shieldcore-ut-no-such-rules.txt");
+
+	const bool loaded = R3ShieldCoreRuleScriptRuntime::ForceLoadFrom(noSuchFile);
+	R3ShieldCoreRuleScript::Clear();  // 双保险：即便上面的读“成功”了也清掉
+
+	// 夹具自检：这两条红了，后面所有“不 Spoofed”的负对照都不可信。
+	Check("夹具：规则表已清空（Count == 0）", R3ShieldCoreRuleScript::Count() == 0);
+	Check("夹具：懒加载已被钉住（不存在的路径读不到）", !loaded);
+
+	// 诊断：把“本机真实规则文件在哪”打出来 —— 失败时一眼看出是被谁污染的。
+	WCHAR realPath[MAX_PATH] = {};
+	if (R3ShieldCoreRulesFile::ResolveRulesPath(nullptr, realPath, _countof(realPath))) {
+		printf("  （本机真实规则文件已刻意忽略：%ls）\n", realPath);
+	}
 }
 
 // ------------------------------------------------------------------ 工具
@@ -142,6 +190,66 @@ static void TestTriggerGate()
 }
 
 // ==================================================================
+// 2.5 ★ v133 新增：**规则面**那一半触发条件（v78 引入）
+// ==================================================================
+//
+// `Evaluate` 的枚举替换条件是
+//     spoof_reg_enum=1 && ( CouldHaveProtectedChildRegistry(path)
+//                           || RScript::HasFace(RegEnum) )
+// 上面第 2 节把**规则脚本清空**之后，测的是前半段（路径触发）。
+// 这一节专门测后半段 —— 它是一条**独立**的触发路径，不测就等于
+// "用户写了枚举规则、却什么都没发生"这个场景没人管。
+//
+// ★ 语义要钉清楚：`HasFace(RegEnum)` 是**保守上界** ——
+//   只要表里有**任意一条**枚举面规则，就把枚举类操作标成 Spoofed，
+//   **不**看这条规则会不会命中这个键（那是 detour 逐项问规则的事）。
+//   ⇒ 所以这里断言的是"**无关键也会标 Spoofed**"，方向与第 2 节相反；
+//     两条合起来才说明"规则面是独立触发、且方向是保守的"。
+static void TestRuleFaceTriggers()
+{
+	printf("\n--- 2.5 规则面触发（v78：有枚举规则就保守标 Spoofed）---\n");
+
+	const wchar_t* kPlainKey = L"\\REGISTRY\\MACHINE\\SOFTWARE\\Other\\Thing";
+	const ULONG kLog = 0;
+	const ULONG kSpoofed = static_cast<ULONG>(R3ShieldCore::Decision::Spoofed);
+
+	// 前置负对照：脚本为空 ⇒ 无关键**不**标 Spoofed
+	R3ShieldCoreRuleScript::Clear();
+	GuardStub::ResetPolicy();
+	SetProtectReg(L"SOFTWARE\\MyCompany\\Critical");
+	SetEnumSpoof(true);
+	GuardStub::SetMode(kLog);
+	Check("2.5a 前置：脚本为空 + 无关键 -> 不 Spoofed",
+		RegistryGuardTest::EvaluateKey(kPlainKey, nullptr,
+			static_cast<ULONG>(R3ShieldCore::Op::EnumerateKey), kLog, false).Decision != kSpoofed);
+
+	// 正例：加一条**枚举面**规则 ⇒ 同一个无关键变成 Spoofed（保守上界）
+	int idx = -1;
+	std::wstring err;
+	const bool added = R3ShieldCoreRuleScript::Add(
+		L"当 注册表枚举 的 子键名 含 \"Whatever\" 时 隐藏", err, &idx);
+	Check("2.5b 夹具：成功加了一条枚举面规则", added);
+	Check("2.5c 夹具：HasFace(RegEnum) 为真",
+		R3ShieldCoreRuleScript::HasFace(R3ShieldCoreRuleScript::Face::RegEnum));
+
+	Check("2.5d ★ 有枚举规则 + 无关键 -> 仍标 Spoofed（保守上界，不是漏判）",
+		RegistryGuardTest::EvaluateKey(kPlainKey, nullptr,
+			static_cast<ULONG>(R3ShieldCore::Op::EnumerateKey), kLog, false).Decision == kSpoofed);
+
+	// 负对照：只有**值面**规则时，枚举面**不受影响**
+	R3ShieldCoreRuleScript::Clear();
+	R3ShieldCoreRuleScript::Add(
+		L"当 注册表值 的 值名 含 \"Whatever\" 时 替换为 \"***\"", err, &idx);
+	Check("2.5e 负对照：只有值面规则 -> 枚举面仍不标 Spoofed",
+		RegistryGuardTest::EvaluateKey(kPlainKey, nullptr,
+			static_cast<ULONG>(R3ShieldCore::Op::EnumerateKey), kLog, false).Decision != kSpoofed);
+
+	// 收尾：清干净，别把状态漏给后面的用例
+	R3ShieldCoreRuleScript::Clear();
+}
+
+
+// ==================================================================
 // 2. 决策：Evaluate 对枚举类操作返回 Spoof
 // ==================================================================
 static void TestEvaluateDecision()
@@ -153,6 +261,30 @@ static void TestEvaluateDecision()
 	const ULONG kLog = 0, kBlockAll = 3;
 
 	const ULONG kSpoofed = static_cast<ULONG>(R3ShieldCore::Decision::Spoofed);
+
+	// ★★★ v133 修：先把**规则脚本**清空，否则本单测的结果取决于
+	//   **本机真实的** `%ProgramData%\R3 Shield Core\r3shieldcore-rules.txt`。
+	//
+	//   为什么（v78 引入）：`Evaluate` 的枚举替换条件是
+	//       spoof_reg_enum=1 && ( CouldHaveProtectedChildRegistry(path)
+	//                             || RScript::HasFace(RegEnum) )
+	//   后半个或项的意思是“用户写了枚举面规则 => 无法静态判断这条规则会不会
+	//   命中这个键 => 保守标 Spoofed，交给 detour 逐项问规则”。
+	//   而本机那份规则文件里恰好有一条「当 注册表枚举 的子键名 含 Secret 时
+	//   隐藏」=> `HasFace(RegEnum)` 恒真 => **两条负对照恒 FAIL**。
+	//
+	//   ★★ 关键细节（v133 第一版只加了这个 `Clear()`，然后**照样红**）：
+	//   `Clear()` 只是“瞬间真”。`Evaluate` 第一次被调用时会走
+	//   `EnsureLoadedSafe()` **懒加载**，把表又填回去。
+	//   => 真正起作用的是 `main()` 里那个 `PinEmptyRuleScript()`
+	//      （用 `ForceLoadFrom` 把加载状态机钉成“已完成”）；这里的 `Clear()`
+	//      只是保险丝 —— 它能清表，但**阻止不了重新加载**。
+	//
+	//   实测证据（v133）：换成没有枚举规则的机器，这两条会“自己变绿”。
+	//   这种**依赖环境**的断言比没有断言更糟 —— 它让“真回归”和“这台机器的
+	//   规则文件不一样”混在一起（铁律 184 同族）。
+	//   => 单测自己钉死状态；“规则面”那一半单独测（见 `TestRuleFaceTriggers`）。
+	R3ShieldCoreRuleScript::Clear();
 
 	SetProtectReg(L"SOFTWARE\\MyCompany\\Critical");
 
@@ -669,10 +801,16 @@ static void TestRemapAlgorithm()
 int main()
 {
 	setlocale(LC_ALL, ".936");
-	printf("=== v72 注册表枚举隐藏 · guard 层单测（纯逻辑，不碰注册表）===\n\n");
+	printf("=== v72 注册表枚举隐藏 · guard 层单测（纯逻辑，不碰注册表）===\n");
+
+	// ★★★ 必须是**第一件事**：拿下面任何一条负对照之前，先把懒加载钉死。
+	//   （夹具自检会多打两条 PASS，那是有意的 —— 铁律 148：夹具不可信时要能一眼看出来。）
+	PinEmptyRuleScript();
+	printf("\n");
 
 	TestTriggerGate();
 	TestEvaluateDecision();
+	TestRuleFaceTriggers();
 	TestCodecNameProbe();
 	TestBuildChildPath();
 	TestRemapAlgorithm();

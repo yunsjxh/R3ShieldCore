@@ -339,15 +339,44 @@ namespace
 		// ⚠️ 必须再判一次 mode == Ask。Ask 依赖引擎侧 UI 线程，
 		//    而那个线程只在 ASK 模式启动 —— LOG/BLOCK 下调 Ask 会等
 		//    一个永远不来的答复（实测表现：LOG 模式被当成 Deny 直接拦）。
-		const bool canAsk = allowAsk && (mode == static_cast<ULONG>(R3ShieldCore::Mode::Ask));
+		// ★ v132：这一面的处置档由配置决定（ini: privacy_clipboard=record|ask|block）。
+		//
+		//   Record（默认）—— 记录 + WouldBlock，不打断
+		//   Ask          —— 弹窗询问（**block 模式下也能问**，见下）
+		//   Block        —— 直接拒（v128 之前 block 的老行为）
+		const R3ShieldCore::ObjectType face =
+			static_cast<R3ShieldCore::ObjectType>(event.ObjectType);
+		const R3ShieldCore::PrivacyAction privacy =
+			R3ShieldCore::PrivacyActionOf(policy ? policy->Flags2 : 0, face);
+
+		// Ask 档在 block 下也要能问。
+		//
+		// ⚠️ 原来这里只认 `mode == Ask`，理由是"UI 线程只在 ASK 模式启动"。
+		//    那个前提**已经不成立了**（`main.cpp` 起改成无条件建询问通道 +
+		//    UI 线程），所以面级 Ask 在 block 下是可行的。若哪天又把无条件
+		//    建立改回去，这条会退化成"问不到 ⇒ 回落 Record"（不打断，
+		//    但用户会发现"选了 Ask 却不弹窗"）。
+		const bool privacyAsk = R3ShieldCore::IsPrivacyFace(face)
+			&& privacy == R3ShieldCore::PrivacyAction::Ask
+			&& mode == static_cast<ULONG>(R3ShieldCore::Mode::Block);
+
+		const bool canAsk = allowAsk
+			&& (mode == static_cast<ULONG>(R3ShieldCore::Mode::Ask) || privacyAsk);
 		if (!canAsk) {
 			if (mode == static_cast<ULONG>(R3ShieldCore::Mode::Block)) {
-				// ★ v129：隐私面在 block 下**不硬拒**。
+				// ★ v132：非 Block 档（Record / 问不了的 Ask）⇒ 只记录。
 				//   剪贴板 Read 是**每次 Ctrl+V 都会走**的热路径，硬拒的表现
 				//   就是"粘贴失效" —— 这是 block 预设最致命的一处误伤。
-				//   只记录 + 标 WouldBlock；真要拦用 mode=block_all。
-				if (R3ShieldCore::IsPrivacyFace(
-						static_cast<R3ShieldCore::ObjectType>(event.ObjectType))) {
+				//
+				//   ⚠️ 四个隐私 guard（camera / clipboard / screen / input_hook）
+				//      用**同一套判断**，不各写一份 —— 抄两份必漂。
+				if (R3ShieldCore::IsPrivacyFace(face)
+						&& privacy != R3ShieldCore::PrivacyAction::Block) {
+					// ★ 先看能不能替换：开了 spoof_clipboard 时，
+					//   "调用成功但内容是假的"比"只记录"保护得更好，也不打断粘贴。
+					if (SpoofClipboardEnabled()) {
+						return RejectOrSpoof(event, format);
+					}
 					event.Decision = static_cast<ULONG>(R3ShieldCore::Decision::WouldBlock);
 					return Action::Record;
 				}
@@ -715,11 +744,14 @@ namespace ClipboardGuardTest
 	//
 	// `mode` 不在这里传 —— 它从 `GuardStub::SetMode()` 写进 Policy，
 	// 与生产路径同源（Policy->Mode）。
-	int EvaluateForTest(ULONG op, UINT format, int* decisionOut, int* flagsOut) noexcept
+	// ★ v132：`allowAsk` 从形参传进来（v129 时写死 false）。
+	//   写死的话就**测不到 Ask 档** —— 而 Ask 正是本轮新增的两档之一。
+	int EvaluateForTest(ULONG op, UINT format, bool allowAsk,
+		int* decisionOut, int* flagsOut) noexcept
 	{
 		R3ShieldCore::Event event = {};
 		const Action action = Evaluate(static_cast<R3ShieldCore::ClipboardOp>(op),
-			event, /*allowAsk=*/false, format);
+			event, allowAsk, format);
 		if (decisionOut) *decisionOut = static_cast<int>(event.Decision);
 		if (flagsOut)    *flagsOut = static_cast<int>(event.Flags);
 		return static_cast<int>(action);

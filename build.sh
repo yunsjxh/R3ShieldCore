@@ -56,8 +56,28 @@ echo "        PY  =$PYICON"
 #        "/VERSION:major.minor" 形式（只接受两段）——
 #    本项目其实只需要给一个"有版本信息"的 exe，最稳的写法是
 #    直接用 **/VERSION:65.0**（两段，无逗号，不会被拆参）。
-#    ★ 而 .rc 里的 FILEVERSION 才是四段点分写法（那是另一种语法）。
-PRODUCT_VERSION="65.0"
+# ★ 而 .rc 里的 FILEVERSION 才是四段点分写法（那是另一种语法）。
+#
+# ★★ v1.0.1 起：版本号**不再写死**，从仓库根的 `VERSION` 文件取（单一来源）。
+#   原来这里硬编 "65.0"，而代码/CHANGELOG 早已到 v129+ —— 产物版本号与实际
+#   能力完全脱节，是 `docs/项目缺点-2026-10-17.md` 第 6 条记着的老问题。
+#   ⚠️ 只取**前两段**：link 的 /VERSION 只接受 major.minor。
+#   ⚠️⚠️ 而且 `/VERSION` **只写进 PE 可选头的 ImageVersion，不是版本资源**！
+#      原来 r3shieldcore.rc 里写着"link 会自动生成 VS_VERSION_INFO" —— 那是错的，
+#      实测主程序资源类型只有 [3(ICON), 14(GROUP_ICON), 24(MANIFEST)]，
+#      **没有 16(RT_VERSION)** ⇒ 资源管理器"详细信息"里版本号是空的。
+#      完整的四段版本号由 .rc 的 VS_VERSION_INFO 承担（见 r3shieldcore.rc）。
+R3SC_VERSION_FILE="$SCRIPT_DIR/VERSION"
+if [ ! -f "$R3SC_VERSION_FILE" ]; then
+    echo "[败] 缺 VERSION 文件（仓库根）—— 版本号没有单一来源"
+    exit 1
+fi
+R3SC_VERSION="$(tr -d ' \t\r\n' < "$R3SC_VERSION_FILE")"
+case "$R3SC_VERSION" in
+    [0-9]*.[0-9]*) : ;;
+    *) echo "[败] VERSION 内容不是点分版本号：'$R3SC_VERSION'"; exit 1 ;;
+esac
+PRODUCT_VERSION="$(printf '%s' "$R3SC_VERSION" | cut -d. -f1-2)"
 
 CONFIG="${1:-Release}"
 ONLY_ARCH="${2:-}"

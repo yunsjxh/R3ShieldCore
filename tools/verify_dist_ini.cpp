@@ -27,6 +27,7 @@
 
 #include <cstdio>
 #include <filesystem>
+#include <fstream>
 #include <string>
 
 static int g_pass = 0;
@@ -159,6 +160,100 @@ static void CheckMainConfig(const std::filesystem::path& dir)
 	Check("ark_refresh_ms=1000（界面刷新节奏，与 ark_scan_ms 相互独立）",
 		eng.ArkRefreshMs == 1000,
 		std::to_string(static_cast<unsigned long>(eng.ArkRefreshMs)));
+
+	// ★ v132：隐私面处置**随包默认必须是 record**。
+	//
+	//   为什么必须在发布闸门里钉：这四个值直接决定"装上去第一小时能不能用"。
+	//   任何一个默认成 block，症状是"粘贴失效 / 截图黑屏 / 摄像头打不开 /
+	//   输入法打不出字" —— 用户会判断成"系统坏了"并卸载，而不是"被拦了"。
+	//   默认成 ask 则是弹窗轰炸（剪贴板 Read 每次 Ctrl+V 都走）。
+	//
+	//   改 ini 一行就能让这条失效 ⇒ 必须**真解析后**断言（铁律 17）。
+	//   打印当前值，让"改了没生效"和"根本没改"在输出上分得开（铁律 97）。
+	{
+		struct PrivacyExpect
+		{
+			const char* key;
+			R3ShieldCore::ObjectType face;
+		};
+		const PrivacyExpect kPrivacyExpects[] = {
+			{ "privacy_camera",     R3ShieldCore::ObjectType::Camera },
+			{ "privacy_input_hook", R3ShieldCore::ObjectType::InputHook },
+			{ "privacy_screen",     R3ShieldCore::ObjectType::Screen },
+			{ "privacy_clipboard",  R3ShieldCore::ObjectType::Clipboard },
+		};
+
+		for (const PrivacyExpect& e : kPrivacyExpects) {
+			const R3ShieldCore::PrivacyAction action =
+				R3ShieldCore::PrivacyActionOf(policy.Flags2, e.face);
+			const char* text = action == R3ShieldCore::PrivacyAction::Record ? "record"
+				: action == R3ShieldCore::PrivacyAction::Ask ? "ask"
+				: action == R3ShieldCore::PrivacyAction::Block ? "block" : "?";
+			printf("  %-22s = %s\n", e.key, text);
+
+			char label[128] = {};
+			snprintf(label, sizeof(label), "%s=record（随包默认只记录，不打断使用）", e.key);
+			Check(label, action == R3ShieldCore::PrivacyAction::Record, text);
+		}
+	}
+}
+
+// ---- v132 负对照：privacy_* 的**非默认值**必须被解析出来 ----
+//
+// ★★★ 为什么必须有这一段（否则 CheckMainConfig 里那 4 条是**恒真**的）：
+//   那 4 条期望的都是 `record`，而 record 就是"这 2 位全 0"——
+//   与 `Policy{}` 的初值**完全一样**。也就是说"解析器根本不认这四个键"
+//   也会让那 4 条全绿（铁律 148 的空真判据：布尔相等先问"两边是不是都空"）。
+//   这里写一份 ini 把两个键设成 ask / block，再真解析一遍。
+static void CheckPrivacyActionParsing(const std::filesystem::path& tmpDir)
+{
+	std::error_code ec;
+	const std::filesystem::path work = tmpDir / L"v132";
+	std::filesystem::create_directories(work, ec);
+	const std::filesystem::path ini = work / L"r3shieldcore.ini";
+	{
+		std::ofstream out(ini, std::ios::binary);
+		out << "mode=block\n"
+			"privacy_camera=ask\n"
+			"privacy_clipboard=block\n";
+	}
+
+	R3ShieldCore::Policy p = {};
+	R3ShieldCoreConfig::LoadFromFile(p, ini, work);
+
+	const R3ShieldCore::PrivacyAction cam =
+		R3ShieldCore::PrivacyActionOf(p.Flags2, R3ShieldCore::ObjectType::Camera);
+	const R3ShieldCore::PrivacyAction clip =
+		R3ShieldCore::PrivacyActionOf(p.Flags2, R3ShieldCore::ObjectType::Clipboard);
+	const R3ShieldCore::PrivacyAction scr =
+		R3ShieldCore::PrivacyActionOf(p.Flags2, R3ShieldCore::ObjectType::Screen);
+
+	printf("\n-- v132 隐私面处置解析（负对照：非默认值）--\n");
+	printf("  camera=%d clipboard=%d screen=%d（0=record 1=ask 2=block）\n",
+		static_cast<int>(cam), static_cast<int>(clip), static_cast<int>(scr));
+
+	Check("v132: privacy_camera=ask 真被解析（不是回落 record）",
+		cam == R3ShieldCore::PrivacyAction::Ask);
+	Check("v132: privacy_clipboard=block 真被解析",
+		clip == R3ShieldCore::PrivacyAction::Block);
+	Check("v132: 没写的 privacy_screen 仍是 record（位不串）",
+		scr == R3ShieldCore::PrivacyAction::Record);
+
+	// 负对照的负对照：**拼错**的值必须保持 record。
+	//   ⚠️ 如果哪天有人把"不认识 ⇒ fail-closed 变 block"，这里会红 ——
+	//      那正是我们不想的：用户打个错字不该让粘贴直接失效。
+	{
+		const std::filesystem::path badIni = work / L"r3shieldcore-bad.ini";
+		{
+			std::ofstream o2(badIni, std::ios::binary);
+			o2 << "mode=block\nprivacy_camera=blokc\n";
+		}
+		R3ShieldCore::Policy p2 = {};
+		R3ShieldCoreConfig::LoadFromFile(p2, badIni, work);
+		Check("v132: 拼错的值保持 record（不静默变成 block）",
+			R3ShieldCore::PrivacyActionOf(p2.Flags2, R3ShieldCore::ObjectType::Camera)
+				== R3ShieldCore::PrivacyAction::Record);
+	}
 }
 
 // ---- 预设：把预设当作 r3shieldcore.ini 载入，验证"最小覆盖"等于预期完整配置 ----
@@ -265,6 +360,9 @@ int main(int argc, char** argv)
 		/ (L"r3shieldcore-dist-verify-" + std::to_wstring(GetCurrentProcessId()));
 	std::filesystem::remove_all(tmpDir, ec);
 	std::filesystem::create_directories(tmpDir, ec);
+
+	// ★ v132：先跑"非默认值"负对照（放在预设之前，这样即使预设段崩了也能看到）
+	CheckPrivacyActionParsing(tmpDir);
 
 	const PresetExpect presets[] = {
 		{ L"r3shieldcore-block.ini",        static_cast<ULONG>(R3ShieldCore::Mode::Block),        true,  "block" },
