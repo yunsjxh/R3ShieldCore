@@ -1,24 +1,36 @@
 #!/usr/bin/env bash
 #
-# spoof_e2e.sh —— 回传数据「替换」的**端到端**验证 runner（v74：三面统一）。
+# spoof_e2e.sh —— 回传数据「替换」的**端到端**验证 runner（v133：四面统一）。
 #
 # 它回答的问题：把**真引擎**跑起来、让它注入一个**真进程**之后，
-#   屏幕 / 剪贴板 / 注册表 三个面的 spoof_*=1 到底有没有让那个进程
+#   屏幕 / 剪贴板 / 注册表 / 文件 四个面的 spoof_*=1 到底有没有让那个进程
 #   "取数据成功但拿到假内容"？
 #
 # ======================================================================
-# ★ 三面的语义**不是**同一个 —— 这决定了矩阵怎么设计（v74 新增）
+# ★ 四面的语义**不是**同一个 —— 这决定了矩阵怎么设计（v74 定三面，v133 加文件）
 # ======================================================================
 #   · 屏幕 / 剪贴板：替换**只在"本应拒绝"时**生效（RejectOrSpoof）。
 #       ⇒ mode=log 下根本不拒 ⇒ 也**不替换**，调用方拿到真数据。
 #   · 注册表（值替换）：替换发生在**读路径**上（!blockable 分支），
 #       与 mode **无关** —— log 下照样清零。
-#       ⇒ 矩阵里专门用 C 格把这条差异**证出来**（否则会被当成 bug）。
+#   · 文件（读替换，v133）：**同注册表这一类** —— 替换也挂在读路径
+#       （`NtReadFile` 成功返回后清零回传缓冲区），与 mode 无关。
+#       但它比注册表多一层前提：**得先有一个句柄**。
+#       好处是"读"不在高危 op 表里 ⇒ `mode=block` 下**打开受保护文件照样成功**，
+#       B 格不会退化成"连门都进不去" ⇒ A/B 两格才可比（同一份路径、只差 spoof 开关）。
+#       若哪天有人把"读"也算成高危、在 block 下拒掉，B 格会立刻报
+#       `file_open=0 file_oerr=5` —— 那不是夹具坏了，是语义被改了。
 #
 # 所以本 runner 的三格不是"三个开关的组合"，而是三个**语义位置**：
 #       A  本应拒绝 + 不替换   ⇒ 看到"失败 / 真值"（负对照）
 #       B  本应拒绝 + 替换     ⇒ 看到"成功 + 假内容"
-#       C  不拒绝  + 替换      ⇒ 屏幕/剪贴板真、注册表**仍假**（模式无关）
+#       C  不拒绝  + 替换      ⇒ 屏幕/剪贴板真、注册表/文件**仍假**（模式无关）
+#
+# ★ 为什么文件面**不能**只靠 tools/spoof_file_probe.exe：
+#   那个探针是"自己 hook 自己"，把 open→read→close 三步在**同一次调用内**手搓。
+#   生产里这三步分在 `NtCreateFile` / `NtReadFile` / `NtClose` 三个 hook 里，
+#   中间隔着真实的用户代码（目标进程自己的 CreateFileW 与 ReadFile 之间）。
+#   "句柄表在真时序下真的接得上"只有本夹具能证。
 #
 # ======================================================================
 # ★★★ 为什么默认**不跑**（铁律 175）
@@ -51,7 +63,8 @@
 #    临时工作区里，并把**子进程的** ProgramData 重定向到那里。
 #
 # ⚠️ 会在 HKCU\Software\R3ShieldCoreE2E 建一个**测试用**注册表值
-#    （三面里的注册表面要读它）。--clean 会删掉。除此之外不动你的注册表。
+#    （四面里的注册表面要读它）。--clean 会删掉。除此之外不动你的注册表。
+# ⚠️ 会在工作区里建一个**测试用**文件（文件面要读它），--clean 一起删。
 #
 # 用法:
 #   bash tools/spoof_e2e.sh                 # 打印说明 + SKIP（默认）
@@ -119,6 +132,45 @@ REG_SECRET='R3SC-E2E-REG-SECRET'
 #   \REGISTRY\USER\S-1-5-21-...\ 那段 SID ⇒ 相对写法命中 HKCU
 #   （见 r3shieldcore_rules.cpp 的 NormalizeKey + protect_reg_ut 用例）。
 REG_PROTECT_PATH="$REG_SUBKEY"
+
+# ======================================================================
+# 文件面要用的目录 / 文件名 / 内容 —— **同样单一来源**（铁律 127）
+# ======================================================================
+# ⚠️ `FILE_SECRET` 与 tools/spoof_e2e_target.cpp 里那份**必须逐字符一致**：
+#    bash 侧写文件、目标进程读文件并比对，是**跨进程契约**。
+#    真漂了会判 `file_match=0`（FAIL），不会静默（铁律 97）。
+#
+# ⚠️ 用**独立子目录** `secret/` 而不是直接放工作区根下：
+#    `protect_file=` 是**前缀匹配**，目录后面拼什么它都管。放子目录有两个好处：
+#      ① 前缀写成 `...\spoof_e2e_work\secret\` 时，**不会**顺手把工作区里
+#         别的文件（引擎日志、配置、三格的 result）也算成受保护
+#         —— 那会让引擎去清零自己的日志，诊断直接瞎掉；
+#      ② 将来想加第二个测试文件不用改前缀。
+FILE_SECRET='R3SC-E2E-FILE-SECRET-0123456789'
+SECRET_SUBDIR='secret'
+SECRET_NAME='file_secret.txt'
+
+# 秘密文件的**MSYS**路径（bash 侧读写用）
+secret_file() { echo "$WORK/$SECRET_SUBDIR/$SECRET_NAME"; }
+# 秘密文件的**Windows**路径（传给目标进程 / 写进 ini 用）
+# ★ 必须是 Windows 形式：目标是原生进程，MSYS 的 /tmp/... 它不认（铁律 117）。
+secret_file_win() {
+    local p; p="$(secret_file)"
+    cygpath -w "$p" 2>/dev/null || printf '%s' "$p"
+}
+# 写进 ini 的 `protect_file=` —— 直接取**那个文件的完整路径**。
+#
+# ★ 为什么这里用"单个文件的完整路径"而不是"目录 + 结尾反斜杠"：
+#   ① 语义更窄、判据更硬：前缀恰好等于它自己，`check_cell_ini_file` 能做
+#      **等值**比较，而不是"以某目录开头"这种更松的判据；
+#   ② 避开一个 heredoc 陷阱：`write_ini` 的 heredoc 是不带引号的（要展开变量），
+#      而"不带引号的 heredoc 里，`\` + 换行 = 续行"。目录形式的前缀**以反斜杠
+#      结尾**，一旦它紧邻换行，那一行就可能被吞掉 —— 而且症状是"ini 少一行"，
+#      不是报错。用完整文件路径就没有结尾反斜杠，从根上绕开。
+#   （给用户看的目录保护用法写在 dist 的 ini 注释里，不靠这个夹具演示。）
+secret_protect_path() {
+    secret_file_win
+}
 
 #
 # ★ 工作区路径是**固定名**（不带 PID）—— 这是对铁律 177 的**有意例外**：
@@ -216,18 +268,114 @@ field() { printf '%s' "$1" | tr ' ' '\n' | sed -n "s/^$2=//p" | head -1; }
 #   「注入范围」与「拦截行为」**解耦**正是为了这个（见 shared 头 FlagTestMode）。
 #   test_inject_only= 与 mode= 无关 ⇒ A/B 既能保留 block 行为，又只注入目标。
 #
-# ★ 三面的 spoof 开关在 A/B/C 里**同进同出**（都是 A=0、B/C=1）—— 所以只用一个
+# ★ 四个面的 spoof 开关在 A/B/C 里**同进同出**（都是 A=0、B/C=1）—— 所以只用一个
 #   函数。写成三个只会漂（铁律 127）。要单独验某一面时再拆。
 cell_mode()  { case "$1" in A|B) echo block ;; C) echo log ;; *) echo "" ;; esac; }
 cell_spoof() { case "$1" in A) echo 0 ;; B|C) echo 1 ;; *) echo "" ;; esac; }
+
+# ★★★ v132 起「隐私面」（屏幕 / 剪贴板 / 摄像头 / 输入钩子）有了**独立处置**
+#   `privacy_* = record|ask|block`，且**只在 mode=block 下参与决策**。
+#   出厂的默认值是 record（放行但记录）—— 这是"block 版还能用"的设计前提。
+#
+#   ⇒ A/B 两格的语义是「**本应拒绝**」，就必须把屏幕/剪贴板**显式钉成 block**。
+#     不钉的话：mode=block + privacy=record ⇒ 守卫走 WouldBlock 分支**返回成功**
+#     ⇒ 目标进程拿到的是**真数据**，而 A 格期望的是 err=5。
+#     结果是 A 格两条断言恒 FAIL —— 而且失败信息长这样：
+#       "A[屏幕]: 期望 bitblt=0 err=5，实得 bitblt=1"
+#     看起来像"拒绝功能坏了"，其实根因是**"本应拒绝"这个前提被 v132 改掉了**。
+#     （铁律 185 同族：判据的前提没跟着实现搬家 ⇒ 恒红/假红。）
+#
+#   C 格是 mode=log，处置根本不参与决策 ⇒ 写 record 只是让三份配置长得一致，
+#   顺便验证"log 下就算写 block 也不该真的拦"（那是守卫自己的 mode 判定，不是 ini）。
+cell_privacy() { case "$1" in A|B) echo block ;; C) echo record ;; *) echo "" ;; esac; }
 CELLS="A B C"
 
 cell_desc() {
     case "$1" in
-        A) echo "mode=block, spoof_*=0  -> 期望 屏幕被拒 / 剪贴板被拒 / 注册表**读到真值**" ;;
-        B) echo "mode=block, spoof_*=1  -> 期望 屏幕成功+黑 / 剪贴板成功+空 / 注册表成功+空" ;;
-        C) echo "mode=log,   spoof_*=1  -> 期望 屏幕/剪贴板**真**（不拒就不换）/ 注册表**仍空**" ;;
+        A) echo "mode=block, spoof_*=0  -> 期望 屏幕被拒 / 剪贴板被拒 / 注册表**真值** / 文件**真内容**" ;;
+        B) echo "mode=block, spoof_*=1  -> 期望 屏幕成功+黑 / 剪贴板成功+空 / 注册表成功+空 / 文件成功+全0" ;;
+        C) echo "mode=log,   spoof_*=1  -> 期望 屏幕/剪贴板**真**（不拒就不换）/ 注册表**仍空** / 文件**仍全0**" ;;
     esac
+}
+
+# 回读校验：确认刚写下去的隐私面处置**真的在文件里**，且值 == 该格应有的值。
+#
+# ★ 为什么要回读而不是信 $privacy：`write_ini` 的 heredoc 不带引号 ⇒ 以后谁
+#   往正文里加一行含反引号/`$` 的东西，就可能把后面几行吞掉；而"变量算对了"
+#   和"文件里真有这一行"是两件事。A 格少了 privacy_screen=block 不会报错，
+#   只会让两条断言**恒 FAIL**（假红），排查起来会一路查错方向。
+#   所以这里查的是**落盘结果**，不是内存里的变量（铁律 179 同族）。
+check_cell_ini_privacy() {
+    local cell="$1" want="$2" f line key v rc=0
+    f="$(ini_path "$cell")"
+    for key in privacy_screen privacy_clipboard privacy_camera privacy_input_hook; do
+        line="$(grep -E "^${key}=" "$f" 2>/dev/null | tail -1)"
+        if [ -z "$line" ]; then
+            bad "格 $cell 的 ini 里没有 $key=（v132 之后 A/B 格必须钉 block）"; rc=1; continue
+        fi
+        v="${line#*=}"
+        # 允许行尾注释，取第一个词
+        v="$(printf '%s' "$v" | tr -d ' \t\r' | cut -d'#' -f1)"
+        [ "$v" = "$want" ] || { bad "格 $cell 的 $key=$v，期望 $want"; rc=1; }
+    done
+    return $rc
+}
+
+# 回读校验：文件面那三行（v133）**真的在文件里**，且值 == 该格应有的值。
+#
+# ★ 为什么要单独一个函数，而不是塞进 check_cell_ini_privacy：
+#   那个函数的语义是"四个隐私面处置必须都是同一个值"（一个 $want 打天下）；
+#   文件面是**三个不同的键、三种不同的期望**（hook_file 恒 0 / protect_file 恒
+#   等于当前工作区的前缀 / spoof_file 随格变）。硬塞进去只会让两个语义纠缠。
+#
+# ★★★ 为什么 `hook_file=0` 也要**回读**它（这条最容易被人"顺手改回 1"）：
+#   它是本夹具的**一条判据前提**：FileGuard 的 Install 只要
+#   `hook_file / hook_raw_disk / spoof_file` **任一**为真就会挂 hook，而
+#   `NtCreateFile` / `NtReadFile` 是**无条件**排进队列的（file_guard.cpp Install）。
+#   ⇒ 显式 `hook_file=0` 时整条链路仍然要通。若哪天有人给 NtReadFile 的挂载
+#     加了 `if (fileHookOn)` 这种条件，默认配置（hook_file=0）下替换就**静默失效**
+#     —— 那时本夹具会因为 `hook_file=0 `而被写成 0 却仍然通过吗？不会：
+#     B 格的 file_strlen 会变成 31 ⇒ FAIL。但那是"行为"层面的红，
+#     回读这一条负责把"前提被悄悄改了"也变成红，两种红分开、好归因。
+check_cell_ini_file() {
+    local cell="$1" want="$2" f line v rc=0
+
+    f="$(ini_path "$cell")"
+
+    # ---- hook_file 必须存在且为 0（见上面长注释）----
+    line="$(grep -E '^hook_file=' "$f" 2>/dev/null | tail -1)"
+    if [ -z "$line" ]; then
+        bad "格 $cell 的 ini 里没有 hook_file=（v133 起必须显式写 0）"; rc=1
+    else
+        v="${line#*=}"; v="$(printf '%s' "$v" | tr -d ' \t\r' | cut -d'#' -f1)"
+        [ "$v" = "0" ] || { bad "格 $cell 的 hook_file=$v，期望 0（替换不该依赖它）"; rc=1; }
+    fi
+
+    # ---- spoof_file 必须等于该格的 spoof ----
+    line="$(grep -E '^spoof_file=' "$f" 2>/dev/null | tail -1)"
+    if [ -z "$line" ]; then
+        bad "格 $cell 的 ini 里没有 spoof_file=（文件面不会被验到）"; rc=1
+    else
+        v="${line#*=}"; v="$(printf '%s' "$v" | tr -d ' \t\r' | cut -d'#' -f1)"
+        [ "$v" = "$want" ] || { bad "格 $cell 的 spoof_file=$v，期望 $want"; rc=1; }
+    fi
+
+    # ---- protect_file 必须等于**当前工作区**那个秘密文件的完整路径 ----
+    #   ★ 必须比对"算出来的那一条"，不能只查"有这一行"：
+    #     前缀指错地方不会报错，只会让 B/C 格读到真内容 ——
+    #     而那时人的第一反应是"替换坏了"，方向就错了（铁律 185）。
+    line="$(grep -E '^protect_file=' "$f" 2>/dev/null | tail -1)"
+    local wantPath; wantPath="$(secret_protect_path)"
+    if [ -z "$line" ]; then
+        bad "格 $cell 的 ini 里没有 protect_file=（受保护路径没配 ⇒ 不会替换）"; rc=1
+    else
+        v="${line#*=}"; v="$(printf '%s' "$v" | tr -d '\r' | cut -d'#' -f1)"
+        v="${v%"${v##*[![:space:]]}"}"     # 去掉尾部空白（**不能** tr -d ' '：路径里可能有空格）
+        [ "$v" = "$wantPath" ] || {
+            bad "格 $cell 的 protect_file=$v，期望 $wantPath"; rc=1; }
+    fi
+
+    return $rc
 }
 
 result_file()  { echo "$WORK/result-$1.txt"; }
@@ -328,11 +476,44 @@ delete_reg_value() {
 }
 
 # ======================================================================
+# 文件面的测试文件：建 / 验（v133）
+# ======================================================================
+# ★ 为什么由 runner 建、而不是目标进程建：
+#   `protect_file=` 命中的路径被算作**高危写**（r3shieldcore_rules.cpp 的
+#   FileRiskReason：`IsHighRiskFileOp` + `MatchesUserProtectFile`）⇒
+#   `mode=block` 下写会被拒 ⇒ 目标**建不出来**。
+#   这不是 bug，正是"保护 = 写不进"这条设计。⇒ 备料必须在**引擎启动之前**、
+#   由引擎外的一方做（与注册表测试值同一条理由）。
+#   ★ 反过来说，"**读**不受影响"也是同一条设计推出来的：`Read` 不在高危 op
+#     表里 ⇒ block 下打开成功 ⇒ A/B 两格才有可比性。
+#
+# ★ 用 `printf` 而不是 `echo`：`echo` 会附一个换行 ⇒ 文件多 1 字节，
+#   而目标按"整个文件"比对 ⇒ file_match 恒 0。**不加结尾换行是契约的一部分**。
+ensure_secret_file() {
+    mkdir -p "$WORK/$SECRET_SUBDIR" 2>/dev/null || return 1
+    local p; p="$(secret_file)"
+    printf '%s' "$FILE_SECRET" > "$p" 2>/dev/null || return 1
+    # ★ 写完**回读**：不验一遍就往下走，"文件内容对不对"只是个假设；
+    #   而它错了的表现是 B/C 格报 file_match=1 —— 看起来像"替换失效"，
+    #   实际是备料错了（铁律 179 同族：别信内存里的变量，查落盘结果）。
+    local got
+    got="$(cat "$p" 2>/dev/null)"
+    [ "$got" = "$FILE_SECRET" ] || return 1
+    return 0
+}
+
+secret_file_ok() {
+    [ -f "$(secret_file)" ] || return 1
+    local got; got="$(cat "$(secret_file)" 2>/dev/null)"
+    [ "$got" = "$FILE_SECRET" ]
+}
+
+# ======================================================================
 # 闸门：没显式给动作就到此为止（--prepare / --collect / --clean 不启动引擎）
 # ======================================================================
 if [ -z "$ACTION" ]; then
     cat <<EOF
-=== 回传数据「替换」端到端验证（三面：屏幕 / 剪贴板 / 注册表）===
+=== 回传数据「替换」端到端验证（四面：屏幕 / 剪贴板 / 注册表 / 文件）===
 
 本步骤会**真启动引擎**（$ENGINE_BASE），并用 v69 的配置项
 （test_inject_only=$TARGET_BASE）把注入范围缩到一个进程。
@@ -346,7 +527,7 @@ if [ -z "$ACTION" ]; then
             判据 = 引擎自报的「注入新进程: N 个」合计 1 ≤ N ≤ 5。
             N=0 ⇒ 目标注不进去；N≥100 ⇒ 没限住、在全局注入（本项目实测
             全局时 N 是 100~200）。**这一级不过就不跑级 2。**
-      级 2 三格矩阵（约 60s）：A/B/C 三格，同时验三面的替换成没成。
+      级 2 三格矩阵（约 60s）：A/B/C 三格，同时验四面的替换成没成。
   · 引擎清单是 requireAdministrator ⇒ 启动它的 shell 必须已提权；本脚本
     **不替你提权**，所以拆成两步：
 
@@ -371,10 +552,14 @@ EOF
 fi
 
 if [ "$ACTION" = "clean" ]; then
+    # ★ 先记下文件面测试文件的路径再删工作区 —— 删完就算不出来了，
+    #   而"删了哪些东西"必须如实报（铁律 97）。
+    localSecretW="$(secret_file_win)"
     rm -rf "$WORK" 2>/dev/null
     delete_reg_value
     echo "已删除工作区: $WORK"
     echo "已删除注册表测试值: HKCU\\$REG_SUBKEY\\$REG_VALUE"
+    echo "已删除文件面测试文件（在工作区里）: $localSecretW"
     exit 0
 fi
 
@@ -447,13 +632,19 @@ ok "引擎与目标产物都在（$ENGINE_BASE / $TARGET_BASE）"
 #   但屏幕面的功能由 A/B 两格的**行为**直接证（BitBlt 被拒 / 变黑）⇒ 不需要串标记。
 #   ⚠️ 用 -el 且 grep -qwF：整词匹配，防 spoof_reg 被 spoof_reg_enum 满足
 #      （铁律 142 同族：子串匹配 ⇒ 假绿）。
+#
+# ★★ v133：再加 spoof_file —— file_guard.cpp 的 `挂载中 (file=.. spoof_file=..)`
+#   是一条**宽串** LOG。这条判据的价值是**跑之前**就挡住"dist 里的 DLL 没重编"：
+#   少了它，症状是 B/C 格的 file_strlen=31（读到真内容），看起来像"替换功能坏了"，
+#   实际只是发了个旧 DLL（铁律 185 同族：假红查错方向）。
+#   ★ 同理要 `grep -qwF`：`spoof_file` 在 `spoof_file=%d` 里，靠 `=` 才成词边界。
 for arch in 64 32; do
     dll="$DIST_DIR/$arch/r3shieldcore-lib.dll"
     if [ ! -f "$dll" ]; then
         bad "缺 $dll —— 该架构的进程不会被注入，端到端结果不可信"
         echo "结果: FAIL"; exit 1
     fi
-    for marker in test_inject_only spoof_clipboard spoof_reg; do
+    for marker in test_inject_only spoof_clipboard spoof_reg spoof_file; do
         if strings -el "$dll" | grep -qwF "$marker"; then
             ok "$arch 位 DLL 带标记 '$marker'（该面逻辑已编入）"
         else
@@ -468,7 +659,7 @@ done
 # 注册表测试值（基线也要读它 ⇒ 必须在跑基线之前就绪）
 # ======================================================================
 echo ""
-echo "=== 注册表测试值（三面里的注册表面要读它）==="
+echo "=== 注册表测试值（四面里的注册表面要读它）==="
 if ensure_reg_value && reg_value_ok; then
     ok "已就绪 HKCU\\$REG_SUBKEY\\$REG_VALUE = $REG_SECRET"
 else
@@ -478,13 +669,31 @@ else
 fi
 
 # ======================================================================
-# 基线：目标单独跑（无引擎）—— 三面都必须拿到**真**数据，否则后面的
+# 文件面的测试文件（v133）—— 基线也要读它 ⇒ 同样必须在这里就绪
+# ======================================================================
+# ★ 注意顺序：这一步必须在 `build_workspace` **之后**才可靠（那一步会
+#   `rm -rf $WORK`，把文件一起删掉）。`build_workspace` 自己末尾会补建一次
+#   （见那里），这里只是给"工作区已存在、文件被 --clean 删过"这种情况兜底。
+echo ""
+echo "=== 文件面测试文件（四面里的文件面要读它）==="
+if ensure_secret_file && secret_file_ok; then
+    ok "已就绪 $(secret_file_win)"
+    ok "内容 = $FILE_SECRET （${#FILE_SECRET} 字节，**无结尾换行**）"
+else
+    bad "建文件面测试文件失败: $(secret_file)"
+    echo "       内容回读与常量不一致，或目录建不出来；文件面将无法验证。"
+    echo "结果: FAIL"; exit 1
+fi
+
+# ======================================================================
+# 基线：目标单独跑（无引擎）—— 四面都必须拿到**真**数据，否则后面的
 # 「变假」无法归因（铁律 110：全零时判据也成立就是空真）。
 # ★ 它**不启动引擎**，所以放在管理员检查之前 —— 非提权也能先确认判别力。
 # ======================================================================
 echo ""
-echo "=== 基线：目标单独跑（无引擎，无 hook）—— 三面都要读到**真**数据 ==="
-BASE_OUT="$(MSYS_NO_PATHCONV=1 "$TARGET" --wait-ms=0 --tag=baseline 2>&1)"
+echo "=== 基线：目标单独跑（无引擎，无 hook）—— 四面都要读到**真**数据 ==="
+BASE_OUT="$(MSYS_NO_PATHCONV=1 "$TARGET" --wait-ms=0 --tag=baseline \
+    --file="$(secret_file_win)" 2>&1)"
 BASE_RESULT="$(printf '%s\n' "$BASE_OUT" | grep -m1 '^RESULT ')"
 echo "  $BASE_RESULT"
 if [ -z "$BASE_RESULT" ]; then
@@ -523,6 +732,25 @@ else
     echo "结果: FAIL"; exit 1
 fi
 
+# ---- 文件：必须读到预先写好的**已知常量**（v133）----
+#   ★ 三个字段一起看：
+#     file_open=1    ⇒ 打开成功（**block 下读受保护路径不该被拒**，这条同时证了语义）
+#     file_match=1   ⇒ 内容对得上（备料没漂、目标读的就是 runner 写的那个文件）
+#     file_bytes>0   ⇒ 这次读**真的发生了**（不是打开成功但零字节）
+BASE_FILE_OPEN="$(field "$BASE_RESULT" file_open)"
+BASE_FILE_ERR="$(field "$BASE_RESULT" file_oerr)"
+BASE_FILE_BYTES="$(field "$BASE_RESULT" file_bytes)"
+BASE_FILE_MATCH="$(field "$BASE_RESULT" file_match)"
+if [ "$BASE_FILE_OPEN" = "1" ] && [ "$BASE_FILE_MATCH" = "1" ] \
+   && [ -n "$BASE_FILE_BYTES" ] && [ "$BASE_FILE_BYTES" -gt 0 ] 2>/dev/null; then
+    ok "基线文件读到真值（file_match=1，bytes=$BASE_FILE_BYTES）⇒ 后续「变全 0」可归因"
+else
+    bad "基线文件**没**读到 $FILE_SECRET（file_open=${BASE_FILE_OPEN:-?} file_oerr=${BASE_FILE_ERR:-?} file_bytes=${BASE_FILE_BYTES:-?} file_match=${BASE_FILE_MATCH:-?}）"
+    echo "       ⇒ 目标打不开 $(secret_file_win)，或写进去的内容与常量不一致。"
+    echo "       ⇒ 判据没有判别力：不能拿「本来就读不到」去证明「被替换了」。"
+    echo "结果: FAIL"; exit 1
+fi
+
 # ======================================================================
 # 工作区（--run-engine 需要它；缺了就自己搭一份）
 # ======================================================================
@@ -534,6 +762,11 @@ build_workspace() {
     done
     cp -r "$DIST_DIR/." "$WORK/app/" || { bad "拷贝 dist 失败"; return 1; }
     purge_stale_engine_logs
+    # ★ v133：新建的工作区里要把文件面的测试文件一起备好。
+    #   放在这里而不是各个调用点，是因为**这一步刚 `rm -rf` 过 $WORK** ——
+    #   谁在这里漏建，后面每一格都会报"file 读不到"，
+    #   而那个症状看起来像"注入没生效"（铁律 185 同族：假红查错方向）。
+    ensure_secret_file || { bad "建文件面测试文件失败: $(secret_file)"; return 1; }
     return 0
 }
 
@@ -569,17 +802,29 @@ purge_stale_engine_logs() {
 # ★ heredoc 是**不带引号**的（要展开 $mode / $spoof / $TARGET_BASE 等）
 #   ⇒ 正文里**不能出现反引号**（会被当命令替换执行）。注释一律用纯文本。
 write_ini() {
-    local cell="$1" mode="$2" spoof="$3"
+    local cell="$1" mode="$2" spoof="$3" privacy="$4"
+    # ★ 必须在 heredoc **之前**算好（heredoc 里取值展开一次就够，别在正文里调函数）：
+    #   正文里调函数也行，但那会让"这一行到底展开了什么"变得难看清。
+    local fileProtect; fileProtect="$(secret_protect_path)"
     printf '%s\n' "$(cat <<EOF
 # spoof_e2e.sh 自动生成 —— 仅用于端到端验证，跑完即删。
 mode=$mode
 test_inject_only=$TARGET_BASE
 
-# ---- 三个面：都要挂上（hook），是否替换由格决定 ----
+# ---- 屏幕 / 剪贴板两面：都要挂上（hook），是否替换由格决定 ----
 hook_screen=1
 spoof_screen=$spoof
 hook_clipboard=1
 spoof_clipboard=$spoof
+
+# ---- 隐私面处置（v132）：只在 mode=block 下生效 ----
+#   A/B 格语义是「本应拒绝」⇒ 必须钉 block；留默认 record 的话守卫会
+#   WouldBlock+放行 ⇒ A 格期望的 err=5 永远等不到（见 cell_privacy 的长注释）。
+#   摄像头/输入钩子不在这套矩阵里跑，一并钉上只是让配置完整、不误导。
+privacy_camera=$privacy
+privacy_input_hook=$privacy
+privacy_screen=$privacy
+privacy_clipboard=$privacy
 
 # ---- 注册表面 ----
 #   hook_reads=0：**故意**保持生产推荐值 —— 这样 spoof 格同时验了
@@ -591,7 +836,18 @@ hook_reads=0
 protect_reg=$REG_PROTECT_PATH
 spoof_reg=$spoof
 
-# ---- 静音化：只留「注入 + 三面判定」，其余主动行为全关 ----
+# ---- 文件面（v133）----
+#   hook_file=0 是**故意的**，不是漏写：FileGuard 的 Install 条件是
+#   hook_file / hook_raw_disk / spoof_file **任一**为真就装，且
+#   NtCreateFile / NtReadFile / NtClose 是**无条件**排进队列的 ⇒ spoof_file
+#   单独就够。把它留 0 等于**顺带验了**这条解耦约束（自挂探针表达不出来）：
+#   若哪天有人给 NtReadFile 的挂载加了 if(hook_file)，这里会立刻红。
+#   protect_file= 是**触发面**：文件替换只认它（与 protect_reg 同构）。
+hook_file=0
+protect_file=$fileProtect
+spoof_file=$spoof
+
+# ---- 静音化：只留「注入 + 四面判定」，其余主动行为全关 ----
 self_protect=0
 neutralize_overlay=0
 high_risk_process_alert=0
@@ -619,6 +875,7 @@ EOF
 # ⚠️ 兜底被读到**本身就是异常**：assert_cells 会断言引擎自报的配置路径里含
 #    pd-<格>（ProgramData 那份），兜底路径不含 ⇒ 该格直接判 FAIL（不是静默通过）。
 write_fallback_ini() {
+    local fileProtect; fileProtect="$(secret_protect_path)"
     printf '%s\n' "$(cat <<EOF
 # spoof_e2e.sh 自动生成（兜底）—— 内容与格无关，刻意取最保守组合。
 # ★ 如果引擎读的是**这一份**，说明 ProgramData 重定向没生效，该格会判 FAIL。
@@ -631,6 +888,9 @@ spoof_clipboard=1
 hook_reads=0
 protect_reg=$REG_PROTECT_PATH
 spoof_reg=1
+hook_file=0
+protect_file=$fileProtect
+spoof_file=1
 
 self_protect=0
 neutralize_overlay=0
@@ -648,8 +908,12 @@ EOF
 
 write_all_inis() {
     for c in $CELLS; do
-        write_ini "$c" "$(cell_mode "$c")" "$(cell_spoof "$c")" || {
+        local sp; sp="$(cell_spoof "$c")"
+        write_ini "$c" "$(cell_mode "$c")" "$sp" "$(cell_privacy "$c")" || {
             bad "写配置失败: $(ini_path "$c")"; return 1; }
+        check_cell_ini_privacy "$c" "$(cell_privacy "$c")" || return 1
+        # ★ v133：文件面那三行也要回读（理由见 check_cell_ini_file 的长注释）。
+        check_cell_ini_file "$c" "$sp" || return 1
     done
     write_fallback_ini || { bad "写兜底配置失败: $(ini_fallback)"; return 1; }
     return 0
@@ -689,6 +953,9 @@ if [ "$ACTION" = "prepare" ]; then
     echo "  兜底（同目录）: $WORK/app/r3shieldcore.ini"
     echo ""
     echo "注册表测试值: HKCU\\$REG_SUBKEY\\$REG_VALUE （已建；--clean 会删）"
+    echo "文件面测试文件: $(secret_file_win)"
+    echo "                （内容 $FILE_SECRET，${#FILE_SECRET} 字节；工作区被 --clean 一起删）"
+    echo "                ini 里的 protect_file= 指的就是它"
     echo ""
     echo "下一步（**管理员终端**里跑）:"
     admin_hint
@@ -761,6 +1028,7 @@ assert_cells() {
         local blt err first nb gpnb gpnbf
         local cput cread cerr clen cmatch
         local rread rerr rlen rmatch
+        local fopen foerr fread frerr fbytes flen fmatch
         blt="$(field "$r" bitblt)"
         err="$(field "$r" err)"
         first="$(field "$r" first)"
@@ -776,6 +1044,13 @@ assert_cells() {
         rerr="$(field "$r" reg_err)"
         rlen="$(field "$r" reg_strlen)"
         rmatch="$(field "$r" reg_match)"
+        fopen="$(field "$r" file_open)"
+        foerr="$(field "$r" file_oerr)"
+        fread="$(field "$r" file_read)"
+        frerr="$(field "$r" file_rerr)"
+        fbytes="$(field "$r" file_bytes)"
+        flen="$(field "$r" file_strlen)"
+        fmatch="$(field "$r" file_match)"
 
         # ---- 前提：剪贴板面的**判别力**先证一下 ----
         #   clip_put=0 ⇒ 目标压根没把测试文本放上去 ⇒ 后面"读到空"分不清
@@ -806,6 +1081,19 @@ assert_cells() {
                 else
                     bad "A[注册表]: 期望读到真值，实得 reg_read=$rread reg_match=$rmatch reg_err=$rerr"
                 fi
+                # ---- 文件：spoof 关 ⇒ 读到**真内容**（负对照，v133）----
+                #   ★ 这一条同时是 protect_file= 的**有效性判据**：
+                #     若前缀没配对上，B/C 格也不会替换 ⇒ 三格都是"真内容" ⇒
+                #     这里绿、B/C 红。反过来这里红（读到假内容）说明
+                #     spoof_file=0 竟然也替换了 —— 那才是真 bug。
+                if [ "$fopen" = "1" ] && [ "$fmatch" = "1" ]; then
+                    ok "A[文件]: 读到**真内容**（file_match=1，bytes=$fbytes）⇒ spoof_file=0 时确实不替换"
+                else
+                    bad "A[文件]: 期望读到真内容，实得 file_open=$fopen file_oerr=$foerr file_read=$fread file_bytes=$fbytes file_match=$fmatch"
+                    echo "       （file_oerr=5 ⇒ block 下「读」被拒了，与设计不符；"
+                    echo "         file_open=0 且 oerr=2/3 ⇒ 测试文件不在位，见上面的备料步骤；"
+                    echo "         file_match=0 但 bytes>0 ⇒ spoof_file=0 却替换了，是真 bug）"
+                fi
                 ;;
             B)
                 # ---- 屏幕：成功 + 全黑 ----
@@ -835,6 +1123,23 @@ assert_cells() {
                 else
                     bad "B[注册表]: 期望 reg_read=1 且 strlen=0，实得 reg_read=$rread strlen=$rlen match=$rmatch"
                 fi
+                # ---- 文件：成功 + 长度不变 + 全 0（v133）----
+                #   ★★ 必须同时要求 `bytes > 0`。只看 strlen=0 的话
+                #      「打开失败 / 读到 0 字节」也满足 ⇒ 空真（铁律 110）。
+                #      而 bytes>0 恰好把"这次读真的发生了"钉住 —— 这是文件面
+                #      与注册表面最大的判据差异（注册表有 reg_read 这个二值，
+                #      文件多了"长度"这个可核对量：替换**不改长度**）。
+                if [ "$fread" = "1" ] && [ -n "$fbytes" ] && [ "$fbytes" -gt 0 ] 2>/dev/null \
+                   && [ "$flen" = "0" ] && [ "$fmatch" = "0" ]; then
+                    ok "B[文件]: 读**成功**（file_read=1，bytes=$fbytes，长度不变）但内容**全 0**（strlen=0）⇒ 替换生效"
+                else
+                    bad "B[文件]: 期望 file_read=1 且 bytes>0 且 strlen=0，实得 file_read=$fread file_bytes=$fbytes file_strlen=$flen file_match=$fmatch"
+                    if [ -n "$fbytes" ] && [ "$fbytes" = "0" ] 2>/dev/null; then
+                        echo "       （bytes=0 ⇒ 这次读根本没发生；先看基线是不是也这样）"
+                    elif [ -n "$flen" ] && [ "$flen" -gt 0 ] 2>/dev/null; then
+                        echo "       （strlen>0 ⇒ 替换没生效；查 protect_file= 是否与目标打开的是同一个文件）"
+                    fi
+                fi
                 ;;
             C)
                 # ---- 屏幕：log 下不拒 ⇒ **不替换** ⇒ 真画面 ----
@@ -851,13 +1156,25 @@ assert_cells() {
                     bad "C[剪贴板]: 期望 clip_match=1，实得 clip_read=$cread strlen=$clen match=$cmatch"
                 fi
                 # ---- 注册表：与 mode **无关** ⇒ log 下**仍**被清零 ----
-                #   ★ 这是三面里注册表面**特有的语义**（替换在读路径上，不在拒绝路径上）。
+                #   ★ 这是注册表/文件两面**共有的语义**（替换在读路径上，不在拒绝路径上）。
                 #     若这里读到真值，说明"注册表替换被 mode 门控了" —— 与设计不符。
                 if [ "$rread" = "1" ] && [ "$rlen" = "0" ] && [ "$rmatch" = "0" ]; then
                     ok "C[注册表]: mode=log 下**仍**被清零（strlen=0）⇒ 注册表替换与 mode 无关（符合设计）"
                 else
                     bad "C[注册表]: 期望 log 下仍被清零（strlen=0 match=0），实得 reg_read=$rread strlen=$rlen match=$rmatch"
                     echo "       （读到真值 ⇒ 注册表替换被 mode 门控了，与 !blockable 读路径的设计不符）"
+                fi
+                # ---- 文件：与 mode **无关** ⇒ log 下**仍**被清零（v133）----
+                #   ★ 这是文件面的**关键语义**，也是它和屏幕/剪贴板最容易混的地方：
+                #     屏幕/剪贴板是"本应拒绝才替换"，log 下不拒 ⇒ 不换；
+                #     文件是"读路径上替换"，log 下照样换。
+                #     若这里读到真内容，说明文件替换被 mode 门控了 —— 与设计不符。
+                if [ "$fread" = "1" ] && [ -n "$fbytes" ] && [ "$fbytes" -gt 0 ] 2>/dev/null \
+                   && [ "$flen" = "0" ] && [ "$fmatch" = "0" ]; then
+                    ok "C[文件]: mode=log 下**仍**得到全 0（bytes=$fbytes 长度不变，strlen=0）⇒ 文件替换与 mode 无关（符合设计）"
+                else
+                    bad "C[文件]: 期望 log 下仍全 0，实得 file_read=$fread file_bytes=$fbytes file_strlen=$flen file_match=$fmatch"
+                    echo "       （读到真内容 ⇒ 文件替换被 mode 门控了，与 NtReadFile 读路径的设计不符）"
                 fi
                 ;;
         esac
@@ -872,9 +1189,10 @@ if [ "$ACTION" = "collect" ]; then
     echo ""
     echo "=== 结果：通过 $pass / 失败 $fail / 跳过 $skip ==="
     if [ "$fail" -eq 0 ]; then
-        echo "结论：回传数据「替换」端到端成立（三面）—— 真引擎注入真进程后，"
-        echo "      block+spoof 下屏幕 BitBlt 返回成功但拿到黑帧、剪贴板读回空、注册表读回空；"
-        echo "      且 log 模式下屏幕/剪贴板恢复真实、注册表**仍**被清零（模式无关）。"
+        echo "结论：回传数据「替换」端到端成立（**四面**）—— 真引擎注入真进程后，"
+        echo "      block+spoof 下屏幕 BitBlt 返回成功但拿到黑帧、剪贴板读回空、"
+        echo "      注册表读回空、**文件读到全 0（长度不变）**；"
+        echo "      且 log 模式下屏幕/剪贴板恢复真实、注册表与文件**仍**被清零（模式无关）。"
         exit 0
     fi
     echo "结果: FAIL —— 见上面每格的诊断。"
@@ -916,6 +1234,16 @@ fi
 ensure_workspace
 ENGINE_W="$WORK/app/$ENGINE_BASE"
 [ -f "$ENGINE_W" ] || { bad "工作区里没有引擎: $ENGINE_W"; echo "结果: FAIL"; exit 1; }
+
+# ★ v133：文件面的测试文件同样可能被 --clean 删掉（工作区一删它就没了）
+#   ⇒ 与上面注册表值同理，这里再确保一次（幂等）。
+if ensure_secret_file && secret_file_ok; then
+    ok "文件面测试文件就绪（$(secret_file_win)）"
+else
+    bad "文件面测试文件不在位: $(secret_file) —— 文件面无法验证"
+    echo "结果: FAIL"; exit 1
+fi
+
 ok "工作区就绪（引擎: $ENGINE_W）"
 
 # ======================================================================
@@ -955,7 +1283,7 @@ smoke_gate() {
     echo "=== 冒烟闸门：先证「注入范围真的被限定了」，再跑矩阵 ==="
     echo "    （引擎只跑 ${SMOKE_MS}ms；这一步失败就**不**跑矩阵）"
 
-    write_ini A "$(cell_mode A)" "$(cell_spoof A)" || { bad "冒烟：写配置失败"; return 1; }
+    write_ini A "$(cell_mode A)" "$(cell_spoof A)" "$(cell_privacy A)" || { bad "冒烟：写配置失败"; return 1; }
     rm -f "$(engine_console)" "$WORK/app/"engine-console-*.log 2>/dev/null
 
     local pd_win
@@ -1047,11 +1375,21 @@ smoke_gate() {
 # ======================================================================
 run_cell() {
     local cell="$1"
-    local mode spoof pd_win console
+    local mode spoof privacy pd_win console
     mode="$(cell_mode "$cell")"
     spoof="$(cell_spoof "$cell")"
+    privacy="$(cell_privacy "$cell")"
     console="$(console_file "$cell")"
-    write_ini "$cell" "$mode" "$spoof" || { echo "写配置失败" >&2; return 1; }
+    # ★★★ v132 引入第 4 个参数（隐私面处置）时，**这里漏更新过**：
+    #   原来是 `write_ini "$cell" "$mode" "$spoof"` —— 三参。
+    #   两个后果，都很难查：
+    #     ① `write_ini` 里 `privacy="$4"` 在 `set -u` 下取未定义位置参数
+    #        ⇒ **整个脚本直接退出**（不是报错继续），矩阵一格都跑不到；
+    #     ② 就算不退出，ini 里 `privacy_screen=` 是空值 ⇒ 守卫按默认 record
+    #        走 WouldBlock+放行 ⇒ A 格期望的 err=5 永远等不到、B 格屏幕不黑。
+    #        而失败信息长得像"拒绝功能坏了"（铁律 185：前提没跟着实现搬家）。
+    #   ⇒ 这里显式传第 4 个参数，并且 smoke_gate 那边一直是对的（可作对照）。
+    write_ini "$cell" "$mode" "$spoof" "$privacy" || { echo "写配置失败" >&2; return 1; }
 
     rm -f "$console" "$console.raw" "$(result_file "$cell")" 2>/dev/null
     rm -f "$(engine_console)" 2>/dev/null
@@ -1087,7 +1425,11 @@ run_cell() {
     sleep "${R3SC_CELL_SETTLE_S:-2}"
 
     # ---- 跑目标（等 2.5s 让轮询注入落进来）----
+    #   ★ v133：多一个 --file=，是文件面要读的那个文件（绝对 Windows 路径）。
+    #     ⚠️ 它必须和 ini 里 `protect_file=` 指同一个文件 —— 两边都由
+    #        `secret_file_win` 派生，单点来源（铁律 127）。
     MSYS_NO_PATHCONV=1 "$TARGET" --wait-ms=2500 --tag="$cell" \
+        --file="$(secret_file_win)" \
         >"$(result_file "$cell")" 2>&1
 
     # ---- 等引擎自己退出（EXIT_AFTER_MS=20000）----
@@ -1132,9 +1474,10 @@ assert_cells
 echo ""
 echo "=== 结果：通过 $pass / 失败 $fail / 跳过 $skip ==="
 if [ "$fail" -eq 0 ]; then
-    echo "结论：回传数据「替换」端到端成立（三面）—— 真引擎注入真进程后，"
-    echo "      block+spoof 下屏幕 BitBlt 返回成功但拿到黑帧、剪贴板读回空、注册表读回空；"
-    echo "      且 log 模式下屏幕/剪贴板恢复真实、注册表**仍**被清零（模式无关）。"
+    echo "结论：回传数据「替换」端到端成立（**四面**）—— 真引擎注入真进程后，"
+    echo "      block+spoof 下屏幕 BitBlt 返回成功但拿到黑帧、剪贴板读回空、"
+    echo "      注册表读回空、**文件读到全 0（长度不变）**；"
+    echo "      且 log 模式下屏幕/剪贴板恢复真实、注册表与文件**仍**被清零（模式无关）。"
     echo ""
     echo "工作区保留在 $WORK（复查：bash tools/spoof_e2e.sh --collect；"
     echo "清掉工作区与注册表测试值：bash tools/spoof_e2e.sh --clean）"

@@ -502,6 +502,11 @@ namespace R3ShieldCorePrompt
 		slot->TimeStamp = event.TimeStamp;
 		slot->TargetKind = event.TargetKind;
 		slot->Flags = event.Flags;
+		// ★ v130：网络面的两个目标参数原来**没拷**（PromptSlot 里有字段、
+		//   填充处漏了）⇒ 引擎侧决策缓存拿不到端口，"同地址不同端口"被当成
+		//   同一条规则。补上后端口才真正参与"同参数"判定。
+		slot->TargetPort = event.TargetPort;
+		slot->NetProtocol = event.NetProtocol;
 		slot->AnsweredGeneration = 0;
 		slot->Verdict = static_cast<ULONG>(fallback);
 

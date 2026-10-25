@@ -1,10 +1,19 @@
 #include "stdafx.h"
 #include "file_guard.h"
+#include "file_spoof_codec.h"
 #include "registry_guard.h"
 #include "r3shieldcore_channel.h"
 #include "r3shieldcore_prompt.h"
 #include "r3shieldcore_rules.h"
 #include "logger.h"
+
+// v135：文件面接进中文规则表（`当 文件 的 路径 含 "x" 时 替换为 全FF`）。
+//
+// ★ 与 `r3shieldcore_rules.h`（编译期高危规则表）**不是一回事**，两者
+//   命名空间必须分得开 —— 理由见 rules_codec.h 头部那段（v78 改名）。
+#include <r3shieldcore/rules_codec.h>
+#include "rules_script_runtime.h"
+namespace RScript = R3ShieldCoreRuleScript;
 
 //
 // 文件行为拦截层。
@@ -89,6 +98,16 @@ namespace
 	typedef NTSTATUS(NTAPI* NtSetSecurityObjectPtr)(HANDLE, SECURITY_INFORMATION, PSECURITY_DESCRIPTOR);
 	typedef NTSTATUS(NTAPI* NtSetEaFilePtr)(HANDLE, FG_IO_STATUS_BLOCK*, PVOID, ULONG);
 	typedef NTSTATUS(NTAPI* NtQueryObjectPtr)(HANDLE, ULONG, PVOID, ULONG, PULONG);
+	//
+	// v133：文件读替换用的两个原型。
+	//
+	// ★ 签名必须与 ntdll 完全一致 —— `NtReadFile` 的参数顺序里
+	//   `ApcRoutine` / `ApcContext` 夹在 `Event` 和 `IoStatusBlock` 之间，
+	//   少写一个参数不会编译报错（函数指针类型自洽），但**调用时会把
+	//   IoStatusBlock 当 ApcContext 传**，直接崩。抄的时候别省。
+	typedef NTSTATUS(NTAPI* NtReadFilePtr)(HANDLE, HANDLE, PVOID, PVOID, FG_IO_STATUS_BLOCK*,
+		PVOID, ULONG, PLARGE_INTEGER, PULONG);
+	typedef NTSTATUS(NTAPI* NtClosePtr)(HANDLE);
 
 	NtCreateFilePtr pOriginalNtCreateFile = nullptr;
 	NtOpenFilePtr pOriginalNtOpenFile = nullptr;
@@ -96,6 +115,14 @@ namespace
 	NtSetInformationFilePtr pOriginalNtSetInformationFile = nullptr;
 	NtSetSecurityObjectPtr pOriginalNtSetSecurityObject = nullptr;
 	NtSetEaFilePtr pOriginalNtSetEaFile = nullptr;
+	//
+	// v133：文件读替换。
+	//
+	// ⚠️ 这两个指针在 `spoof_file=0` 时**恒为 nullptr**（不挂 hook）。
+	//   hook 体里不能假设它们非空 —— 万一将来有人改成"无条件挂"，
+	//   忘了先判空就是**每次读文件都跳空指针**（全进程崩）。
+	NtReadFilePtr pOriginalNtReadFile = nullptr;
+	NtClosePtr pOriginalNtClose = nullptr;
 
 	// NtQueryObject 不挂 hook，只留一个干净指针用来还原句柄路径。
 	// 不挂 = 不可能递归（和 registry_guard 的 NtQueryKey 同理）。
@@ -404,6 +431,71 @@ namespace
 		event.ThreadId = GetCurrentThreadId();
 
 		R3ShieldCoreChannel::Publish(event);
+	}
+
+	// ==================================================================
+	// v133：文件读替换（ini: spoof_file=，默认关）
+	// ==================================================================
+	//
+	// 为什么要维护一张"句柄 → 是否受保护"的小表，而不是在 NtReadFile 里
+	// 直接查路径：**NtReadFile 的参数里没有路径**，只有 HANDLE。
+	// 想拿路径只能 `NtQueryObject(ObjectNameInformation)` —— 那是**一次
+	// 系统调用**，而 NtReadFile 是整机最热的 API 之一（一个解压程序每秒
+	// 几万次），在它里面加一次 syscall 等于把整机 I/O 拖慢一个量级。
+	// ⇒ 在"打开"那一刻（低频）算一次，之后读的时候只查内存表（O(n)，n≤64）。
+	//
+	// ★★★ 表本身、以及"该清多少字节"的判定，全都在
+	//   `file_spoof_codec.h` 里 —— **生产与探针共用同一份**（铁律 127）。
+	//   这里只做三件事：读策略开关、判路径、上报事件。
+	//
+	R3ShieldCoreFileSpoof::HandleTable g_protectedHandles = {};
+
+	bool SpoofFileEnabled() noexcept
+	{
+		R3ShieldCore::Policy* policy = R3ShieldCoreChannel::Policy();
+		return policy && (policy->Flags2 & R3ShieldCore::FlagSpoofFile) != 0;
+	}
+
+	// 擦掉某个句柄值上的记录（可能有多条，全擦）。
+	void ForgetProtectedHandle(HANDLE fileHandle) noexcept
+	{
+		g_protectedHandles.Forget(fileHandle);
+	}
+
+	// 记下"这个句柄指向受保护文件"。调用方已经确认 `SpoofFileEnabled()`。
+	void RememberProtectedHandle(HANDLE fileHandle, PCWSTR normalizedPath) noexcept
+	{
+		if (!fileHandle)
+		{
+			return;
+		}
+
+		// ★ 判定与"先擦"必须在**同一个调用**里完成（`Refresh`）：
+		//   先判后擦会让"不受保护的新文件复用了旧句柄值"这个场景
+		//   把旧记录留在表里 ⇒ 误清无关读的缓冲区（静默数据损坏）。
+		//   codec 的 `Refresh(handle, shouldProtect)` 就是为这件事设计的。
+		const bool shouldProtect =
+			normalizedPath && normalizedPath[0] != L'\0'
+			&& R3ShieldCoreRules::MatchesUserProtectFile(normalizedPath);
+
+		// ★ v135：把**路径一起记下** —— 规则求值在读的时候要按路径匹配，
+		//   而读的时候只有句柄（`NtReadFile` 的参数里没有路径）。
+		if (!g_protectedHandles.Refresh(fileHandle, shouldProtect, normalizedPath) && shouldProtect) {
+			// 表满：**不记录**（fail-open），但要说清楚（铁律 97：不能静默）。
+			if (InterlockedExchange(&g_protectedHandles.OverflowLogged, 1) == 0) {
+				LOG(L"FileGuard: 受保护句柄表已满(%u)，该句柄不再替换（spoof_file，本次放行真内容）。"
+					L"通常说明 protect_file= 配得太宽或进程同时打开过多受保护文件",
+					R3ShieldCoreFileSpoof::MaxHandles);
+			}
+		}
+	}
+
+	// 查询并**顺手把 Reported 置位**（返回"这次是不是第一次"）。
+	// v135：`pathOut` 非空时顺带把路径抄出来（只有配了文件面规则时才传）。
+	bool TakeProtectedHandle(HANDLE fileHandle, bool* firstTime,
+		WCHAR* pathOut, size_t pathCap) noexcept
+	{
+		return g_protectedHandles.Take(fileHandle, firstTime, pathOut, pathCap);
 	}
 
 	R3ShieldCore::Verdict PromptFallbackVerdict() noexcept
@@ -974,6 +1066,13 @@ namespace
 				IoStatusBlock, AllocationSize, FileAttributes, ShareAccess,
 				CreateDisposition, CreateOptions, EaBuffer, EaLength);
 
+			// ★ v133：记下"这个句柄指向受保护文件"（仅 spoof_file 开启时）。
+			//   `NtCreateFile` 是文件句柄的**主入口**（绝大多数打开都走这里，
+			//   `NtOpenFile` 只是它的薄封装）⇒ 漏了这里等于整个功能失效。
+			if (status >= 0 && FileHandle && SpoofFileEnabled()) {
+				RememberProtectedHandle(*FileHandle, event.KeyPath);
+			}
+
 			if (action == Action::Record) {
 				event.Status = static_cast<ULONG>(status);
 				Publish(event);
@@ -1024,11 +1123,164 @@ namespace
 			status = pOriginalNtOpenFile(FileHandle, DesiredAccess, ObjectAttributes,
 				IoStatusBlock, ShareAccess, OpenOptions);
 
+			// ★ v133：记下"这个句柄指向受保护文件"（仅 spoof_file 开启时）。
+			//   必须在**真调成功之后**取 `*FileHandle` —— 失败时它是未定义的。
+			if (status >= 0 && FileHandle && SpoofFileEnabled()) {
+				RememberProtectedHandle(*FileHandle, event.KeyPath);
+			}
+
 			if (action == Action::Record) {
 				event.Status = static_cast<ULONG>(status);
 				Publish(event);
 			}
 		}
+
+		InterlockedDecrement(&g_activeHooks);
+		return status;
+	}
+
+	//
+	// v133：NtReadFile —— 受保护文件的读，回传缓冲区**清零、长度不变**。
+	//
+	// ★ 为什么不走 `Evaluate`：文件读**从来不会被拒**（拒了全系统都起不来），
+	//   所以这里不存在"决策"这一步 —— 命中受保护句柄就替换，没命中就纯放行。
+	//   这与 v71 注册表读替换是同构的（那边也在 `!blockable` 分支里做）。
+	//   代价：这一条路径**不看 mode**（log 下照样清零），与 spoof_screen /
+	//   spoof_clipboard 的"只在应拒时替换"**不同**。差异是真实的，
+	//   见 shared 头 FlagSpoofFile 那段与 tools/spoof_e2e.sh 的 C 格。
+	//
+	NTSTATUS NTAPI NtReadFile_Hook(HANDLE FileHandle, HANDLE Event, PVOID ApcRoutine,
+		PVOID ApcContext, FG_IO_STATUS_BLOCK* IoStatusBlock, PVOID Buffer,
+		ULONG Length, PLARGE_INTEGER ByteOffset, PULONG Key)
+	{
+		InterlockedIncrement(&g_activeHooks);
+
+		// ★ v135：只有**真配了「文件」面规则**才需要路径。
+		//   `HasFace` 是保守上界（表里有没有这个面的规则）⇒ 用户没配文件规则时
+		//   这里完全不进规则求值，也就没有 mutex / 正则的开销。
+		//   ★ 方向：宁可多问一次，不可漏问 —— 返回 false 才跳过。
+		WCHAR rulePath[R3ShieldCoreFileSpoof::MaxPathChars] = {};
+		const bool wantRulePath = RScript::HasFace(RScript::Face::File);
+
+		bool firstTime = false;
+		const bool protectedHandle = TakeProtectedHandle(FileHandle, &firstTime,
+			wantRulePath ? rulePath : nullptr,
+			wantRulePath ? R3ShieldCoreFileSpoof::MaxPathChars : 0);
+
+		NTSTATUS status = pOriginalNtReadFile(FileHandle, Event, ApcRoutine, ApcContext,
+			IoStatusBlock, Buffer, Length, ByteOffset, Key);
+
+		if (protectedHandle) {
+			const ULONG_PTR information = IoStatusBlock ? IoStatusBlock->Information : 0;
+
+			// ★ "该清多少字节"的判定在 codec 里（生产与探针同一份）：
+			//   失败 / EOF / 异步 → 返回 0，一个字节都不动。
+			const ULONG bytes = R3ShieldCoreFileSpoof::BytesToZero(
+				status, Length, information);
+
+			// ---- v135：按规则决定"填什么" ----
+			//
+			// ★ 默认动作 = 全零（v133 行为**一字未改**）：规则没配 / 没命中
+			//   时走的就是这条路，所以老配置的行为不会因为加了规则而变。
+			RScript::Act act = RScript::Act::ReplaceEmpty;
+			BYTE fill = 0;
+			const WCHAR* text = nullptr;
+			if (wantRulePath && rulePath[0] != L'\0') {
+				const RScript::Verdict v = RScript::Eval(
+					RScript::Face::File, rulePath, nullptr, nullptr);
+				if (v.hit) {
+					act  = v.act;
+					fill = v.fill;
+					text = v.text.c_str();
+				}
+			}
+
+			// ★ 偏移：`ByteOffset` 为 NULL 表示"从当前文件位置读"（同步句柄）。
+			//   这时按 0 算 —— 理由与代价写在 `FillWithText` 的注释里
+			//   （平铺本身就在重复，视觉差别很小，而代价是为每次读多打一次
+			//     `NtQueryInformationFile`）。
+			const long long readOffset = (ByteOffset != nullptr) ? ByteOffset->QuadPart : 0;
+
+			bool replaced = false;
+			if (bytes > 0) {
+				switch (act) {
+				case RScript::Act::Pass:
+					// 规则明确要求放行：不动缓冲区。**不报 Spoofed**（铁律 97）。
+					replaced = false;
+					break;
+				case RScript::Act::ReplaceByte:
+					replaced = R3ShieldCoreFileSpoof::FillBuffer(Buffer, bytes, fill);
+					break;
+				case RScript::Act::ReplaceText:
+					replaced = R3ShieldCoreFileSpoof::FillWithText(Buffer, bytes, readOffset, text);
+					break;
+				default:    // ReplaceEmpty / 未命中 / 任何意外值 ⇒ 全零
+					replaced = R3ShieldCoreFileSpoof::ZeroBuffer(Buffer, bytes);
+					break;
+				}
+			}
+
+			if (replaced) {
+				// 只有**真的改了字节**才上报 Spoofed（铁律 97）。
+				// 每个句柄只报一次：NtReadFile 可能一秒几万次，
+				// 每次都报会把事件通道和日志一起刷爆。
+				if (firstTime) {
+					R3ShieldCore::Event event = {};
+					event.Op = static_cast<ULONG>(R3ShieldCore::FileOp::Read);
+					event.Decision = static_cast<ULONG>(R3ShieldCore::Decision::Spoofed);
+					event.Status = static_cast<ULONG>(status);
+					event.Flags2 |= R3ShieldCore::FlagEvent2Spoofed;
+					CaptureHandlePath(FileHandle, event);
+					Publish(event);
+				}
+			}
+			else if (act == RScript::Act::Pass) {
+				// ★ 规则说放行 ⇒ 这是**用户配置的结果**，不是故障。
+				//   但仍然要在第一次说一句，否则"配了规则却没替换"
+				//   会被当成 bug 查（而它其实是按配置工作的）。
+				if (firstTime) {
+					LOG(L"FileGuard: 规则命中「放行」，该文件本次按真实内容返回：%ls",
+						rulePath);
+				}
+			}
+			else if (R3ShieldCoreFileSpoof::IsAsyncPending(status)) {
+				// ★★ 异步读：数据要等 I/O 完成才落进 Buffer，此刻清零毫无作用，
+				//   而真数据稍后仍会写进去 ⇒ **本次替换不生效**。
+				//
+				//   ⚠️ 为什么不能"干脆把调用拒掉"：I/O 已经提交给内核了，
+				//   调用方拿到失败后可能立刻释放/复用 Buffer，而内核随后
+				//   往里写 ⇒ **目标进程内存损坏**。宁可放行真内容，
+				//   也不能在别人的进程里制造内存破坏。
+				//   ⇒ 放行 + 只报一次 + **不置 Spoofed**（铁律 97）。
+				if (firstTime) {
+					R3ShieldCore::Event event = {};
+					event.Op = static_cast<ULONG>(R3ShieldCore::FileOp::Read);
+					event.Decision = static_cast<ULONG>(R3ShieldCore::Decision::WouldBlock);
+					event.Status = static_cast<ULONG>(status);
+					CaptureHandlePath(FileHandle, event);
+					Publish(event);
+					LOG(L"FileGuard: 受保护文件的读走了异步路径（STATUS_PENDING），spoof_file 本次未生效，返回的是真实内容");
+				}
+			}
+		}
+
+		InterlockedDecrement(&g_activeHooks);
+		return status;
+	}
+
+	//
+	// v133：NtClose —— 擦掉句柄记录（防句柄值复用后误清无关读的缓冲区）。
+	//
+	// ★ 先擦再关：即使原函数失败（句柄本来就无效），记录也不该继续留着 ——
+	//   留着的唯一后果就是"将来某个复用了这个值的对象被误伤"。
+	//
+	NTSTATUS NTAPI NtClose_Hook(HANDLE Handle)
+	{
+		InterlockedIncrement(&g_activeHooks);
+
+		ForgetProtectedHandle(Handle);
+
+		NTSTATUS status = pOriginalNtClose(Handle);
 
 		InterlockedDecrement(&g_activeHooks);
 		return status;
@@ -1344,16 +1596,25 @@ namespace FileGuard
 			policy && (policy->Flags & R3ShieldCore::FlagHookFile) != 0;
 		const bool rawDiskHookOn =
 			policy && (policy->Flags2 & R3ShieldCore::FlagHookRawDisk) != 0;
+		//
+		// ★ v133：读替换也要求装 hook —— 而且它**要求的最多**：
+		//   除了读写那批，还要额外挂 `NtReadFile`（替换点）与 `NtClose`
+		//   （擦句柄记录，防句柄值复用误伤）。
+		//   ⇒ 三个开关**任一**开就要装，别把 spoof_file 漏在条件外面
+		//     （漏了的表现是"配了 spoof_file 却什么都没发生"，且日志安静）。
+		//
+		const bool spoofFileOn = SpoofFileEnabled();
 
-		if (!policy || (!fileHookOn && !rawDiskHookOn)) {
+		if (!policy || (!fileHookOn && !rawDiskHookOn && !spoofFileOn)) {
 			g_bypass = true;
 			g_installed = true;
-			LOG(L"FileGuard: hook_file / hook_raw_disk 均未开启，本进程不挂文件 hook");
+			LOG(L"FileGuard: hook_file / hook_raw_disk / spoof_file 均未开启，本进程不挂文件 hook");
 			return true;
 		}
 
-		LOG(L"FileGuard: 挂载中 (file=%d rawdisk=%d, pid=%u)",
-			fileHookOn ? 1 : 0, rawDiskHookOn ? 1 : 0, GetCurrentProcessId());
+		LOG(L"FileGuard: 挂载中 (file=%d rawdisk=%d spoof_file=%d, pid=%u)",
+			fileHookOn ? 1 : 0, rawDiskHookOn ? 1 : 0, spoofFileOn ? 1 : 0,
+			GetCurrentProcessId());
 
 		g_bypass = false;
 
@@ -1383,6 +1644,32 @@ namespace FileGuard
 		g_ownsNtSetSecurityObjectHook = g_hookCount > hooksBeforeSecurityObject;
 		QueueHook("NtSetEaFile", reinterpret_cast<LPVOID>(NtSetEaFile_Hook),
 			reinterpret_cast<LPVOID*>(&pOriginalNtSetEaFile), false);
+
+		//
+		// v133：读替换的两个 hook —— **只在 spoof_file=1 时**才挂。
+		//
+		// ★ 为什么必须"按需挂"而不是"反正挂了也无害"：
+		//   `NtReadFile` / `NtClose` 是整机最热的两条路径（任何一个进程
+		//   每秒几万次），多一层 detour 的代价**乘在每一个进程上**。
+		//   默认配置下这两个开关是关的 ⇒ 这一层对默认用户的开销必须是 0。
+		//   （同理 `hook_file` 默认关，见文件头注释。）
+		//
+		// ★ 两个都设为 required=false：`NtClose` 在极老的系统上理论上
+		//   可能不导出（实际都导出）。挂不上时的行为是**功能降级而不是崩溃**
+		//   —— 少了 NtClose 只是少了一道防复用的补丁（第一道在 open 里），
+		//   少 了 NtReadFile 则整个替换不生效，日志会吵出来。
+		//
+		if (spoofFileOn) {
+			const int hooksBeforeRead = g_hookCount;
+			QueueHook("NtReadFile", reinterpret_cast<LPVOID>(NtReadFile_Hook),
+				reinterpret_cast<LPVOID*>(&pOriginalNtReadFile), false);
+			if (g_hookCount == hooksBeforeRead) {
+				LOG(L"FileGuard: NtReadFile 挂载失败，spoof_file 不会生效（本进程读到的仍是真实内容）");
+			}
+
+			QueueHook("NtClose", reinterpret_cast<LPVOID>(NtClose_Hook),
+				reinterpret_cast<LPVOID*>(&pOriginalNtClose), false);
+		}
 
 		g_installed = true;
 

@@ -5,6 +5,15 @@
 #include "r3shieldcore_prompt.h"
 #include "r3shieldcore_rules.h"
 #include "logger.h"
+// ★ v134：替换内容可以来自**外部图片**（ini `spoof_screen_image=`）。
+//   生产与单测**共用同一份**实现（铁律 127：探针别自己重写一遍替换逻辑，
+//   否则"探针通过"证明不了生产代码）。
+#include "screen_spoof_image.h"
+// ★ v135：截屏面接进中文规则表（按调用方进程名决定换成哪张图）。
+//   命名空间必须与「编译期高危规则表」分得开 —— 见 rules_codec.h 头部（v78）。
+#include <r3shieldcore/rules_codec.h>
+#include "rules_script_runtime.h"
+namespace RScript = R3ShieldCoreRuleScript;
 
 //
 // 屏幕捕获监控层（GDI 截屏路径）。
@@ -193,9 +202,158 @@ namespace
 		return true;
 	}
 
+	// ------------------------------------------------------------------
+	// ★ v134：替换的**内容来源**（外部图片 vs 黑帧）
+	// ------------------------------------------------------------------
+	//
+	// 语义：`spoof_screen=1` **且** `spoof_screen_image=` 非空 ⇒ 把那张图
+	//   **拉伸铺满**被截取的区域；否则 ⇒ 保持 v67 的黑帧（默认行为一字不改）。
+	//
+	// ★★★ 失败方向必须**更像假**，不能更像真：
+	//   图片读不到 / 画不上（DC 不可写 / 格式不支持）时，一律**回落黑帧**，
+	//   绝不"那就把真画面放过去"。所以这里写成"先试图片，失败再涂黑"，
+	//   而**不是**"有图就不涂黑"。这条是替换功能的底线（铁律 12/13 同款）。
+	//
+	// ⚠️ 为什么每个 hook 点都调这两个包装、而不是各自判断：
+	//   四个替换点（BitBlt / StretchBlt / PrintWindow / GetDIBits）如果各写一遍
+	//   "有没有配图 / 图能不能用"，迟早有一处漏掉 ⇒ 表现为"截图一半是图、
+	//   一半是黑"，而那种现象极难归因。
+	R3ShieldCore::Policy* SpoofPolicy() noexcept
+	{
+		return R3ShieldCoreChannel::Policy();
+	}
+
+	// 配了图片吗（且非空）。NULL 表示"没配"。
+	const WCHAR* SpoofImagePath() noexcept
+	{
+		R3ShieldCore::Policy* policy = SpoofPolicy();
+		if (policy && policy->SpoofScreenImagePath[0] != L'\0')
+		{
+			return policy->SpoofScreenImagePath;
+		}
+		return nullptr;
+	}
+
+	// ------------------------------------------------------------------
+	// ★ v135：截屏面接进中文规则表 —— 按**调用方进程名**决定"换成什么"
+	// ------------------------------------------------------------------
+	//
+	// 规则示例：`当 截屏 的 进程 含 "OBS" 时 替换为图 "C:\fake\desktop.bmp"`
+	//
+	// ★ 为什么"调用方"就是**当前进程**：
+	//   hook 是注入到被截屏的那个进程里的，`BitBlt` 的调用者就是它自己
+	//   （跨进程截屏也是"在 A 进程里 BitBlt B 的窗口 DC"，hook 仍在 A 里）。
+	//   ⇒ 取自己的 exe 名就够了，**一次缓存、之后零成本**。
+	//   ⚠️ 不要为这个去查窗口标题：`BitBlt` 的 DC 大多拿不到来源窗口。
+	//
+	// ★ 进程名只取一次：`GetModuleFileNameW` 每次调用都要查进程参数块，
+	//   而这条路径可能一秒跑几十次（每帧截屏）。
+	const WCHAR* CurrentProcessExeName() noexcept
+	{
+		static WCHAR s_name[MAX_PATH] = {};
+		static volatile LONG s_ready = 0;
+		if (s_ready == 0)
+		{
+			WCHAR full[MAX_PATH] = {};
+			const DWORD n = GetModuleFileNameW(nullptr, full, MAX_PATH);
+			if (n > 0 && n < MAX_PATH)
+			{
+				const WCHAR* slash = wcsrchr(full, L'\\');
+				wcsncpy_s(s_name, slash ? slash + 1 : full, _TRUNCATE);
+			}
+			// 并发下两个线程可能都写一遍 —— 写的是同一个值，无害。
+			InterlockedExchange(&s_ready, 1);
+		}
+		return s_name;
+	}
+
+	enum class ScreenSpoofMode
+	{
+		Black,   // 涂黑（默认；也是"图读不到"的回落方向）
+		Image,   // 画指定图片
+		Pass,    // 规则明确要求放行：本次**不替换**，返回真实画面
+	};
+
+	// 决定本次替换"怎么做"。`imageOut` 非空时写入图片路径（空串 = 没有图）。
+	//
+	// ★★★ 为什么用**输出缓冲区**而不是返回 `const WCHAR*`：
+	//   规则命中时路径来自 `Verdict::text`（一个 `std::wstring`），
+	//   `Verdict` 是**局部变量** —— 把它的 `c_str()` 返回出去就是
+	//   **悬垂指针**，而这条路径在热区里，表现为"偶发画出乱七八糟的图"
+	//   或直接崩在被注入进程里。拷贝一份就没有这个问题。
+	//
+	// ★ 叠加语义（用户选的那个）：ini 的 `spoof_screen` 开关已经在外面判过
+	//   （只有 `action == Action::Spoof` 才进来）；这里规则**再细分**。
+	//   规则一条都没命中 ⇒ 回落 v134 的全局图片；没配图 ⇒ 黑帧。
+	ScreenSpoofMode ScreenMode(WCHAR* imageOut, size_t cap) noexcept
+	{
+		if (imageOut && cap > 0)
+		{
+			imageOut[0] = L'\0';
+		}
+
+		if (RScript::HasFace(RScript::Face::Screen))
+		{
+			const RScript::Verdict v = RScript::Eval(
+				RScript::Face::Screen, nullptr, CurrentProcessExeName(), nullptr);
+			if (v.hit)
+			{
+				switch (v.act)
+				{
+				case RScript::Act::Pass:
+					return ScreenSpoofMode::Pass;
+				case RScript::Act::ReplaceImage:
+					if (imageOut && cap > 0 && !v.text.empty())
+					{
+						wcsncpy_s(imageOut, cap, v.text.c_str(), _TRUNCATE);
+						return ScreenSpoofMode::Image;
+					}
+					// 图路径是空串 ⇒ 等于没配图 ⇒ 黑帧（失败方向"更像假"）。
+					return ScreenSpoofMode::Black;
+				default:
+					return ScreenSpoofMode::Black;
+				}
+			}
+		}
+
+		const WCHAR* ini = SpoofImagePath();
+		if (ini && imageOut && cap > 0)
+		{
+			wcsncpy_s(imageOut, cap, ini, _TRUNCATE);
+			return ScreenSpoofMode::Image;
+		}
+		return ScreenSpoofMode::Black;
+	}
+
+	// DC 路径：图片优先，失败回落黑帧。返回 true = 替换真的发生了。
+	//
+	// ★ v135：图片路径由调用方传进来（`ScreenMode` 已经决定好了），
+	//   而不是在这里再读一次 policy —— 否则规则会被求值两遍，
+	//   两遍之间还可能因为规则表变化而给出不同答案。
+	bool SpoofRect(HDC dc, int x, int y, int width, int height, const WCHAR* image) noexcept
+	{
+		if (image && R3ShieldCoreScreenImage::PaintRect(dc, x, y, width, height, image))
+		{
+			return true;
+		}
+		return BlackenRect(dc, x, y, width, height);
+	}
+
+	// GetDIBits 路径：图片优先，失败回落 memset(0)。
+	bool SpoofDibBits(LPVOID bits, const BITMAPINFO* info, int rowsWritten,
+		const WCHAR* image) noexcept
+	{
+		if (image && R3ShieldCoreScreenImage::PaintDib(bits, info, rowsWritten, image))
+		{
+			return true;
+		}
+		return BlackenDibBits(bits, info, rowsWritten);
+	}
+
 	// 「本应拒绝」时的统一出口。
 	//
-	// ★ v67：开关打开 ⇒ **替换**（调用成功 + 黑帧）；否则 ⇒ 拒绝（原行为，一字不改）。
+	// ★ v67：开关打开 ⇒ **替换**（调用成功 + 黑帧 / v134 起可为外部图片）；
+	//   否则 ⇒ 拒绝（原行为，一字不改）。
 	// ⚠️ 返回 Spoof 时，detour 层**不得**返回失败码 —— 要真调原函数后返回它的结果。
 	// ⚠️ 本函数**不**负责置 FlagEvent2Spoofed：那是 detour 层按"涂黑是否真成功"置的。
 	Action RejectOrSpoof(R3ShieldCore::Event& event) noexcept
@@ -271,15 +429,30 @@ namespace
 		//    而那个线程**只在 ASK 模式启动** —— LOG/BLOCK 下调 Ask 会等
 		//    一个永远不来的答复（实测表现：LOG 模式下被当成 Deny，
 		//    直接 BLOCK 掉，而 LOG 模式不该拦任何东西）。
-		const bool canAsk = allowAsk && (mode == static_cast<ULONG>(R3ShieldCore::Mode::Ask));
+		// ★ v132：这一面的处置档由配置决定（ini: privacy_screen=record|ask|block）。
+		const R3ShieldCore::ObjectType face =
+			static_cast<R3ShieldCore::ObjectType>(event.ObjectType);
+		const R3ShieldCore::PrivacyAction privacy =
+			R3ShieldCore::PrivacyActionOf(policy ? policy->Flags2 : 0, face);
+		const bool privacyAsk = R3ShieldCore::IsPrivacyFace(face)
+			&& privacy == R3ShieldCore::PrivacyAction::Ask
+			&& mode == static_cast<ULONG>(R3ShieldCore::Mode::Block);
+
+		const bool canAsk = allowAsk
+			&& (mode == static_cast<ULONG>(R3ShieldCore::Mode::Ask) || privacyAsk);
 		if (!canAsk) {
 			if (mode == static_cast<ULONG>(R3ShieldCore::Mode::Block)) {
-				// ★ v129：隐私面在 block 下**不硬拒**。
+				// ★ v132：非 Block 档（Record / 问不了的 Ask）⇒ 只记录。
 				//   截屏是"知情类"：截图工具、录屏、会议共享都会走这里，
 				//   硬拒的表现是"黑屏 / 截出来是空的"，用户会当成软件坏了。
-				//   只记录 + 标 WouldBlock；真要拦用 mode=block_all。
-				if (R3ShieldCore::IsPrivacyFace(
-						static_cast<R3ShieldCore::ObjectType>(event.ObjectType))) {
+				if (R3ShieldCore::IsPrivacyFace(face)
+						&& privacy != R3ShieldCore::PrivacyAction::Block) {
+					// ★ 先看能不能替换：开了 spoof_screen 时给"黑帧"，
+					//   截图工具照常工作但拿不到真实画面 —— 比"只记录"更好。
+					//   （v129 第一版直接 return Record，把替换路径挡住了，是回归。）
+					if (SpoofScreenEnabled()) {
+						return RejectOrSpoof(event);
+					}
 					event.Decision = static_cast<ULONG>(R3ShieldCore::Decision::WouldBlock);
 					return Action::Record;
 				}
@@ -360,7 +533,16 @@ namespace
 		// ★ v67：替换 —— 真调已发生（目标 DC 的句柄/尺寸都真实），
 		//    再把目标区域涂黑。**返回 result（= 成功）**，调用者看不出区别。
 		if (action == Action::Spoof && result) {
-			if (BlackenRect(hdcDest, xDest, yDest, width, height)) {
+			// ★ v134：换成 `SpoofRect` —— 配了 `spoof_screen_image=` 就画那张图，
+			//   没配 / 画不上就照旧涂黑（失败方向永远"更像假"）。
+			// ★ v135：图片路径改由 `ScreenMode` 决定（规则可覆盖 ini 那张）。
+			WCHAR spoofImage[260] = {};
+			if (ScreenMode(spoofImage, _countof(spoofImage)) == ScreenSpoofMode::Pass) {
+				// 规则明确放行 ⇒ **口径必须跟着改**，不能继续报 Spoofed（铁律 97）。
+				event.Decision = static_cast<ULONG>(R3ShieldCore::Decision::Allowed);
+			}
+			else if (SpoofRect(hdcDest, xDest, yDest, width, height,
+					spoofImage[0] ? spoofImage : nullptr)) {
 				event.Flags2 |= R3ShieldCore::FlagEvent2Spoofed;
 			}
 			else {
@@ -405,7 +587,12 @@ namespace
 
 		// ★ v67：替换 —— 同 BitBlt，涂的是**目标**矩形（缩放后的尺寸）。
 		if (action == Action::Spoof && result) {
-			if (BlackenRect(hdcDest, xDest, yDest, widthDest, heightDest)) {
+			WCHAR spoofImage[260] = {};
+			if (ScreenMode(spoofImage, _countof(spoofImage)) == ScreenSpoofMode::Pass) {
+				event.Decision = static_cast<ULONG>(R3ShieldCore::Decision::Allowed);
+			}
+			else if (SpoofRect(hdcDest, xDest, yDest, widthDest, heightDest,
+					spoofImage[0] ? spoofImage : nullptr)) {
 				event.Flags2 |= R3ShieldCore::FlagEvent2Spoofed;
 			}
 			else {
@@ -458,10 +645,16 @@ namespace
 		// ★ v67：替换 —— 把窗口画到 hdcBlt 之后再涂黑整块目标 DC。
 		//    hdcBlt 的尺寸用 GetClipBox 取（内存 DC 上即"位图范围"）。
 		if (action == Action::Spoof && result) {
+			WCHAR spoofImage[260] = {};
+			const ScreenSpoofMode mode = ScreenMode(spoofImage, _countof(spoofImage));
 			RECT rect = {};
-			if (GetClipBox(hdcBlt, &rect) != ERROR &&
+			if (mode == ScreenSpoofMode::Pass) {
+				event.Decision = static_cast<ULONG>(R3ShieldCore::Decision::Allowed);
+			}
+			else if (GetClipBox(hdcBlt, &rect) != ERROR &&
 				rect.right > rect.left && rect.bottom > rect.top &&
-				BlackenRect(hdcBlt, rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top)) {
+				SpoofRect(hdcBlt, rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top,
+					spoofImage[0] ? spoofImage : nullptr)) {
 				event.Flags2 |= R3ShieldCore::FlagEvent2Spoofed;
 			}
 			else {
@@ -537,7 +730,13 @@ namespace
 		// ★ v67：替换 —— 真调已把真实像素写进调用者的缓冲区，现在把它涂黑。
 		//    只涂**本次真正写入的行数**（result），按位深算行距。
 		if (action == Action::Spoof && result > 0) {
-			if (BlackenDibBits(bits, info, result)) {
+			// ★ v134：`SpoofDibBits` —— 图片优先，失败回落 memset(0)。
+			WCHAR spoofImage[260] = {};
+			if (ScreenMode(spoofImage, _countof(spoofImage)) == ScreenSpoofMode::Pass) {
+				event.Decision = static_cast<ULONG>(R3ShieldCore::Decision::Allowed);
+			}
+			else if (SpoofDibBits(bits, info, result,
+					spoofImage[0] ? spoofImage : nullptr)) {
 				event.Flags2 |= R3ShieldCore::FlagEvent2Spoofed;
 			}
 			else {
@@ -682,14 +881,34 @@ namespace ScreenGuard
 #ifdef SCREENGUARD_GUARD_UT
 namespace ScreenGuardTest
 {
-	int EvaluateForTest(ULONG op, int* decisionOut, ULONG* flagsOut) noexcept
+	// ★ v132：`allowAsk` 从形参传进来（v129 时写死 false）。
+	int EvaluateForTest(ULONG op, bool allowAsk, int* decisionOut, ULONG* flagsOut) noexcept
 	{
 		R3ShieldCore::Event event = {};
 		const Action action = Evaluate(static_cast<R3ShieldCore::ScreenOp>(op),
-			event, /*allowAsk=*/false);
+			event, allowAsk);
 		if (decisionOut) *decisionOut = static_cast<int>(event.Decision);
 		if (flagsOut)    *flagsOut = event.Flags;
 		return static_cast<int>(action);
+	}
+
+	// ★ v135：截屏面的规则求值（`ScreenMode`）同样在匿名 namespace 里。
+	//   返回 0 = 黑帧，1 = 画图（路径抄进 imageOut），2 = 放行。
+	//   ★ 为什么一定要能测：`Pass` 会把上报口径从 `Spoofed` 改成 `Allowed`
+	//     （铁律 97：口径必须与实际一致）—— 而这个改动**只在运行时生效**，
+	//     光看代码看不出来"这一次到底是放行还是替换"。
+	int ScreenModeForTest(WCHAR* imageOut, int cap) noexcept
+	{
+		const ScreenSpoofMode m = ScreenMode(imageOut, static_cast<size_t>(cap));
+		if (m == ScreenSpoofMode::Image) return 1;
+		if (m == ScreenSpoofMode::Pass)  return 2;
+		return 0;
+	}
+
+	// 规则是按"调用方进程名"匹配的，单测得先知道自己的名字才能写出命中的规则。
+	const WCHAR* ProcessExeNameForTest() noexcept
+	{
+		return CurrentProcessExeName();
 	}
 }
 #endif // SCREENGUARD_GUARD_UT

@@ -62,6 +62,21 @@ namespace GuardStub
 		else { g_policy.Flags &= ~R3ShieldCore::FlagHighRiskGuard; }
 	}
 	void SetPromptOpen(bool open) noexcept { g_promptOpen = open; }
+
+	// ★ v132：设某个隐私面的处置档（写进 Policy->Flags2 的那 2 位）。
+	//
+	// 走真实的 `R3ShieldCore::SetPrivacyAction()`，不在这里另算位移 ——
+	// 单测要验的正是"位布局对不对"，桩自己算一遍就等于自证。
+	void SetPrivacyAction(R3ShieldCore::ObjectType face,
+		R3ShieldCore::PrivacyAction action) noexcept
+	{
+		g_policy.Flags2 = R3ShieldCore::SetPrivacyAction(g_policy.Flags2, face, action);
+	}
+	R3ShieldCore::PrivacyAction GetPrivacyAction(R3ShieldCore::ObjectType face) noexcept
+	{
+		return R3ShieldCore::PrivacyActionOf(g_policy.Flags2, face);
+	}
+	void SetFlags2(ULONG flags2) noexcept { g_policy.Flags2 = flags2; }
 	void ResetPolicy() noexcept
 	{
 		// ★ 这里**不能**写 `g_policy = {};` —— MSVC 14.51.36231 对

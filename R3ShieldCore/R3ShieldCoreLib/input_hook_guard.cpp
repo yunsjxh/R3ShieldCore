@@ -274,15 +274,26 @@ namespace
 		//    而那个线程**只在 ASK 模式启动** —— LOG/BLOCK 下调 Ask 会等
 		//    一个永远不来的答复（实测表现：LOG 模式下被当成 Deny，
 		//    直接 BLOCK 掉，而 LOG 模式不该拦任何东西）。
-		const bool canAsk = allowAsk && (mode == static_cast<ULONG>(R3ShieldCore::Mode::Ask));
+		// ★ v132：这一面的处置档由配置决定（ini: privacy_input_hook=record|ask|block）。
+		const R3ShieldCore::ObjectType face =
+			static_cast<R3ShieldCore::ObjectType>(event.ObjectType);
+		const R3ShieldCore::PrivacyAction privacy =
+			R3ShieldCore::PrivacyActionOf(policy ? policy->Flags2 : 0, face);
+		const bool privacyAsk = R3ShieldCore::IsPrivacyFace(face)
+			&& privacy == R3ShieldCore::PrivacyAction::Ask
+			&& mode == static_cast<ULONG>(R3ShieldCore::Mode::Block);
+
+		const bool canAsk = allowAsk
+			&& (mode == static_cast<ULONG>(R3ShieldCore::Mode::Ask) || privacyAsk);
 		if (!canAsk) {
 			if (mode == static_cast<ULONG>(R3ShieldCore::Mode::Block)) {
-				// ★ v129：隐私面在 block 下**不硬拒**。
+				// ★ v132：非 Block 档（Record / 问不了的 Ask）⇒ 只记录。
 				//   输入钩子是"知情类"：输入法、游戏、远程控制、屏幕取词
 				//   全都要装钩子，硬拒的表现是"打字没反应 / 游戏按键失灵"。
-				//   只记录 + 标 WouldBlock；真要拦用 mode=block_all。
-				if (R3ShieldCore::IsPrivacyFace(
-						static_cast<R3ShieldCore::ObjectType>(event.ObjectType))) {
+				//   ⚠️ 本面**没有** spoof 通道（钩子没法"装成功但不生效"），
+				//      所以这里没有 RejectOrSpoof 分支。
+				if (R3ShieldCore::IsPrivacyFace(face)
+						&& privacy != R3ShieldCore::PrivacyAction::Block) {
 					event.Decision = static_cast<ULONG>(R3ShieldCore::Decision::WouldBlock);
 					return Action::Record;
 				}
@@ -1234,12 +1245,13 @@ namespace InputHookGuardTest
 {
 	// idHook 传 WH_KEYBOARD_LL / WH_KEYBOARD；threadId=0 表示全局钩子
 	// （Win32 定义：dwThreadId==0 ⇒ 系统注入到所有同类 GUI 线程）。
+	// ★ v132：`allowAsk` 从形参传进来（v129 时写死 false）。
 	int EvaluateForTest(ULONG op, int idHook, ULONG threadId, bool rawSink,
-		int* decisionOut, ULONG* flagsOut) noexcept
+		bool allowAsk, int* decisionOut, ULONG* flagsOut) noexcept
 	{
 		R3ShieldCore::Event event = {};
 		const Action action = Evaluate(static_cast<R3ShieldCore::HookOp>(op),
-			event, /*allowAsk=*/false, idHook, threadId, rawSink);
+			event, allowAsk, idHook, threadId, rawSink);
 		if (decisionOut) *decisionOut = static_cast<int>(event.Decision);
 		if (flagsOut)    *flagsOut = event.Flags;
 		return static_cast<int>(action);

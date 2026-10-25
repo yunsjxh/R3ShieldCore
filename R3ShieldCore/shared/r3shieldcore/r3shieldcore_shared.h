@@ -20,7 +20,16 @@ namespace R3ShieldCore
 {
 	constexpr ULONG PolicyMagic = 0x31504752;  // 'RGP1'
 	constexpr ULONG ChannelMagic = 0x31454752; // 'RGE1'
-	constexpr ULONG AbiVersion = 26;           // 26: ★ 摄像头**帧替换**（v73）—— `Policy::Flags2` 新增一个
+	constexpr ULONG AbiVersion = 27;           // 27: ★ 截屏替换的**外部图片源**（v134）——
+	                                           //     `Policy` **尾部追加** `SpoofScreenImagePath[]`
+	                                           //     ⇒ `sizeof(Policy)` **变了**，这是**布局**升版，
+	                                           //     必须挡（理由同 20/22）：旧 DLL 映射 `sizeof(旧)`
+	                                           //     仍能成功，但尾部字段偏移全错 ⇒ 它会把
+	                                           //     `SpoofScreenImagePath` 读成别的字节，拿垃圾路径
+	                                           //     去 `LoadImageW`（最坏每个文件一次失败尝试）。
+	                                           //     升版本 ⇒ 新旧混用落到「共享通道不可用 ⇒ 本进程
+	                                           //     跳过全部 Hook」，而不是"拿错位内存当路径"。
+	                                           // 26: ★ 摄像头**帧替换**（v73）—— `Policy::Flags2` 新增一个
 	                                           //     **位** `FlagSpoofCamera`（0x800）。**布局不变**，
 	                                           //     与 25/24/23/19 同一个理由（**语义**升版）：
 	                                           //     旧 DLL 不认识本位 ⇒ 它会在 `MFCreateSourceReaderFromMediaSource`
@@ -380,7 +389,7 @@ enum class ObjectType : ULONG
 };
 
 	// ------------------------------------------------------------------
-	// 「知情类」面：mode=block 下**不硬拒**，只记录。
+	// 「知情类」面：命中高危后**怎么处置由用户配置**（v132 起）。
 	//
 	// 为什么需要这个区分：
 	//   这几类的判据不是"会破坏数据"，而是"需要用户知情"（见上面
@@ -390,8 +399,11 @@ enum class ObjectType : ULONG
 	//     · 屏幕 BitBlt —— 截图 / 录屏 / 部分 UI 自绘 ⇒ 黑屏
 	//     · 摄像头 / 麦克风 —— 视频通话打不开
 	//     · 输入钩子 —— 输入法 / 游戏 / 远控全废
-	//   所以 block 对它们的语义是"看得见、不打断"（记录 + WouldBlock）。
-	//   真要连隐私面一起拦，用 mode=block_all（它本来就"不看豁免、不问"）。
+	//
+	// ★ 历史：v129 把"只记录"**硬编码**在四个 guard 里。问题是它没有
+	//   中间档 —— 想要"每次问一下"的用户只能整机切 mode=ask（那时
+	//   破坏类也一起变问），想要"直接拦"的用户只能切 block_all（那时
+	//   连文件/注册表都不看豁免了）。**面级处置**才是这里缺的那一层。
 	//
 	// ⚠️ 破坏类面**不在此列**，block 下照拦：注册表持久化 / 系统文件 /
 	//    服务 / 驱动 / 计划任务 / COM 劫持 / 令牌窃取 / 跨进程注入。
@@ -407,6 +419,95 @@ enum class ObjectType : ULONG
 		default:
 			return false;
 		}
+	}
+
+	// ------------------------------------------------------------------
+	// 隐私面处置档（v132）。ini: privacy_camera / privacy_input_hook /
+	//                              privacy_screen / privacy_clipboard
+	//
+	// 语义（只影响 **mode=block** 下、**命中高危**的那一次调用）：
+	//
+	//   Record —— 记录 + 标 WouldBlock，**不打断**（v129 的行为，默认）
+	//   Ask    —— 弹窗询问；用户点允许就照做，拒绝才拒
+	//   Block  —— 直接拒绝（= v128 之前 block 的老行为）
+	//
+	// 为什么默认仍是 Record：
+	//   block 是随包默认预设，装上去第一小时就要能用。把这几个面默认
+	//   改成 Ask 会立刻弹窗轰炸（剪贴板 Read 每次 Ctrl+V 都走），改成
+	//   Block 会让粘贴/截图/摄像头直接失效 —— 两种都会让人以为系统坏了。
+	//   想要更严的人自己拨，拨完**必须重启引擎**（位在 Policy 里）。
+	//
+	// ⚠️ 与 `mode=block_all` 的关系：全拦模式**不看这一层**，一律拒
+	//    （铁律 165：全拦下不开后门）。
+	// ⚠️ 与 `spoof_*` 的关系：Record / Block 两档都会先看替换开关 ——
+	//    "调用成功、数据是假的"比"只记录"保护得更好，也比"硬拒"不打断。
+	enum class PrivacyAction : ULONG
+	{
+		Record = 0, // 只记录（默认）
+		Ask = 1,    // 弹窗询问
+		Block = 2,  // 直接拒绝
+		// 3 未定义 —— 按 Block 处理（写错一位就 fail-closed，而不是静默放行）
+	};
+
+	constexpr ULONG PrivacyActionMask = 0x3;
+
+	// 每面 2 位，放在 `Policy::Flags2` 的 bit12 起（bit0~11 已用）。
+	//
+	// ⚠️ 为什么**不**复用现有的 `FlagHookCamera` 等开关：那是"要不要装
+	//    hook"（监控范围），这里是"命中之后怎么办"（处置）。两件事
+	//    混在一位里，就会出现"想关处置但连监控一起关了"。
+	inline ULONG PrivacyActionShift(ObjectType type) noexcept
+	{
+		switch (type)
+		{
+		case ObjectType::Camera:    return 12;
+		case ObjectType::InputHook: return 14;
+		case ObjectType::Screen:    return 16;
+		case ObjectType::Clipboard: return 18;
+		default:                    return 0xFFFFFFFFu; // 非隐私面：不适用
+		}
+	}
+
+	// 读某面的处置档。非隐私面返回 Record（调用方本来也不该问）。
+	inline PrivacyAction PrivacyActionOf(ULONG flags2, ObjectType type) noexcept
+	{
+		const ULONG shift = PrivacyActionShift(type);
+		if (shift >= 32) {
+			return PrivacyAction::Record;
+		}
+
+		switch ((flags2 >> shift) & PrivacyActionMask) {
+		case 1:  return PrivacyAction::Ask;
+		case 2:  return PrivacyAction::Block;
+		case 0:  return PrivacyAction::Record;
+		default: return PrivacyAction::Block; // 3：未定义 ⇒ fail-closed
+		}
+	}
+
+	// 写某面的处置档（只动这 2 位，不碰别的面）。
+	inline ULONG SetPrivacyAction(ULONG flags2, ObjectType type, PrivacyAction action) noexcept
+	{
+		const ULONG shift = PrivacyActionShift(type);
+		if (shift >= 32) {
+			return flags2;
+		}
+
+		flags2 &= ~(PrivacyActionMask << shift);
+		flags2 |= (static_cast<ULONG>(action) & PrivacyActionMask) << shift;
+		return flags2;
+	}
+
+	// 有没有**任何**一个隐私面被设成 Ask。
+	//
+	// 用途：引擎侧决定"要不要把询问通道当常驻能力"（打印/自检用），
+	// 以及配置页提示"你开了会弹窗的档"。判定本身仍然逐面走
+	// `PrivacyActionOf`，**不要**用这个代替。
+	inline bool AnyPrivacyFaceAsks(ULONG flags2) noexcept
+	{
+		return PrivacyActionOf(flags2, ObjectType::Camera) == PrivacyAction::Ask
+			|| PrivacyActionOf(flags2, ObjectType::InputHook) == PrivacyAction::Ask
+			|| PrivacyActionOf(flags2, ObjectType::Screen) == PrivacyAction::Ask
+			|| PrivacyActionOf(flags2, ObjectType::Clipboard) == PrivacyAction::Ask;
 	}
 
 	// 文件的写类操作。数值从 1 开始，与注册表的 Op 各自独立
@@ -426,6 +527,12 @@ enum class ObjectType : ULONG
 		SetSecurity = 7,   // NtSetSecurityObject —— 改 ACL
 		SetEa = 8,         // NtSetEaFile —— 扩展属性
 		Truncate = 9,      // NtSetEndOfFileInformation —— 截断
+		//
+		// ★ v133：读。**只在 `spoof_file=1` 时才会产生这个事件** ——
+		//   文件读默认一个 hook 都不挂（太热，见上面 FileOp 那段注释）。
+		//   加这个值不改 `Event` 布局（`Op` 本来就是 `ULONG`）⇒ ABI 不变。
+		//
+		Read = 10,         // NtReadFile —— 读文件（仅用于"替换"上报）
 	};
 
 	//
@@ -1374,6 +1481,80 @@ enum class ObjectType : ULONG
 	constexpr ULONG FlagSpoofCamera = 0x00000800; // 摄像头帧"替换"而非拒绝（返回中性帧），默认**关**（v73）
 
 	//
+	// v133：**文件读替换**（ini: `spoof_file`，默认**关**）。
+	//
+	// 语义：读**受保护路径**（`protect_file=` 前缀命中）的文件时，`NtReadFile`
+	//   调用**成功返回**，但调用方缓冲区里被写入的是**全 0 字节**
+	//   （`Decision::Spoofed`）。⇒ 目标程序"文件打开了、也读到了、长度也对"，
+	//   只是内容不是真的。
+	//
+	// ★★ 为什么是"同长度清零"而不是"换成一段指定文本"：
+	//   文件是**按块、带偏移**读的 —— 同一次 `NtReadFile` 可能读 0 号块，
+	//   也可能读第 3MB 处的块（`ByteOffset` 由调用方给，甚至可以为 NULL
+	//   表示"接着上次的位置读"）。把内容换成固定字符串会**破坏偏移语义**：
+	//   调用方要第 N 字节，我们给的却是字符串的第 N 字节，读出来的东西
+	//   与"这个文件本来是什么"完全无关，而且分段读和一次读整文件的结果
+	//   会**不一致**（同一个文件两种内容）。
+	//   ⇒ 清零是唯一"对任意偏移、任意分块、任意并发读都自洽"的替代物：
+	//     第 N 字节永远是 0。这与 v71 注册表值"同长度、数据区清零"
+	//     是**同一条规则**（`registry_spoof_codec.h` 的 fallbackFill = 0）。
+	//
+	// ★ 清零后**结构上仍然合法**：长度不变、状态码不变、`IoStatusBlock->Information`
+	//   不变、偏移语义不变 ⇒ 调用方不会读越界、不会算错长度。
+	//   ⚠️ 但**内容解析会失败**（文本变 NUL、PE 头全 0）—— 这正是本功能的
+	//   目的（"读不到真内容"），**不是缺陷**。对外口径不能说"返回一个假文件"，
+	//   只能说"长度一样、内容为零"（铁律 97：口径必须与实际一致）。
+	//
+	// ★★ 触发面**只有** `protect_file=`（用户显式声明的保护路径），
+	//   **不用**内置高危文件表 —— 后者包含 `hosts`、`System32\drivers\*`
+	//   这类**正常软件天天读**的路径，拿来当替换触发面会大面积误伤。
+	//   语义上更顺：**"保护" = 写不进 + 读不到（读到的是零）**。
+	//   与 v71 用 `protect_reg=` 而不是内置高危注册表表，是同一个理由。
+	//
+	// ★★★ 实现上与前五个面**根本不同**，这是本面唯一的真难点：
+	//   注册表/剪贴板/屏幕/摄像头都是"**一次调用、一进一出**"——
+	//   数据就在这一次调用的参数里，改完就完事。
+	//   文件是"**先拿句柄，之后任意次读**"—— `NtReadFile` 的参数里
+	//   **没有路径**，只有一个 `HANDLE`。所以必须：
+	//     ① 在 `NtCreateFile` / `NtOpenFile` 成功时记下"这个句柄指向受保护文件"
+	//        （进程级小表，见 `file_guard.cpp` 的 `MarkProtectedHandle`）；
+	//     ② `NtReadFile` 里按句柄查表，命中才清零；
+	//     ③ `NtClose` 时**擦掉**这条记录 —— 否则句柄值被系统复用给**别的**
+	//        文件（或管道）时，我们会去清一个**无关**读的缓冲区
+	//        （静默数据损坏，比不替换严重得多）。
+	//   ⇒ 所以本开关**会连带安装 4 个 hook**（CreateFile / OpenFile / ReadFile /
+	//     Close），而其余五个 spoof 面各自只装 1 个。**默认关**正是因为这个：
+	//     文件 I/O 是整机最热的路径，`hook_file` 默认关也是同一个理由。
+	//
+	// ★ 覆盖范围：**读路径，与 `mode` 无关**（与 v71 注册表同构）。
+	//   理由：文件读**从来不会被拒**（`blockable=false`，拒了全系统都起不来），
+	//   所以这里不存在"本应拒绝"这个前提，也就没有"只在拒绝时替换"的说法。
+	//   ⚠️ 因此 `mode=log` 下**也会**清零 —— 这与 `spoof_screen`/`spoof_clipboard`
+	//   的行为**不同**（那两个只在"本应拒绝"时替换）。差异是真实的，
+	//   见 `tools/spoof_e2e.sh` 的 C 格（就是专门用来把这条差异证出来的）。
+	//
+	// ⚠️ 前置条件（三条，缺一不可）：
+	//   ① 必须配了 `protect_file=`（否则没有任何路径是"受保护"⇒ 本开关空转）；
+	//   ② 必须能挂上 4 个文件 hook（挂不上 ⇒ 什么都不做，日志吵）；
+	//   ③ 被读的文件必须在**本进程内**用 `NtCreateFile`/`NtOpenFile` 打开过
+	//      （见下面的盲区第 1 条）。
+	//
+	// ⚠️ **不覆盖**（诚实标注，都是真实的绕过路径）：
+	//   · **内存映射**（`NtCreateSection` + `NtMapViewOfSection`）—— 走的是页错误
+	//     而不是 `NtReadFile`，**完全不经过我们**。这是最大的一个洞：
+	//     把受保护文件映射进来再读，能拿到**完整真内容**；
+	//   · **`NtReadFileScatter`**（分散/聚集读）—— 未挂；
+	//   · **进程启动前就打开的句柄**（父进程继承、`DuplicateHandle` 复制）
+	//     —— 我们没记过它 ⇒ 查表不命中 ⇒ **放行真内容**（fail-open）；
+	//   · **直 syscall / 内核态读**（`NtReadFile` 的新号 syscall 直调）—— 绕过用户态 hook；
+	//   · **`CopyFile` / `robocopy` 的服务端拷贝**（`FSCTL_*` 内核路径）—— 未覆盖；
+	//   · **别的进程**读同一个文件 —— 我们只在**被注入进程内**生效。
+	//   定位与其余五个面一致：**提高成本，不是硬边界**。
+	//   见 docs/回传数据替换-多路径盘点.md。
+	//
+	constexpr ULONG FlagSpoofFile = 0x00200000; // 文件读"替换"而非放行（回传缓冲区清零、长度不变），默认**关**（v133）
+
+	//
 	// v68：**测试模式**（ini: `mode=test`，默认**关**）。
 	//
 	// 动机：引擎的正常工作是**全局注入**所有非系统进程 —— 包括你正在用的
@@ -1545,6 +1726,33 @@ enum class ObjectType : ULONG
 		//
 		ULONG TestInjectCount;
 		WCHAR TestInjectPaths[MaxTestInjectPaths][MaxTestInjectPathChars];
+
+		//
+		// ★ v134：**截屏替换的外部图片来源**（ini 的 `spoof_screen_image=`）。
+		//
+		// 语义：`spoof_screen=1` 且本字段非空 ⇒ 截屏替换不再返回**黑帧**，
+		//   而是把这张图**拉伸铺满**被截取的区域。空 ⇒ 保持 v67 的黑帧（默认）。
+		//   读不到 / 不是受支持的图片 ⇒ **回落黑帧**（fail-closed：
+		//   宁可给它一张黑图，也绝不放过真画面 —— 铁律 12/13 同款）。
+		//
+		// ★ 为什么放 `Policy`（要升 ABI）而不是另开一个共享节：
+		//   ① 注入进程本来就要映射 `Policy`，多一个节要再维护一套 DACL /
+		//      handshake / 版本校验，成本远高于一个 520 字节的尾部字段；
+		//   ② 路径是**配置**，天然属于 `Policy`；图片的**像素**不进这里
+		//      （那会变成几 MB 的共享内存，且每个进程都要按自己 DPI 缩放）。
+		//   ③ 由**注入进程自己** `LoadImageW` 解码并缓存（见
+		//      `screen_spoof_image.h`）—— 只在首次替换时付一次代价。
+		//
+		// ⚠️ **尾部追加**：前面所有字段偏移不动。
+		// ★ 但它让 `sizeof(Policy)` 变大 ⇒ **本版 AbiVersion 升到 27**。
+		//   为什么"能映射成功"还不够：旧 DLL 用旧 `sizeof` 映射也成功，
+		//   然后按旧布局去读后面的字段 ⇒ 会把本字段读成别的字节，
+		//   拿一段垃圾当路径反复 `LoadImageW`。靠版本校验挡掉。
+		//
+		// ⚠️ 长度上限 `MaxProtectPathChars`（260）：与 `protect_*` 同一口径。
+		//   超长路径在配置解析时会**整条拒绝**（不是截断 —— 截断后的路径
+		//   会指向另一个文件，那是"替换成错的东西"，比不替换更糟）。
+		WCHAR SpoofScreenImagePath[MaxProtectPathChars];
 	};
 
 	// ---------------------------------------------------------------------

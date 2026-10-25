@@ -216,7 +216,7 @@ static void TestNextStepHint()
 	Check("empty -> start with Dang",
 		Hint(L"") == L"每条规则都以「当」开头");
 	Check("only Dang -> write face",
-		Hint(L"当") == L"写面：注册表值 / 注册表枚举 / 剪贴板");
+		Hint(L"当") == L"写面：注册表值 / 注册表枚举 / 剪贴板 / 文件 / 截屏");
 	Check("face only -> write operator",
 		Hint(L"当 注册表值") == L"写算子：等于 / 含 / 匹配 / 开头 / 结尾");
 	Check("face+de -> write operator",
@@ -227,13 +227,13 @@ static void TestNextStepHint()
 		Hint(L"当 注册表值 的 值名 含 \"a\"") == L"写「时」");
 	Check("+Shi -> write action",
 		Hint(L"当 注册表值 的 值名 含 \"a\" 时")
-			== L"写动作：替换为 … / 隐藏 / 拒绝 / 放行");
+			== L"写动作：替换为 … / 替换为图 …（截屏面）/ 隐藏（枚举面）/ 拒绝 / 放行");
 	Check("complete -> empty hint",
 		Hint(L"当 注册表值 的 值名 含 \"a\" 时 替换为 \"b\"") == L"");
 
 	// 省略字段也认（字段是可选段）
 	Check("field omitted -> still walks to action",
-		Hint(L"当 剪贴板 含 \"a\" 时") == L"写动作：替换为 … / 隐藏 / 拒绝 / 放行");
+		Hint(L"当 剪贴板 含 \"a\" 时") == L"写动作：替换为 … / 替换为图 …（截屏面）/ 隐藏（枚举面）/ 拒绝 / 放行");
 	Check("clipboard full rule -> empty hint",
 		Hint(L"当 剪贴板 的 格式 等于 文本 时 替换为 \"x\"") == L"");
 

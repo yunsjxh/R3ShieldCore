@@ -32,17 +32,59 @@
  *    所以 build.sh 里是先 cd 到 R3ShieldCore/ 再把相对路径喂给 rc.exe 的
  *    （与 cl.exe 相同的约定，见 build.sh 开头的注释）。
  *
- *  ★ 版本信息为什么不在这里写
+ *  ★ 版本信息（v1.0.1 修正）
  *  ==========================
- *  link.exe 会**自动**根据 /VERSION:65.0.0.0 生成一份 VS_VERSION_INFO。
- *  如果这里再写一份，资源表里会出现两个 VERSION 条目 —— 资源管理器读到的
- *  可能是没有 FileDescription 的那一份（实测：详细信息里产品名是空的）。
- *  所以版本信息统一交给 build.sh 的 /VERSION 开关，本文件只管图标。
- *  （对比：installer/r3sc_setup.rc 是 gcc 链接的，没有那个开关，
- *    所以它**必须**手写 VS_VERSION_INFO —— 两边不一样是因为链接器不同。）
+ *  ★★★ 这里原来写着"link.exe 会**自动**根据 /VERSION 生成一份 VS_VERSION_INFO，
+ *    所以本文件只管图标" —— **那是错的**，而且是"看着配了其实没有"的典型：
+ *      · link 的 `/VERSION:x.y` 只写进 PE 可选头的 **ImageVersion** 两个字段，
+ *        它**不是**资源，也不会生成 RT_VERSION；
+ *      · 实测（v1.0.1 出包前）：主程序的资源类型只有 [3(ICON), 14(GROUP_ICON),
+ *        24(MANIFEST)]，**没有 16(RT_VERSION)** ⇒ 资源管理器「详细信息」里
+ *        文件版本/产品版本全是空，右键属性看不到任何版本号。
+ *    ⇒ 现在版本信息**写在本文件里**（与 installer/r3sc_setup.rc、tools/
+ *      r3shieldcore_cfg.rc 一样），/VERSION 只当镜像版本号用，两者不再互相依赖。
+ *    ⚠️ 原来那句"两边都写会出现两个 VERSION 条目"的担心不成立 ——
+ *      /VERSION 根本不产生资源条目，所以不存在重复。
+ *    ⚠️ 版本号必须与仓库根的 `VERSION` 文件一致（闸门 check_dist_sync.sh 会比对）。
  * ==========================================================================*/
+
+/* 源码是 UTF-8 无 BOM，而 rc.exe 默认按系统代码页(936)解 —— 下面有中文
+ * 字符串，必须显式声明代码页（与 tools/r3shieldcore_cfg.rc 同一写法）。 */
+#pragma code_page(65001)
 
 #include <winresrc.h>
 
 /* 引擎 exe 的图标。ID 用 1（约定值），代码里按 MAKEINTRESOURCE(1) 取。 */
 1 ICON "r3shieldcore.ico"
+
+/* 版本信息。
+ * 语言块 080404b0 = 简体中文(0x0804) + Unicode(0x04b0)。
+ * Translation 的值必须和语言块对应，否则资源管理器里「详细信息」是空的。 */
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION    1,0,1,0
+ PRODUCTVERSION 1,0,1,0
+ FILEFLAGSMASK  0x3fL
+ FILEFLAGS      0x0L
+ FILEOS         0x40004L
+ FILETYPE       0x1L
+ FILESUBTYPE    0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "080404b0"
+        BEGIN
+            VALUE "CompanyName",      "R3 ShieldCore"
+            VALUE "FileDescription",  "R3 ShieldCore 主程序"
+            VALUE "FileVersion",      "1.0.1.0"
+            VALUE "InternalName",     "R3 ShieldCore"
+            VALUE "LegalCopyright",   "R3 ShieldCore"
+            VALUE "OriginalFilename", "R3 ShieldCore.exe"
+            VALUE "ProductName",      "R3 ShieldCore"
+            VALUE "ProductVersion",   "1.0.1.0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x804, 1200
+    END
+END

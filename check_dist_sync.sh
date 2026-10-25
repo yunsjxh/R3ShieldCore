@@ -2139,7 +2139,8 @@ for v129_arch in 32 64; do
         continue
     fi
     v129_stale=0
-    for v129_src in camera_guard.cpp clipboard_guard.cpp screen_guard.cpp input_hook_guard.cpp; do
+    for v129_src in camera_guard.cpp clipboard_guard.cpp screen_guard.cpp input_hook_guard.cpp \
+                    r3shieldcore_prompt.cpp r3shieldcore_prompt_ui.cpp r3shieldcore_decision_cache.h; do
         [ "$V129_REL" -nt "$V129_LIBDIR/$v129_src" ] || v129_stale=1
     done
     [ "$V129_REL" -nt "$PROJECT_ROOT/R3ShieldCore/shared/r3shieldcore/r3shieldcore_shared.h" ] \
@@ -2152,9 +2153,869 @@ for v129_arch in 32 64; do
     fi
 done
 
+# === v130：决策缓存必须覆盖**全部**目标参数 ===
+#
+# 用户要求「同参数不过问，不同参数还是要问」。这里的"参数"= 该面的全部目标字段。
+# 漏一个 ⇒ 那个维度就变成"不问"，而且**看不出来**（日志里两条规则长得一样）。
+# 判据与 `tools/v130_decision_cache_ut.cpp` 的变异测试等价：
+# 把任一 `request.Xxx` 从签名里删掉，这里立刻红。
+echo ""
+echo "=== v130 决策缓存：参数覆盖 ==="
+V130_HDR="$PROJECT_ROOT/R3ShieldCore/R3ShieldCoreLib/r3shieldcore_decision_cache.h"
+if [ ! -f "$V130_HDR" ]; then
+    echo "[FAIL] 找不到 $V130_HDR"
+    fail=1
+else
+    for v130_param in ObjectType Op TargetKind KeyPath ValueName DllPath CommandLine TargetPort NetProtocol; do
+        if grep -q "request\.$v130_param" "$V130_HDR"; then
+            echo "[ OK ] 目标签名含 $v130_param"
+        else
+            echo "[FAIL] 目标签名漏了 $v130_param —— 这个维度会变成「不同参数也不问」"
+            fail=1
+        fi
+    done
+
+    # 旧的前缀匹配必须已经消失（它正是"换值名/换子键也放行"的来源）。
+    if grep -q "IsKeyPrefixMatch" "$PROJECT_ROOT/R3ShieldCore/R3ShieldCoreLib/r3shieldcore_prompt_ui.cpp"; then
+        echo "[FAIL] prompt_ui.cpp 里还留着 IsKeyPrefixMatch —— 前缀匹配没被换掉"
+        fail=1
+    else
+        echo "[ OK ] 旧的前缀匹配已移除（改成全量签名比较）"
+    fi
+
+    # 负对照：不存在的参数名必须搜不到（证明上面的 grep 不是恒真）。
+    if grep -q "request\.THIS_PARAM_MUST_NOT_EXIST" "$V130_HDR"; then
+        echo "[FAIL] 负对照失败：不存在的参数名居然搜到了 ⇒ 检索不可信"
+        fail=1
+    else
+        echo "[ OK ] 负对照：不存在的参数名搜不到（检索有效）"
+    fi
+fi
+
+# === v132：隐私面处置可配（record / ask / block）===
+#
+# 这条链路有**四处**必须同时改对，漏一处就静默失效：
+#   ① shared.h    —— 位布局（每面 2 位）
+#   ② 四个 guard  —— 按配置分流
+#   ③ 引擎解析    —— ini 键 → 位
+#   ④ cfg 界面    —— 用户能拨到
+#   再加上随包 ini 默认值。任何一处漏了，症状都是"界面上能选，但没效果"。
+echo ""
+echo "=== v132 隐私面处置（record / ask / block）==="
+V132_SHARED="$PROJECT_ROOT/R3ShieldCore/shared/r3shieldcore/r3shieldcore_shared.h"
+V132_CFG="$PROJECT_ROOT/tools/r3shieldcore_cfg.cpp"
+V132_ENGCFG="$PROJECT_ROOT/R3ShieldCore/R3ShieldCore/r3shieldcore_config.cpp"
+
+# ① 三档齐全
+for v132_tier in "Record = 0" "Ask = 1" "Block = 2"; do
+    if grep -qP "^\t\t$v132_tier" "$V132_SHARED"; then
+        echo "[ OK ] PrivacyAction 有档位 $v132_tier"
+    else
+        echo "[FAIL] PrivacyAction 缺档位 $v132_tier"
+        fail=1
+    fi
+done
+
+# ② 位移钉死（12/14/16/18）—— 重排位会让引擎与 DLL 的位约定错位
+for v132_shift in 12 14 16 18; do
+    if grep -A14 "inline ULONG PrivacyActionShift" "$V132_SHARED" | grep -q "return $v132_shift;"; then
+        echo "[ OK ] 位移 $v132_shift 在用"
+    else
+        echo "[FAIL] 位移 $v132_shift 不见了 —— 位布局被改，旧 DLL 会读错档"
+        fail=1
+    fi
+done
+
+# ③ 四个 guard 都读了配置（少一个 = 那个面选什么都不生效）
+for v132_g in camera_guard clipboard_guard screen_guard input_hook_guard; do
+    if grep -q "^[^/]*R3ShieldCore::PrivacyActionOf(" "$PROJECT_ROOT/R3ShieldCore/R3ShieldCoreLib/$v132_g.cpp"; then
+        echo "[ OK ] $v132_g.cpp 读了 PrivacyActionOf"
+    else
+        echo "[FAIL] $v132_g.cpp 没读 PrivacyActionOf —— 这个面的配置是摆设"
+        fail=1
+    fi
+done
+
+# ④ 引擎解析表里四个键都在
+for v132_key in privacy_camera privacy_input_hook privacy_screen privacy_clipboard; do
+    if grep -q "\"$v132_key\"" "$V132_ENGCFG"; then
+        echo "[ OK ] 引擎解析认 $v132_key"
+    else
+        echo "[FAIL] 引擎解析不认 $v132_key —— 写进 ini 也没用"
+        fail=1
+    fi
+    # ⑤ cfg 界面能拨到（Kind::Enum + 键名）
+    if grep -q "L\"$v132_key\"" "$V132_CFG"; then
+        echo "[ OK ] cfg 界面有 $v132_key"
+    else
+        echo "[FAIL] cfg 界面没有 $v132_key —— 用户只能手改 ini"
+        fail=1
+    fi
+    # ⑥ 随包 ini 带默认值
+    if grep -q "^$v132_key=" "$DIST_DIR/r3shieldcore.ini"; then
+        echo "[ OK ] 随包 ini 有 $v132_key"
+    else
+        echo "[FAIL] 随包 ini 没有 $v132_key"
+        fail=1
+    fi
+done
+
+# ⑦ 默认值必须是 record（发布闸门同款断言，这里查文本是为了先给一句人话）
+if grep -q "^privacy_clipboard=record" "$DIST_DIR/r3shieldcore.ini"; then
+    echo "[ OK ] privacy_clipboard 随包默认 = record（不会让 Ctrl+V 失效）"
+else
+    echo "[FAIL] privacy_clipboard 随包默认不是 record —— 装上去粘贴可能直接失效"
+    fail=1
+fi
+
+# ⑧ 产物：双架构 DLL 必须比 v132 的源码新
+for v132_arch in 32 64; do
+    V132_REL="$PROJECT_ROOT/R3ShieldCore/Release/$v132_arch/r3shieldcore-lib.dll"
+    if [ ! -f "$V132_REL" ]; then
+        echo "[FAIL] 找不到 $V132_REL"
+        fail=1
+        continue
+    fi
+    v132_stale=0
+    for v132_src in camera_guard.cpp clipboard_guard.cpp screen_guard.cpp \
+                     input_hook_guard.cpp r3shieldcore_shared.h; do
+        v132_path="$PROJECT_ROOT/R3ShieldCore/R3ShieldCoreLib/$v132_src"
+        [ -f "$v132_path" ] || v132_path="$PROJECT_ROOT/R3ShieldCore/shared/r3shieldcore/$v132_src"
+        [ "$V132_REL" -nt "$v132_path" ] || v132_stale=1
+    done
+    if [ "$v132_stale" -eq 0 ]; then
+        echo "[ OK ] $v132_arch 位 DLL 比 v132 的四个 guard + shared.h 都新"
+    else
+        echo "[FAIL] $v132_arch 位 DLL 比某个 v132 源文件旧 —— 改了源码没重编（跑 build.sh）"
+        fail=1
+    fi
+done
+
+# ⑨ 负对照：不存在的键必须搜不到
+if grep -q "privacy_THIS_KEY_MUST_NOT_EXIST" "$V132_ENGCFG" "$V132_CFG" 2>/dev/null; then
+    echo "[FAIL] 负对照失败：不存在的键居然搜到了 ⇒ 检索不可信"
+    fail=1
+else
+    echo "[ OK ] 负对照：不存在的键搜不到（检索有效）"
+fi
+
+# === v133：文件读替换（spoof_file）===
+#
+# 这条链路比前面几个面**多一处**必须同时改对 —— 它有**接线**问题：
+#   ① shared.h        —— 位 + 语义
+#   ② codec           —— 句柄表 / 清零判定（生产与探针共用）
+#   ③ file_guard      —— **两个 open 钩子都要调 RememberProtectedHandle**
+#                         （少一个 ⇒ 走那条路的句柄永远不受保护，静默失效）
+#   ④ Install         —— **必须真的把 NtReadFile / NtClose 挂上**
+#                         （漏了 ⇒ 表记得再好也没人去查，一个字都不会替换）
+#   ⑤ 引擎解析        —— ini 键 → 位
+#   ⑥ cfg 界面        —— 总闸那行要看得到
+#   ⑦ 随包 ini        —— 默认值与说明
+# ★ ③④ 是"接线"，是这一面最容易漏、且**探针也发现不了**的两处
+#   （探针自己搭台子，不经过生产的 Install/open 钩子）⇒ 只能靠静态判据钉住。
+echo ""
+echo "=== v133 文件读替换（spoof_file）==="
+V133_SHARED="$PROJECT_ROOT/R3ShieldCore/shared/r3shieldcore/r3shieldcore_shared.h"
+V133_GUARD="$PROJECT_ROOT/R3ShieldCore/R3ShieldCoreLib/file_guard.cpp"
+V133_CODEC="$PROJECT_ROOT/R3ShieldCore/R3ShieldCoreLib/file_spoof_codec.h"
+V133_PROBE="$PROJECT_ROOT/tools/spoof_file_probe.cpp"
+V133_ENGCFG="$PROJECT_ROOT/R3ShieldCore/R3ShieldCore/r3shieldcore_config.cpp"
+V133_CFG="$PROJECT_ROOT/tools/r3shieldcore_cfg.cpp"
+V133_INI="$PROJECT_ROOT/dist/R3ShieldCore-x64/r3shieldcore.ini"
+
+# ① 位定义（数值必须钉住：改了值而旧 DLL 还在跑 ⇒ 读到别的开关的位）
+if grep -q "FlagSpoofFile = 0x00200000" "$V133_SHARED"; then
+    echo "[ OK ] shared.h 有 FlagSpoofFile = 0x00200000"
+else
+    echo "[FAIL] shared.h 缺 FlagSpoofFile = 0x00200000（位值改了会与旧 DLL 撞位）"
+    fail=1
+fi
+
+# ② codec 存在且被生产 include（判据查 include 形态，不查裸名字）
+if [ -f "$V133_CODEC" ]; then
+    echo "[ OK ] file_spoof_codec.h 存在"
+else
+    echo "[FAIL] 缺 file_spoof_codec.h —— 生产与探针就没有共用实现（铁律 127）"
+    fail=1
+fi
+if grep -q '^#include "file_spoof_codec.h"' "$V133_GUARD"; then
+    echo "[ OK ] file_guard.cpp include 了 codec"
+else
+    echo "[FAIL] file_guard.cpp 没 include codec —— 它自己另写了一份实现？"
+    fail=1
+fi
+if grep -q '^#include "file_spoof_codec.h"' "$V133_PROBE"; then
+    echo "[ OK ] 探针也 include 同一份 codec（不是自己重写）"
+else
+    echo "[FAIL] 探针没 include codec —— 它验的是自己那套，证明不了生产代码"
+    fail=1
+fi
+
+# ③ 两个 open 钩子**都**要接线（少一个 = 走那条路的句柄永远不受保护）
+#    ★ 查"调用形态" `RememberProtectedHandle(`，不查裸名字：
+#      函数定义 + 注释里也有这个名字，裸名字会让判据恒绿（铁律 179 同族）。
+v133_wire="$(grep -c '^[^/]*RememberProtectedHandle(\*FileHandle' "$V133_GUARD" 2>/dev/null || true)"
+if [ "${v133_wire:-0}" -ge 2 ]; then
+    echo "[ OK ] NtCreateFile / NtOpenFile 两个钩子都调了 RememberProtectedHandle（$v133_wire 处）"
+else
+    echo "[FAIL] 只有 ${v133_wire:-0} 处 RememberProtectedHandle 调用（要 2 处）—— 有一个 open 路径的句柄不受保护"
+    fail=1
+fi
+
+# ④ Install 必须真的挂上两个 hook
+for v133_hook in NtReadFile NtClose; do
+    if grep -q "QueueHook(\"$v133_hook\"" "$V133_GUARD"; then
+        echo "[ OK ] Install 挂了 $v133_hook"
+    else
+        echo "[FAIL] Install 没挂 $v133_hook —— 句柄表记得再好也没人查，一个字都不会替换"
+        fail=1
+    fi
+done
+
+# ⑤ 防句柄复用的那个函数必须是"带 shouldProtect 的 Refresh"
+#    （v133 第一版是 MarkAfterForget = 先擦再**无条件**记，会把不受保护的
+#      复用句柄也记进去 ⇒ 误清无关读。探针 D3/D4 抓到过。）
+#
+# ★★ v135 改了签名：尾部多了 `const WCHAR* path = nullptr`（句柄表要存路径，
+#   因为 `NtReadFile` 只有 HANDLE 没有路径）。判据**只钉前缀** `shouldProtect`
+#   —— 钉整行的话，每加一个带默认值的参数就要来改闸门一次（判据前提搬家，
+#   铁律 185：搬家后它恒红，而红的原因跟被测事实无关）。
+if grep -q "bool Refresh(HANDLE handle, bool shouldProtect" "$V133_CODEC"; then
+    echo "[ OK ] codec 的覆盖式更新是 Refresh(handle, shouldProtect, ...)"
+else
+    echo "[FAIL] codec 缺 Refresh(handle, shouldProtect, ...) —— 句柄复用时可能误清无关读"
+    fail=1
+fi
+
+# ⑥ 引擎解析认 spoof_file
+if grep -q '"spoof_file"' "$V133_ENGCFG"; then
+    echo "[ OK ] 引擎解析认 spoof_file"
+else
+    echo "[FAIL] 引擎解析不认 spoof_file —— 写进 ini 也没用"
+    fail=1
+fi
+
+# ⑦ cfg 界面的总闸表里有它（漏了 ⇒ 用户看"总闸"看不出它开着，假信息）
+if grep -q '{ "spoof_file",' "$V133_CFG"; then
+    echo "[ OK ] cfg 总闸表里有 spoof_file"
+else
+    echo "[FAIL] cfg 总闸表里没有 spoof_file —— 界面会显示成关，而实际可能开着"
+    fail=1
+fi
+
+# ⑦b 总闸那行**必须**用 GetScalarRaw 取值
+#
+# ★★★ v133 修的老缺陷：`AdvSwitchOn` 原来用 `GetScalar`，而那个函数只认
+#   "配置页上真有控件的键"（`RebuildIndex` 里被 `FindKey` 过滤过）。
+#   `spoof_*` 六个开关全是 ini-only ⇒ 一个都不在表里 ⇒ 恒返回 "0"
+#   ⇒ 那行"总闸"**永远显示全关**。而它的全部意义就是告诉用户
+#   "你的规则没生效是因为 ini 里的总闸关着"（铁律 97：不能显示假信息）。
+#   实测：ini 里写着 spoof_reg=1 spoof_screen=1 spoof_file=1，界面仍是"全关"。
+if grep -A3 'bool AdvSwitchOn(const char\* key)' "$V133_CFG" | grep -q 'GetScalarRaw'; then
+    echo "[ OK ] 总闸那行用 GetScalarRaw 取值（能看到 ini-only 开关）"
+else
+    echo "[FAIL] 总闸那行又改回 GetScalar 了 —— 它会恒显示全关，是假信息"
+    fail=1
+fi
+if grep -q 'std::string GetScalarRaw' "$V133_CFG"; then
+    echo "[ OK ] 配置模型有 GetScalarRaw（不过滤未注册键）"
+else
+    echo "[FAIL] 配置模型缺 GetScalarRaw —— 总闸那行读不到 ini-only 键"
+    fail=1
+fi
+
+# ⑦c v133 续：六个 spoof_* 已升成配置页的**可拨开关**（进了 schema）
+#
+# ★ 为什么这条要进**发布闸门**（不是只放单测里）：键**不进 schema** 时，
+#   控件初值（`SetFieldFromConfig` 走 `GetScalar`）恒取默认值"关"，而
+#   `HarvestSection` 会把它判成"改过了" ⇒ 用户一按「保存」就把 ini 里的 1
+#   写成 0 —— **静默关掉他开着的替换**。
+#   现象是"保存一次之后替换自己没了"，几乎不可能联想到 schema 注册。
+if grep -q 'const KeyDef kSecSpoof\[\]' "$V133_CFG"; then
+    echo "[ OK ] cfg 有 kSecSpoof 分区（六个替换开关的 schema）"
+else
+    echo "[FAIL] cfg 没有 kSecSpoof 分区 —— 六个开关又变回只能看不能拨"
+    fail=1
+fi
+if grep -q '{ L"回传数据替换", kSecSpoof,' "$V133_CFG"; then
+    echo "[ OK ] kSecSpoof 已挂进左栏分区表（界面看得到）"
+else
+    echo "[FAIL] kSecSpoof 没挂进 kSections —— 建了表但界面进不去"
+    fail=1
+fi
+V133_SPOOF_BLOCK="$(awk '/const KeyDef kSecSpoof\[\]/,/^};/' "$V133_CFG")"
+for v133_k in spoof_reg spoof_reg_enum spoof_clipboard spoof_screen spoof_camera spoof_file; do
+    if printf '%s\n' "$V133_SPOOF_BLOCK" | grep -q "{ L\"$v133_k\", .*Kind::Bool, L\"0\""; then
+        echo "[ OK ] schema 里有 $v133_k（Bool，默认 0）"
+    else
+        echo "[FAIL] schema 里缺 $v133_k，或类型/默认值不对 —— 保存会把它写成 0"
+        fail=1
+    fi
+done
+
+# ⑧ 随包 ini 有默认值与说明
+if grep -q '^spoof_file=0' "$V133_INI"; then
+    echo "[ OK ] 随包 ini 里 spoof_file=0（默认关）"
+else
+    echo "[FAIL] 随包 ini 缺 spoof_file=0 —— 用户发现不了这个开关"
+    fail=1
+fi
+if grep -q '^# protect_file=' "$V133_INI"; then
+    echo "[ OK ] 随包 ini 说明了 protect_file=（触发面）"
+else
+    echo "[FAIL] 随包 ini 没说明 protect_file= —— 打开 spoof_file 也会空转"
+    fail=1
+fi
+
+# ⑨ 位 DLL 必须比新源文件新（改了源码没重编 = 发旧包）
+for v133_arch in 64 32; do
+    v133_dll="$PROJECT_ROOT/dist/R3ShieldCore-x64/$v133_arch/r3shieldcore-lib.dll"
+    [ -f "$v133_dll" ] || v133_dll="$PROJECT_ROOT/dist/R3ShieldCore-x64/r3shieldcore-lib.dll"
+    if [ ! -f "$v133_dll" ]; then
+        echo "[FAIL] 找不到 $v133_arch 位的 r3shieldcore-lib.dll"
+        fail=1
+        continue
+    fi
+    v133_stale=0
+    for v133_path in "$V133_GUARD" "$V133_CODEC" "$V133_SHARED"; do
+        [ "$v133_dll" -nt "$v133_path" ] || v133_stale=1
+    done
+    if [ "$v133_stale" -eq 0 ]; then
+        echo "[ OK ] $v133_arch 位 DLL 比 v133 的 file_guard + codec + shared.h 都新"
+    else
+        echo "[FAIL] $v133_arch 位 DLL 比某个 v133 源文件旧 —— 改了源码没重编（跑 build.sh）"
+        fail=1
+    fi
+done
+
+# ⑩ 负对照
+if grep -q "spoof_file_THIS_KEY_MUST_NOT_EXIST" "$V133_ENGCFG" "$V133_CFG" 2>/dev/null; then
+    echo "[FAIL] 负对照失败：不存在的键居然搜到了 ⇒ 检索不可信"
+    fail=1
+else
+    echo "[ OK ] 负对照：不存在的键搜不到（检索有效）"
+fi
+
+
+# ===========================================================================
+# v134：截屏替换的**外部图片来源**（spoof_screen_image）
+# ===========================================================================
+#
+# 这一版**升了 AbiVersion（26 -> 27）**，因为 `Policy` 尾部多了一个路径数组。
+# ⇒ 闸门必须同时钉三件事：**引擎认这个键**、**DLL 里真有画图这条分支**、
+#   **cfg 里有输入框**。缺任何一条，用户填了路径都是白填（而且不会有任何报错）。
+echo ""
+echo "=== v134 截屏替换 · 外部图片来源（spoof_screen_image）==="
+
+V134_SHARED="$PROJECT_ROOT/R3ShieldCore/shared/r3shieldcore/r3shieldcore_shared.h"
+V134_SGRD="$PROJECT_ROOT/R3ShieldCore/R3ShieldCoreLib/screen_guard.cpp"
+V134_IMG="$PROJECT_ROOT/R3ShieldCore/R3ShieldCoreLib/screen_spoof_image.h"
+V134_UT="$PROJECT_ROOT/tools/v134_screen_image_ut.cpp"
+
+# ① Policy 字段 + AbiVersion 必须同时到位
+#
+# ★ 为什么两条要一起查：只加字段不升 ABI ⇒ 旧 DLL 按旧 sizeof 映射能成功，
+#   然后按旧布局去读尾部字段 ⇒ 把别的字节当路径，反复撞盘（见 shared.h 的注释）。
+#   只升 ABI 不加字段 ⇒ 布局没变却让新旧混用被拒，等于白断一代。
+if grep -q 'WCHAR SpoofScreenImagePath\[' "$V134_SHARED"; then
+    echo "[ OK ] Policy 尾部有 SpoofScreenImagePath[]"
+else
+    echo "[FAIL] Policy 里没有 SpoofScreenImagePath[] —— 引擎读了也没地方放"
+    fail=1
+fi
+if grep -qE 'AbiVersion = 27' "$V134_SHARED"; then
+    echo "[ OK ] AbiVersion = 27（尾部追加了字段，必须布局升版）"
+else
+    echo "[FAIL] AbiVersion 不是 27 —— 加了字段却没升版，旧 DLL 会读到错位内存"
+    fail=1
+fi
+
+# ② 引擎配置解析认得这个键
+if grep -q '"spoof_screen_image"' "$V133_ENGCFG"; then
+    echo "[ OK ] 引擎解析认 spoof_screen_image"
+else
+    echo "[FAIL] 引擎解析不认 spoof_screen_image —— 写进 ini 也没用"
+    fail=1
+fi
+
+# ③ screen_guard 真的走了"图片优先"的出口
+#
+# ★★ 这里查的是**调用形态**（`SpoofRect(`），不是裸名字 —— 定义、注释、
+#   `BlackenRect` 的引用都会喂饱计数器（铁律：判据要查"有没有真的调用"）。
+if grep -q '#include "screen_spoof_image.h"' "$V134_SGRD"; then
+    echo "[ OK ] screen_guard 引了 screen_spoof_image.h（生产与单测同一份实现）"
+else
+    echo "[FAIL] screen_guard 没引 screen_spoof_image.h"
+    fail=1
+fi
+# ★★ v135 起调用点长这样：`else if (SpoofRect(hdcDest, xDest, ..., spoofImage))`
+#   —— 多传了一个图片路径参数，且**挂在 `else if` 后面**（先问规则放不放行，
+#   再决定画什么）。原来只认 `if (`，于是三处调用点一处都数不到 ⇒ 判据恒红，
+#   而红的原因跟"有没有真的调用"毫无关系（铁律 185）。这里把 `else ` 也认上。
+V134_RECT_CALLS=$(grep -cE '^[[:space:]]*(else )?(if \()?SpoofRect\(' "$V134_SGRD" || true)
+if [ "${V134_RECT_CALLS:-0}" -ge 3 ]; then
+    echo "[ OK ] 三个 DC 路径（BitBlt / StretchBlt / PrintWindow）都走 SpoofRect（$V134_RECT_CALLS 处）"
+else
+    echo "[FAIL] SpoofRect 的调用点只有 ${V134_RECT_CALLS:-0} 处，期望 >=3（有一路被漏掉了）"
+    fail=1
+fi
+if grep -qE '^[[:space:]]*(else )?(if \()?SpoofDibBits\(' "$V134_SGRD"; then
+    echo "[ OK ] GetDIBits 路径走 SpoofDibBits"
+else
+    echo "[FAIL] GetDIBits 路径没走 SpoofDibBits —— 那条路会一直出黑帧"
+    fail=1
+fi
+
+# ④ ★★★ 失败方向：必须**回落黑帧**，不能"报告成功"
+#
+# 这是整个功能的安全底线：图读不到时如果直接 return true（不画），
+# 调用方会以为替换成功了，而目标 DC 里是**真实画面** ⇒ 替换变成"泄密"。
+# 判据 = `SpoofRect` / `SpoofDibBits` 的函数体里必须出现 `return Blacken*`。
+V134_SPOOF_BODY="$(awk '/^\tbool SpoofRect\(/,/^\t}/' "$V134_SGRD")"
+if printf '%s\n' "$V134_SPOOF_BODY" | grep -q 'return BlackenRect('; then
+    echo "[ OK ] SpoofRect 失败回落 BlackenRect（不会放过真画面）"
+else
+    echo "[FAIL] SpoofRect 没有回落黑帧 —— 图读不到时会漏出真实画面！"
+    fail=1
+fi
+V134_DIB_BODY="$(awk '/^\tbool SpoofDibBits\(/,/^\t}/' "$V134_SGRD")"
+if printf '%s\n' "$V134_DIB_BODY" | grep -q 'return BlackenDibBits('; then
+    echo "[ OK ] SpoofDibBits 失败回落 BlackenDibBits（不会放过真实像素）"
+else
+    echo "[FAIL] SpoofDibBits 没有回落 memset(0) —— 图读不到时会漏出真实像素！"
+    fail=1
+fi
+
+# ⑤ cfg 有输入框（Kind::Text），且**进了 schema**
+#
+# ★★ 为什么这条要进发布闸门：`spoof_screen_image` 是 `Kind::Text`。
+#   键不进 schema ⇒ 控件恒显示空串 ⇒ `HarvestSection` 判成"改过了" ⇒
+#   用户一按保存就把 ini 里填的路径**清空**（不是关开关，是丢路径）。
+if grep -q 'L"spoof_screen_image".*Kind::Text' "$V133_CFG"; then
+    echo "[ OK ] cfg 里 spoof_screen_image 是 Text 控件"
+else
+    echo "[FAIL] cfg 里没有 spoof_screen_image 的 Text 控件 —— 用户没法填路径"
+    fail=1
+fi
+if awk '/const KeyDef kSecSpoof\[\]/,/^};/' "$V133_CFG" | grep -q 'L"spoof_screen_image"'; then
+    echo "[ OK ] spoof_screen_image 在 kSecSpoof 分区里（与六个开关同屏）"
+else
+    echo "[FAIL] spoof_screen_image 不在 kSecSpoof 里 —— 加了控件但那一页看不到"
+    fail=1
+fi
+
+# ⑥ 随包 ini 说明了它，且出厂为空（= 仍是黑帧，行为与 v67 一致）
+if grep -q '^spoof_screen_image=' "$V133_INI"; then
+    echo "[ OK ] 随包 ini 有 spoof_screen_image=（出厂留空）"
+else
+    echo "[FAIL] 随包 ini 缺 spoof_screen_image= —— 用户发现不了这个开关"
+    fail=1
+fi
+V134_INI_VAL="$(grep -m1 '^spoof_screen_image=' "$V133_INI" | cut -d'=' -f2 | cut -d'#' -f1 | tr -d ' \t\r')"
+if [ -z "$V134_INI_VAL" ]; then
+    echo "[ OK ] 出厂默认留空 ⇒ 替换内容仍是黑帧（负对照：默认行为未被 v134 改变）"
+else
+    echo "[FAIL] 出厂 spoof_screen_image=$V134_INI_VAL，应为空（否则默认包会去读一个不存在的图）"
+    fail=1
+fi
+
+# ⑦ 双架构 DLL / EXE 必须比新源码新
+for v134_arch in 64 32; do
+    v134_dll="$PROJECT_ROOT/dist/R3ShieldCore-x64/$v134_arch/r3shieldcore-lib.dll"
+    [ -f "$v134_dll" ] || v134_dll="$PROJECT_ROOT/dist/R3ShieldCore-x64/r3shieldcore-lib.dll"
+    if [ ! -f "$v134_dll" ]; then
+        echo "[FAIL] 找不到 $v134_arch 位的 r3shieldcore-lib.dll"
+        fail=1
+        continue
+    fi
+    v134_stale=0
+    for v134_path in "$V134_SGRD" "$V134_IMG" "$V134_SHARED"; do
+        [ "$v134_dll" -nt "$v134_path" ] || v134_stale=1
+    done
+    if [ "$v134_stale" -eq 0 ]; then
+        echo "[ OK ] $v134_arch 位 DLL 比 screen_guard + screen_spoof_image.h + shared.h 都新"
+    else
+        echo "[FAIL] $v134_arch 位 DLL 比某个 v134 源文件旧 —— 改了源码没重编（跑 build.sh）"
+        fail=1
+    fi
+done
+
+# ⑧ 单测存在（缺了就等于"这个功能没人验"）
+if [ -f "$V134_UT" ]; then
+    echo "[ OK ] 有 v134 单测（tools/v134_screen_image_ut.cpp）"
+else
+    echo "[FAIL] 缺 tools/v134_screen_image_ut.cpp —— 图片替换没有行为级判据"
+    fail=1
+fi
+
+# ⑨ 负对照
+if grep -q "spoof_screen_image_THIS_MUST_NOT_EXIST" "$V134_SGRD" "$V133_CFG" 2>/dev/null; then
+    echo "[FAIL] 负对照失败：不存在的键居然搜到了 ⇒ 检索不可信"
+    fail=1
+else
+    echo "[ OK ] 负对照：不存在的键搜不到（检索有效）"
+fi
+
+# ⑩ 缓存键必须含**路径**，不能只比 mtime
+#
+# ★★★ 这是 v134 交付前最后一个真缺陷：`Load()` 的注释写着"同一路径 + 同一
+#   修改时间才复用"，代码却只比了 mtime。本机实测**连续写两个文件、20 轮里
+#   10 轮**拿到完全相同的 `ftLastWriteTime`（Windows 懒更新）⇒ 换成另一张图、
+#   mtime 恰好相同，就**继续画上一张图**，而且没有任何报错。
+#   症状是"改了配置没生效"，排查的人会去怀疑 ini 路径/权限/重启，不会怀疑缓存键。
+#   ⇒ 判据：`Load()` 函数体里必须出现 `wcscmp(g_cache.path, path)`。
+V134_LOAD_BODY="$(awk '/inline HBITMAP Load\(/,/^\t}/' "$V134_IMG")"
+if printf '%s\n' "$V134_LOAD_BODY" | grep -q 'wcscmp(g_cache.path, path)'; then
+    echo "[ OK ] Load 的缓存键含路径比较（只比 mtime 会画出上一张图）"
+else
+    echo "[FAIL] Load 只比 mtime 不比路径 —— mtime 撞车时会继续画上一张图（无任何报错）"
+    fail=1
+fi
+
+# ===========================================================================
+# v135：规则表新增两个面 —— 文件（File）/ 截屏（Screen）
+# ===========================================================================
+#
+# 这一版改的是**规则 DSL**，它有一条别处没有的失效方式：
+#   规则**解析成功、但永远不命中**，而且**不报错**。
+#   典型：`当 文件 的 格式 含 "x" 时 替换为 全零` —— `Eval` 里拿不到 `fmt`
+#   就 `continue`，于是"看着配上了、实际一条都没生效"。
+# ⇒ 闸门必须钉住"面×字段 / 面×动作 的相容性校验**真的存在**"，
+#   而不能只钉"代码里出现了 File 这个词"（铁律 142：只查存在 ⇒ 假绿）。
+echo ""
+echo "=== v135 规则表新面（文件 / 截屏）==="
+
+V135_CODEC="$PROJECT_ROOT/R3ShieldCore/shared/r3shieldcore/rules_codec.h"
+V135_FGUARD="$PROJECT_ROOT/R3ShieldCore/R3ShieldCoreLib/file_guard.cpp"
+V135_SGRD2="$PROJECT_ROOT/R3ShieldCore/R3ShieldCoreLib/screen_guard.cpp"
+V135_FCODEC="$PROJECT_ROOT/R3ShieldCore/R3ShieldCoreLib/file_spoof_codec.h"
+V135_CFGSRC="$PROJECT_ROOT/tools/r3shieldcore_cfg.cpp"
+V135_CFGEXE="$PROJECT_ROOT/dist/R3ShieldCore-x64/r3shieldcore-cfg.exe"
+V135_UT_CODEC="$PROJECT_ROOT/tools/v135_rules_faces_ut.cpp"
+V135_UT_GUARD="$PROJECT_ROOT/tools/v135_guard_ut.cpp"
+V135_GATE_GUARD="$PROJECT_ROOT/build_guard_ut.sh"
+V135_GATE_ALL="$PROJECT_ROOT/tools/spoof_verify_all.sh"
+
+# ① 三个枚举必须真的扩到新成员（值不重要，**名字**是解析器的词汇表）
+if grep -q 'enum class Face  { RegValue, RegEnum, Clip, File, Screen };' "$V135_CODEC"; then
+    echo "[ OK ] Face 有 5 个面（含 File / Screen）"
+else
+    echo "[FAIL] Face 不是 5 个面 —— 规则里写「文件」「截屏」会解析失败"
+    fail=1
+fi
+if grep -q 'enum class Field { Name, Path, Format, Process };' "$V135_CODEC"; then
+    echo "[ OK ] Field 有 Process（截屏面按调用方进程名匹配）"
+else
+    echo "[FAIL] Field 缺 Process —— 截屏面没有可匹配的字段"
+    fail=1
+fi
+if grep -q 'ReplaceImage' "$V135_CODEC"; then
+    echo "[ OK ] Act 有 ReplaceImage（替换为图）"
+else
+    echo "[FAIL] Act 缺 ReplaceImage —— 截屏换图无法在规则里表达"
+    fail=1
+fi
+
+# ② 面×字段 相容性：文件→路径、截屏→进程
+#
+# ★ 这两行**就是**那条"提前挡住永远不命中"的校验。删了它，DSL 不会报错，
+#   只会静默失效 —— 所以判据必须落在**这两行的具体形态**上。
+if grep -q 'case Face::File:   fieldOk = (r.field == Field::Path);' "$V135_CODEC" \
+   && grep -q 'case Face::Screen: fieldOk = (r.field == Field::Process);' "$V135_CODEC"; then
+    echo "[ OK ] 面×字段 相容性校验在（文件→路径 / 截屏→进程）"
+else
+    echo "[FAIL] 面×字段 相容性校验被删/改了 —— 写错字段会解析通过且永不命中（静默失效）"
+    fail=1
+fi
+
+# ③ 面×动作 相容性：替换为图只对截屏面
+if grep -q 'r.act == Act::ReplaceImage && r.face != Face::Screen' "$V135_CODEC"; then
+    echo "[ OK ] 面×动作 相容性校验在（替换为图只对截屏面）"
+else
+    echo "[FAIL] 缺「替换为图只对截屏面」的校验 —— 文件面写替换为图会静默变成全零"
+    fail=1
+fi
+
+# ④ `Eval` 必须真的把 `Process` 槽接上
+#
+# ★ 只有 `case Field::Process: v = name; break;` 存在，截屏规则才可能命中。
+#   少了它，`v` 保持空 ⇒ 任何模式都匹配不上 ⇒ 同样是"解析成功、永不命中"。
+if grep -q 'case Field::Process: v = name; break;' "$V135_CODEC"; then
+    echo "[ OK ] Eval 把 Process 字段接到了 name 槽（截屏规则能命中）"
+else
+    echo "[FAIL] Eval 没接 Process 字段 —— 截屏规则永远匹配不上，且不报错"
+    fail=1
+fi
+
+# ⑤ 生产侧真的按规则分派（**调用形态**，不是裸名字）
+#
+# ★ 查裸名字会被"定义 + 注释"喂饱 ⇒ 变异测试仍"通过"。
+#   这里查的是**调用点**：`HasFace(RScript::Face::File)` 与
+#   `Eval(\n Face::File, rulePath, nullptr, nullptr)`。
+if grep -q 'RScript::HasFace(RScript::Face::File)' "$V135_FGUARD"; then
+    echo "[ OK ] file_guard 用 HasFace(File) 预筛（没配文件规则时零开销）"
+else
+    echo "[FAIL] file_guard 没有 HasFace(File) —— 要么没接规则，要么每条读都查表"
+    fail=1
+fi
+if grep -q 'RScript::Face::File, rulePath' "$V135_FGUARD"; then
+    echo "[ OK ] file_guard 用**句柄表里的真实路径**求值（不是当前进程路径）"
+else
+    echo "[FAIL] file_guard 求值时没传 rulePath —— 文件面规则拿不到路径，永不命中"
+    fail=1
+fi
+if grep -q 'RScript::Face::Screen, nullptr, CurrentProcessExeName()' "$V135_SGRD2"; then
+    echo "[ OK ] screen_guard 用当前进程 exe 名求值（截屏面按调用方匹配）"
+else
+    echo "[FAIL] screen_guard 求值时没传进程名 —— 截屏规则永不命中"
+    fail=1
+fi
+
+# ⑥ 截屏的**四个** DC 落地调用点必须都在（少一个 ⇒ 那条路照旧泄露真实画面）
+#
+# ★ 数的是**调用形态** `ScreenMode(spoofImage, _countof(spoofImage))`，
+#   不含定义本身与 `ScreenModeForTest` 里的那次（那两次写法不同）。
+V135_MODE_CALLS="$(grep -F -c 'ScreenMode(spoofImage, _countof(spoofImage))' "$V135_SGRD2" || true)"
+if [ "${V135_MODE_CALLS:-0}" -eq 4 ]; then
+    echo "[ OK ] BitBlt/StretchBlt/PrintWindow/GetDIBits 四处都问了 ScreenMode（4 处）"
+else
+    echo "[FAIL] ScreenMode 调用点 = ${V135_MODE_CALLS:-0}，应为 4 —— 少的那条路仍会给出真实画面"
+    fail=1
+fi
+
+# ⑦ 「放行」时上报口径必须改成 Allowed（铁律 97）
+#
+# ★★★ 这是最容易被漏掉的一处：规则说"放行"、代码也确实没替换，
+#   但事件里仍写 `Spoofed` ⇒ 日志说"我替换了"、屏幕上是真画面。
+#   判据：四个调用点的**后面几行内**都要有 `Decision::Allowed`（4 对 4）。
+V135_PASS_PAIRS="$(grep -F -A6 'ScreenMode(spoofImage, _countof(spoofImage))' "$V135_SGRD2" \
+    | grep -c 'Decision::Allowed' || true)"
+if [ "${V135_PASS_PAIRS:-0}" -ge 4 ]; then
+    echo "[ OK ] 放行时上报口径改成 Allowed（${V135_PASS_PAIRS} 处，≥4）"
+else
+    echo "[FAIL] 放行分支只有 ${V135_PASS_PAIRS:-0} 处改成 Allowed —— 日志会谎报「已替换」"
+    fail=1
+fi
+
+# ⑧ cfg 界面：面芯片 5 个、动作芯片 8 个
+#
+# ★ 数量必须与 codec 的词汇表对得上：用户点「文件」芯片得到的是骨架，
+#   骨架里的默认字段写错 ⇒ 点一下就得到一条永不命中的规则。
+if grep -q 'kAdvFaceChips\[5\]' "$V135_CFGSRC" \
+   && grep -q 'kAdvFaceChipLabel\[5\]' "$V135_CFGSRC" \
+   && grep -q 'constexpr int kAdvChipRowA = 5;' "$V135_CFGSRC"; then
+    echo "[ OK ] cfg 面芯片 5 个（注册表值/枚举/剪贴板/文件/截屏）"
+else
+    echo "[FAIL] cfg 面芯片不是 5 个 —— 新面在界面上点不出来"
+    fail=1
+fi
+if grep -q 'constexpr int kAdvChipRowC = 8;' "$V135_CFGSRC"; then
+    echo "[ OK ] cfg 动作芯片 8 个（含 替换为 全FF / 替换为图）"
+else
+    echo "[FAIL] cfg 动作芯片不是 8 个 —— 全FF 与 替换为图 点不出来"
+    fail=1
+fi
+# 骨架里的默认字段必须与 codec 的默认一致
+#
+# ★★★ 必须**只在芯片块内**搜：一开始我在整个文件里 grep `当 文件 的 路径 含`，
+#   而 `kAdvDemoRules` 里也有一条同样的写法 ⇒ 芯片写错了照样绿。
+#   变异测试 M10 就是这么抓到的（把芯片里的 `路径` 改成 `格式`，闸门不报红）。
+#   ⇒ 先把 `kAdvFaceChips[] = { ... };` 这段切出来，再在块内判。
+V135_CHIP_BLOCK="$(awk '/kAdvFaceChips\[[0-9]+\] = \{/{f=1} f{print} f&&/\};/{exit}' "$V135_CFGSRC")"
+if printf '%s\n' "$V135_CHIP_BLOCK" | grep -q '当 文件 的 路径 含' \
+   && printf '%s\n' "$V135_CHIP_BLOCK" | grep -q '当 截屏 的 进程 含'; then
+    echo "[ OK ] 骨架用的是各面的默认字段（文件→路径、截屏→进程）"
+else
+    echo "[FAIL] 骨架里的字段与 codec 默认不一致 —— 点一下就是一条永不命中的规则"
+    fail=1
+fi
+
+# ⑨ cfg 产物必须比源码新
+#
+# ★ cfg 是**唯一**不走 `Release/` 的产物（`build_cfgtool.sh` 直接写 dist）
+#   ⇒ 忘了重编 = 发出去的还是旧界面，而其它闸门全都是绿的。
+if [ -f "$V135_CFGEXE" ] && [ "$V135_CFGEXE" -nt "$V135_CFGSRC" ]; then
+    echo "[ OK ] dist 里的 cfg 比 r3shieldcore_cfg.cpp 新"
+else
+    echo "[FAIL] dist 的 cfg 比源码旧（或不存在）—— 跑 build_cfgtool.sh（★ 先关掉正在运行的 cfg）"
+    fail=1
+fi
+
+# ⑩ 两个单测必须存在，且**都进了某道闸门**
+#
+# ★ "文件存在"不够：v135_rules_faces_ut 一度只在我手敲的命令里跑过，
+#   没接进任何脚本 ⇒ 别人改坏了也不知道（铁律 142 的同型问题）。
+for v135_ut in "$V135_UT_CODEC" "$V135_UT_GUARD"; do
+    if [ -f "$v135_ut" ]; then
+        echo "[ OK ] 有单测 $(basename "$v135_ut")"
+    else
+        echo "[FAIL] 缺单测 $(basename "$v135_ut") —— 这一面没有行为级判据"
+        fail=1
+    fi
+done
+if grep -q '"v135_guard_ut|"' "$V135_GATE_GUARD"; then
+    echo "[ OK ] v135_guard_ut 进了 build_guard_ut.sh"
+else
+    echo "[FAIL] v135_guard_ut 没进 build_guard_ut.sh —— 没有闸门会跑它"
+    fail=1
+fi
+if grep -q 'v135_rules_faces_ut.exe' "$V135_GATE_ALL"; then
+    echo "[ OK ] v135_rules_faces_ut 进了 spoof_verify_all.sh"
+else
+    echo "[FAIL] v135_rules_faces_ut 没进 spoof_verify_all.sh —— 没有闸门会跑它"
+    fail=1
+fi
+
+# ⑪ 双架构 DLL 必须比 v135 的源文件新
+for v135_arch in 64 32; do
+    v135_dll="$PROJECT_ROOT/dist/R3ShieldCore-x64/$v135_arch/r3shieldcore-lib.dll"
+    if [ ! -f "$v135_dll" ]; then
+        echo "[FAIL] 找不到 $v135_arch 位的 r3shieldcore-lib.dll"
+        fail=1
+        continue
+    fi
+    v135_stale=0
+    for v135_path in "$V135_CODEC" "$V135_FGUARD" "$V135_SGRD2" "$V135_FCODEC"; do
+        [ "$v135_dll" -nt "$v135_path" ] || v135_stale=1
+    done
+    if [ "$v135_stale" -eq 0 ]; then
+        echo "[ OK ] $v135_arch 位 DLL 比 rules_codec + file_guard + screen_guard + file_spoof_codec 都新"
+    else
+        echo "[FAIL] $v135_arch 位 DLL 比某个 v135 源文件旧 —— 改了源码没重编（跑 build.sh）"
+        fail=1
+    fi
+done
+
+# ⑫ 负对照：不存在的面词搜不到
+if grep -q "截屏THIS_FACE_MUST_NOT_EXIST" "$V135_CODEC" "$V135_CFGSRC" 2>/dev/null; then
+    echo "[FAIL] 负对照失败：不存在的面词居然搜到了 ⇒ 检索不可信"
+    fail=1
+else
+    echo "[ OK ] 负对照：不存在的面词搜不到（检索有效）"
+fi
+
+# ===========================================================================
+# v1.0.1：版本号必须**三处一致**，而且必须真的**编进产物**
+# ===========================================================================
+#
+# 为什么单独一段：v1.0.1 出包前发现主程序在资源管理器「详细信息」里
+# **版本号是空的** —— 而 build.sh 明明传了 `/VERSION:65.0`。
+# 真因：`link /VERSION` 只写 PE 可选头的 ImageVersion，**不是资源**。
+# 而 r3shieldcore.rc 的注释一直写着"link 会自动生成 VS_VERSION_INFO"，
+# 于是这一版之前从来没有过版本资源（rc 返回 0、link 返回 0、exe 正常跑）。
+#
+# ★ 判据分两层，缺一不可：
+#   ① **源码层**：VERSION 文件 / 三个 .rc / build.sh 里的取值互相比对
+#      —— 防"改了 VERSION 忘了改 .rc"；
+#   ② **产物层**：用 `tools/pe_version.py` 真读 exe 的 RT_VERSION
+#      —— 防"源码里写了但没编进去"（这正是上面那个缺陷的形态）。
+#      只查 ① 是假绿：三个 .rc 都写着 1.0.1，产物里照样可以一个都没有。
+echo ""
+echo "=== v1.0.1 发布版本一致性 ==="
+
+V101_ROOT="$PROJECT_ROOT"
+V101_VER_FILE="$V101_ROOT/VERSION"
+V101_MAIN_RC="$V101_ROOT/R3ShieldCore/R3ShieldCore/rsrc/r3shieldcore.rc"
+V101_CFG_RC="$V101_ROOT/tools/r3shieldcore_cfg.rc"
+V101_SETUP_RC="$V101_ROOT/installer/r3sc_setup.rc"
+V101_BUILD_SH="$V101_ROOT/build.sh"
+V101_PYVER="$V101_ROOT/tools/pe_version.py"
+
+V101_VER=""
+if [ -f "$V101_VER_FILE" ]; then
+    V101_VER="$(tr -d ' \t\r\n' < "$V101_VER_FILE")"
+fi
+case "$V101_VER" in
+    [0-9]*.[0-9]*.[0-9]*) : ;;
+    *)
+        echo "[FAIL] 仓库根 VERSION 缺失或不是 x.y.z 形式（读到 '${V101_VER}'）"
+        V101_VER="0.0.0"
+        fail=1
+        ;;
+esac
+# 前三段拼成 rc 的 "1,0,1" 与 "1.0.1" 两种写法
+V101_COMMA="$(printf '%s' "$V101_VER" | cut -d. -f1-3 | tr '.' ',')"
+V101_DOT="$(printf '%s' "$V101_VER" | cut -d. -f1-3)"
+echo "  VERSION = $V101_VER"
+
+# ①-a 三个 .rc 的 FILEVERSION 必须是同一组数字
+for v101_pair in "主程序:$V101_MAIN_RC" "cfg:$V101_CFG_RC" "安装包:$V101_SETUP_RC"; do
+    v101_name="${v101_pair%%:*}"
+    v101_path="${v101_pair#*:}"
+    if [ ! -f "$v101_path" ]; then
+        echo "[FAIL] 找不到 $v101_name 的 .rc：$v101_path"
+        fail=1
+        continue
+    fi
+    if grep -qE "^[[:space:]]*FILEVERSION[[:space:]]+$V101_COMMA([[:space:]]|,|$)" "$v101_path"; then
+        echo "[ OK ] $v101_name 的 FILEVERSION = $V101_COMMA"
+    else
+        echo "[FAIL] $v101_name 的 FILEVERSION 不是 $V101_COMMA —— 与 VERSION 文件不一致"
+        fail=1
+    fi
+    if grep -qE "^[[:space:]]*PRODUCTVERSION[[:space:]]+$V101_COMMA([[:space:]]|,|$)" "$v101_path"; then
+        echo "[ OK ] $v101_name 的 PRODUCTVERSION = $V101_COMMA"
+    else
+        echo "[FAIL] $v101_name 的 PRODUCTVERSION 不是 $V101_COMMA"
+        fail=1
+    fi
+    # ★ 字符串那份也要比：只改 FILEVERSION 不改字符串，右键属性里显示的还是旧的
+    if grep -q "\"FileVersion\",[[:space:]]*\"$V101_DOT" "$v101_path"; then
+        echo "[ OK ] $v101_name 的 FileVersion 字符串以 $V101_DOT 开头"
+    else
+        echo "[FAIL] $v101_name 的 FileVersion 字符串不是 $V101_DOT.*（右键属性会显示旧版本）"
+        fail=1
+    fi
+done
+
+# ①-b build.sh 必须从 VERSION 文件取，而不是写死
+if grep -q 'R3SC_VERSION_FILE=' "$V101_BUILD_SH" \
+   && grep -q 'PRODUCT_VERSION="$(printf' "$V101_BUILD_SH"; then
+    echo "[ OK ] build.sh 的 PRODUCT_VERSION 从 VERSION 文件取（不再写死）"
+else
+    echo "[FAIL] build.sh 把 PRODUCT_VERSION 写死了 —— 版本号又会出现两个来源"
+    fail=1
+fi
+
+# ② 产物层：真的读 exe 里的 RT_VERSION
+if [ ! -f "$V101_PYVER" ]; then
+    echo "[FAIL] 缺 tools/pe_version.py —— 产物层版本判据没了，只剩源码层（假绿）"
+    fail=1
+else
+    for v101_exe in \
+        "$DIST_DIR/R3 ShieldCore.exe" \
+        "$DIST_DIR/r3shieldcore-cfg.exe"; do
+        if [ ! -f "$v101_exe" ]; then
+            echo "[FAIL] 找不到 $(basename "$v101_exe") —— 版本判据失去前提"
+            fail=1
+            continue
+        fi
+        if "$PYTHON" "$V101_PYVER" "$v101_exe" "$V101_DOT" >/dev/null 2>&1; then
+            echo "[ OK ] $(basename "$v101_exe") 的 RT_VERSION 前三段 = $V101_DOT"
+        else
+            echo "[FAIL] $(basename "$v101_exe") 没有版本资源或版本不是 $V101_DOT.*"
+            "$PYTHON" "$V101_PYVER" "$v101_exe" 2>&1 | sed 's/^/        /'
+            fail=1
+        fi
+    done
+    # 安装包是**可选产物**（绿色版部署时还没出包）⇒ 存在才判，缺了明确标"跳过"
+    v101_setup="$PROJECT_ROOT/dist/R3ShieldCore-Setup.exe"
+    if [ -f "$v101_setup" ]; then
+        if "$PYTHON" "$V101_PYVER" "$v101_setup" "$V101_DOT" >/dev/null 2>&1; then
+            echo "[ OK ] R3ShieldCore-Setup.exe 的 RT_VERSION 前三段 = $V101_DOT"
+        else
+            echo "[FAIL] 安装包版本不是 $V101_DOT.* —— 安装向导标题栏会显示旧版本"
+            "$PYTHON" "$V101_PYVER" "$v101_setup" 2>&1 | sed 's/^/        /'
+            fail=1
+        fi
+    else
+        echo "[skip] 还没有 dist/R3ShieldCore-Setup.exe（跳过不计入通过 —— 出包后再跑本闸门）"
+    fi
+fi
+
 echo ""
 if [ "$fail" -eq 0 ]; then
-    echo "结果: PASS —— dist 与构建产物一致，双架构同代次，且带 v66/v67/v69/v70/v71/v72/v73/v74/v75/v77/v78/v79/v80/v81/v82/v83/v84/v85/v86/v88/v89 标记，cfg 带 v114~v128 界面标记。"
+    echo "结果: PASS —— dist 与构建产物一致，双架构同代次，且带 v66/v67/v69/v70/v71/v72/v73/v74/v75/v77/v78/v79/v80/v81/v82/v83/v84/v85/v86/v88/v89 标记，cfg 带 v114~v128 界面标记与 v135 新面芯片。"
     exit 0
 fi
 echo "结果: FAIL —— 发布目录与构建产物不同步，**不要打包**。"

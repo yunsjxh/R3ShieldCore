@@ -24,23 +24,31 @@
 // ★ 语法（刻意做得像易语言）
 //       当 <面> [的 <字段>] <算子> <模式> 时 <动作>
 //
-//     面   : 注册表值 | 注册表枚举 | 剪贴板
-//     字段 : 值名 | 键路径 | 子键名 | 格式      （可省，用该面的默认字段）
+//     面   : 注册表值 | 注册表枚举 | 剪贴板 | 文件 | 截屏
+//     字段 : 值名 | 键路径 | 子键名 | 格式 | 路径 | 进程
+//            （可省，用该面的默认字段）
+//            注册表值/枚举/剪贴板 → 值名/子键名/格式
+//            文件 → 路径      截屏 → 进程
 //     算子 : 等于 | 含 | 匹配 | 开头 | 结尾     （匹配 = 正则，模式写 /.../）
 //     模式 : "文本"  或  /正则/
 //     动作 : 替换为 "文本" | 替换为 全零 | 替换为 全FF | 替换为 空
+//            | 替换为图 "图片路径"（只对截屏面）
 //            | 隐藏（只对枚举面） | 拒绝 | 放行
 //
 //   例：
 //     当 注册表值 的 值名 匹配 /Pass.*/ 时 替换为 "***"
 //     当 剪贴板 的 格式 等于 文本 时 替换为 "假的"
 //     当 注册表枚举 的 子键名 含 "Secret" 时 隐藏
+//     当 文件 的 路径 含 "secret" 时 替换为 全零
+//     当 截屏 的 进程 含 "OBS" 时 替换为图 "C:\fake\desktop.bmp"
 //
 // ★ 求值：**按加入顺序，第一条命中的生效**（first-match wins）。
-//   一条都没命中 ⇒ 由**调用方**回落自己的默认行为（控制台是 fill/hide/fakeclip）。
+//   一条都没命中 ⇒ 由**调用方**回落自己的默认行为（控制台是 fill/hide/fakeclip；
+//   引擎侧文件面回落"全零"、截屏面回落 ini 的 `spoof_screen_image`）。
 //
 // ★ 解析期就挡住"面 × 动作"不相容的写法（`隐藏` 只对枚举面、`全XX` 对剪贴板面
-//   不支持）—— 否则运行时静默不生效，这类"看着加上了其实没用"最费时间。
+//   不支持、`替换为图` 只对截屏面、文件面不能 `隐藏`/`拒绝`）——
+//   否则运行时静默不生效，这类"看着加上了其实没用"最费时间。
 //
 // ★ 线程：改规则与求值可能来自不同线程 ⇒ 一把 mutex 护住。
 //   求值路径只读，规则表通常很小（几十条），开销可忽略。
@@ -86,10 +94,21 @@ namespace R3ShieldCoreRuleScript {
 	}
 
 
-enum class Face  { RegValue, RegEnum, Clip };
-enum class Field { Name, Path, Format };   // Name：值名(值面) / 子键名(枚举面)
+// ★ v135：新增两个面 —— `File`（文件读）与 `Screen`（截屏）。
+//
+//   为什么要加（用户原话：「规则表还没有文件和截图替换的规则啊」）：
+//     v76 做这套 DSL 时，替换家族只有注册表值/注册表枚举/剪贴板三个面；
+//     v133 加文件、v134 加截屏图片时都只加了 ini 全局开关，没回头扩 DSL
+//     ⇒ 这两个面变成"全有或全无"，没法按路径/来源细分。
+//
+//   ⚠️ 两个面的**字段**与别的面不一样，别照抄：
+//     · `File` 没有"名字"，只有**路径** ⇒ 默认字段 `Path`；
+//     · `Screen` 没有文件名/键名，匹配的是**谁在截屏** ⇒ 默认字段 `Process`，
+//       值是**当前进程的 exe 名**（hook 跑在被注入进程里，所以"调用方"就是它自己）。
+enum class Face  { RegValue, RegEnum, Clip, File, Screen };
+enum class Field { Name, Path, Format, Process };   // Name：值名(值面) / 子键名(枚举面)
 enum class Op    { Equal, Contains, Regex, StartsWith, EndsWith };
-enum class Act   { ReplaceText, ReplaceByte, ReplaceEmpty, Hide, Block, Pass };
+enum class Act   { ReplaceText, ReplaceByte, ReplaceEmpty, Hide, Block, Pass, ReplaceImage };
 
 struct Rule {
 	Face  face  = Face::RegValue;
@@ -220,7 +239,8 @@ static bool IsFieldWord(const std::wstring& s)
 	return s == L"值名" || s == L"名字" || s == L"名称" || s == L"name"
 	    || s == L"键路径" || s == L"路径" || s == L"path"
 	    || s == L"子键名" || s == L"子键" || s == L"child"
-	    || s == L"格式" || s == L"format";
+	    || s == L"格式" || s == L"format"
+	    || s == L"进程" || s == L"进程名" || s == L"process" || s == L"exe";
 }
 
 // ---------------------------------------------------------------- 匹配
@@ -254,6 +274,12 @@ static bool MatchOne(const Rule& r, const WCHAR* value)
 
 // ---------------------------------------------------------------- 解析
 // 语法： 当 <面> [的] [<字段>] <算子> <模式> 时 <动作...>
+//
+// ★ `FaceName` 的定义在下面的「描述」段，但 `Parse` 的报错信息要用它
+//   （"「剪贴板」这个面不支持这个字段"）⇒ 这里先声明。
+//   只在**解析失败**的路径上调用，热路径（`Eval`）不碰它。
+static const WCHAR* FaceName(Face f);
+
 static bool Parse(const WCHAR* line, Rule& r, std::wstring& err)
 {
 	std::vector<Tok> t;
@@ -270,18 +296,29 @@ static bool Parse(const WCHAR* line, Rule& r, std::wstring& err)
 	if (WordIn(t[i], { L"注册表值", L"值", L"reg", L"regvalue", L"value" }))        r.face = Face::RegValue;
 	else if (WordIn(t[i], { L"注册表枚举", L"枚举", L"regenum", L"enum", L"key" })) r.face = Face::RegEnum;
 	else if (WordIn(t[i], { L"剪贴板", L"clip", L"clipboard" }))                    r.face = Face::Clip;
-	else { err = L"不认识的面：「" + t[i].text + L"」。可用：注册表值 / 注册表枚举 / 剪贴板"; return false; }
+	else if (WordIn(t[i], { L"文件", L"文件读", L"file" }))                          r.face = Face::File;
+	else if (WordIn(t[i], { L"截屏", L"屏幕", L"截图", L"screen", L"screenshot" }))   r.face = Face::Screen;
+	else {
+		err = L"不认识的面：「" + t[i].text + L"」。可用：注册表值 / 注册表枚举 / 剪贴板 / 文件 / 截屏";
+		return false;
+	}
 	++i;
 
 	// --- 可选「的」---
 	if (i < t.size() && IsWord(t[i], L"的")) ++i;
 
 	// --- 字段（可省；省了就用该面的默认字段）---
-	r.field = (r.face == Face::Clip) ? Field::Format : Field::Name;
+	switch (r.face) {
+	case Face::Clip:   r.field = Field::Format;  break;   // 剪贴板只有「格式」
+	case Face::File:   r.field = Field::Path;    break;   // 文件只有「路径」
+	case Face::Screen: r.field = Field::Process; break;   // 截屏只有「进程」
+	default:           r.field = Field::Name;    break;
+	}
 	if (i < t.size() && t[i].kind == TokKind::Word && IsFieldWord(t[i].text)) {
 		if (WordIn(t[i], { L"值名", L"名字", L"名称", L"name" })) r.field = Field::Name;
 		else if (WordIn(t[i], { L"键路径", L"路径", L"path" }))   r.field = Field::Path;
 		else if (WordIn(t[i], { L"子键名", L"子键", L"child" }))  r.field = Field::Name;
+		else if (WordIn(t[i], { L"进程", L"进程名", L"process", L"exe" })) r.field = Field::Process;
 		else                                                     r.field = Field::Format;
 		++i;
 	}
@@ -312,8 +349,20 @@ static bool Parse(const WCHAR* line, Rule& r, std::wstring& err)
 	++i;
 
 	// --- 动作 ---
-	if (i >= t.size()) { err = L"缺动作（替换为 … / 隐藏 / 拒绝 / 放行）"; return false; }
-	if (WordIn(t[i], { L"替换为", L"改成", L"replace" })) {
+	if (i >= t.size()) { err = L"缺动作（替换为 … / 替换为图 … / 隐藏 / 拒绝 / 放行）"; return false; }
+	if (WordIn(t[i], { L"替换为图", L"换成图", L"replaceimage" })) {
+		// ★ 单独一个动作词，而不是让「替换为 "路径"」兼两义：
+		//   同一个写法在文件面是"文件内容变成这段文本"、在截屏面是"换成这张图"，
+		//   这种"同形不同义"最容易被误读 —— 而且写错了**解析期看不出来**。
+		++i;
+		if (i >= t.size() || t[i].kind != TokKind::Str) {
+			err = L"「替换为图」后面要跟图片路径，例如 替换为图 \"C:\\fake\\desktop.bmp\"";
+			return false;
+		}
+		r.act = Act::ReplaceImage;
+		r.text = t[i].text;
+	}
+	else if (WordIn(t[i], { L"替换为", L"改成", L"replace" })) {
 		++i;
 		if (i >= t.size()) { err = L"「替换为」后面要跟内容（\"文本\" / 全零 / 全FF / 空）"; return false; }
 		if (t[i].kind == TokKind::Str) { r.act = Act::ReplaceText; r.text = t[i].text; }
@@ -335,12 +384,41 @@ static bool Parse(const WCHAR* line, Rule& r, std::wstring& err)
 	else if (WordIn(t[i], { L"隐藏", L"藏起来", L"hide" }))          r.act = Act::Hide;
 	else if (WordIn(t[i], { L"拒绝", L"拦", L"block", L"deny" }))    r.act = Act::Block;
 	else if (WordIn(t[i], { L"放行", L"通过", L"pass", L"allow" }))  r.act = Act::Pass;
-	else { err = L"不认识的动作：「" + t[i].text + L"」。可用：替换为 … / 隐藏 / 拒绝 / 放行"; return false; }
+	else {
+		err = L"不认识的动作：「" + t[i].text + L"」。可用：替换为 … / 替换为图 … / 隐藏 / 拒绝 / 放行";
+		return false;
+	}
 	++i;
 
 	if (i < t.size()) { err = L"「" + t[i].text + L"」是多余的（动作之后不该再有内容）"; return false; }
 
-	// 面 × 动作 的相容性（提前挡住写错，而不是运行时静默不生效）
+	// ---- 面 × 字段 的相容性 ----
+	//
+	// ★★ 为什么要挡：`Eval` 里某个字段拿不到值时会 `continue`（跳过这条规则）
+	//   —— 于是"当 文件 的 格式 含 \"x\" 时 替换为 全零"这种写法**解析通过、
+	//   永远不命中、也不报错**。这正是本文件开头说的"看着加上了其实没用"。
+	{
+		bool fieldOk = false;
+		switch (r.face) {
+		case Face::Clip:   fieldOk = (r.field == Field::Format); break;
+		case Face::File:   fieldOk = (r.field == Field::Path);   break;
+		case Face::Screen: fieldOk = (r.field == Field::Process); break;
+		case Face::RegValue:
+		case Face::RegEnum: fieldOk = (r.field == Field::Name || r.field == Field::Path); break;
+		}
+		if (!fieldOk) {
+			err = L"「" + std::wstring(FaceName(r.face)) + L"」这个面不支持这个字段。";
+			switch (r.face) {
+			case Face::Clip:   err += L"它只有：格式"; break;
+			case Face::File:   err += L"它只有：路径"; break;
+			case Face::Screen: err += L"它只有：进程"; break;
+			default:           err += L"可用：值名 / 子键名 / 键路径"; break;
+			}
+			return false;
+		}
+	}
+
+	// ---- 面 × 动作 的相容性（提前挡住写错，而不是运行时静默不生效）----
 	if (r.act == Act::Hide && r.face != Face::RegEnum) {
 		err = L"「隐藏」只对「注册表枚举」有意义"; return false;
 	}
@@ -349,6 +427,23 @@ static bool Parse(const WCHAR* line, Rule& r, std::wstring& err)
 	}
 	if (r.act == Act::ReplaceByte && r.face == Face::Clip) {
 		err = L"剪贴板面不支持「全XX」字节填充（试 替换为 \"文本\" 或 替换为 空）"; return false;
+	}
+	if (r.act == Act::ReplaceImage && r.face != Face::Screen) {
+		err = L"「替换为图」只对「截屏」面有意义（文件面请用 替换为 全零 / 替换为 \"文本\"）"; return false;
+	}
+	if (r.face == Face::File && (r.act == Act::Hide || r.act == Act::Block)) {
+		// ★ 文件读**从来不会被拒**（拒了全系统都起不来，见 file_guard.cpp 的
+		//   `NtReadFile_Hook` 注释）⇒ 「拒绝」在这个面没有可执行的含义，
+		//   写进去只会让人以为"这个文件被拦住了"，实际是照读。
+		err = L"文件面的动作只能是：替换为 全零 / 全FF / \"文本\" / 空，或 放行";
+		return false;
+	}
+	if (r.face == Face::Screen && r.act != Act::ReplaceImage && r.act != Act::ReplaceByte
+		&& r.act != Act::ReplaceEmpty && r.act != Act::Pass) {
+		// ★ 截屏面"替换为文本"没有意义（画面不是文本）；
+		//   要指定画面内容请用 `替换为图 "路径"`，要黑屏请用 `替换为 全零`。
+		err = L"截屏面的动作只能是：替换为图 \"路径\" / 替换为 全零 / 替换为 空 / 放行";
+		return false;
 	}
 	r.src = line;
 	return true;
@@ -416,6 +511,15 @@ static bool ReplaceAt(int idx, const WCHAR* line, std::wstring& err)
 }
 
 // ---------------------------------------------------------------- 求值
+//
+// `path` / `name` / `fmt` 三个槽按面取用：
+//   注册表值  : path=键路径   name=值名      fmt=—
+//   注册表枚举: path=键路径   name=子键名    fmt=—
+//   剪贴板    : —             —             fmt=格式
+//   文件      : path=文件路径 name=—         fmt=—
+//   截屏      : —             name=进程名    fmt=—
+//   ★ 截屏面复用 `name` 槽传进程名（两者都只是"一个用来匹配的字符串"），
+//     不额外加参数 —— 加参数会动到 4 个调用点，而它们全在 hook 热路径上。
 static Verdict Eval(Face face, const WCHAR* path, const WCHAR* name, const WCHAR* fmt)
 {
 	std::lock_guard<std::mutex> lk(g_mtx);
@@ -424,9 +528,10 @@ static Verdict Eval(Face face, const WCHAR* path, const WCHAR* name, const WCHAR
 		if (r.face != face) continue;
 		const WCHAR* v = nullptr;
 		switch (r.field) {
-		case Field::Name:   v = name; break;
-		case Field::Path:   v = path; break;
-		case Field::Format: v = fmt;  break;
+		case Field::Name:    v = name; break;
+		case Field::Path:    v = path; break;
+		case Field::Format:  v = fmt;  break;
+		case Field::Process: v = name; break;
 		}
 		if (!v) continue;
 		if (!MatchOne(r, v)) continue;
@@ -445,7 +550,14 @@ static Verdict Eval(Face face, const WCHAR* path, const WCHAR* name, const WCHAR
 // ---------------------------------------------------------------- 描述（打印用）
 static const WCHAR* FaceName(Face f)
 {
-	switch (f) { case Face::RegValue: return L"注册表值"; case Face::RegEnum: return L"注册表枚举"; default: return L"剪贴板"; }
+	switch (f) {
+	case Face::RegValue: return L"注册表值";
+	case Face::RegEnum:  return L"注册表枚举";
+	case Face::Clip:     return L"剪贴板";
+	case Face::File:     return L"文件";
+	case Face::Screen:   return L"截屏";
+	}
+	return L"注册表值";
 }
 static const WCHAR* OpName(Op o)
 {
@@ -458,8 +570,20 @@ static std::wstring ActDesc(const Rule& r)
 {
 	switch (r.act) {
 	case Act::ReplaceText:  return L"替换为 \"" + r.text + L"\"";
+	case Act::ReplaceImage: return L"替换为图 \"" + r.text + L"\"";
 	case Act::ReplaceByte: {
-		WCHAR b[16]; _snwprintf_s(b, _countof(b), _TRUNCATE, L"全%02X", r.fill); return b;
+		// ★★★ 必须带「替换为 」前缀（v135 修）。
+		//   原来只返回 `全00` / `全FF` —— 而 `Parse` 的动作段只认
+		//   「替换为 …」，裸的 `全FF` 会被判成"不认识的动作"
+		//   ⇒ `Describe` 的输出**无法再被解析**。
+		//   后果：界面上"点一行 → 载入编辑框 → 改一下 → 点更新"时，
+		//   凡是 `src` 为空的规则（程序化构造的），点一下就坏一条。
+		//   之所以长期没暴露：`DescribeAt` 优先返回 `src`（用户原文），
+		//   只有 `src` 为空时才走 `Describe` —— 而"往返可解析"这条
+		//   以前没人测（v135 的描述往返用例抓出来的）。
+		WCHAR b[24];
+		_snwprintf_s(b, _countof(b), _TRUNCATE, L"替换为 全%02X", r.fill);
+		return b;
 	}
 	case Act::ReplaceEmpty: return L"替换为 空";
 	case Act::Hide:         return L"隐藏";
@@ -474,9 +598,10 @@ static std::wstring Describe(const Rule& r)
 	s += FaceName(r.face);
 	s += L" 的 ";
 	switch (r.field) {
-	case Field::Path:   s += L"键路径"; break;
-	case Field::Format: s += L"格式";   break;
-	default:            s += (r.face == Face::RegEnum) ? L"子键名" : L"值名"; break;
+	case Field::Path:    s += (r.face == Face::File) ? L"路径" : L"键路径"; break;
+	case Field::Format:  s += L"格式"; break;
+	case Field::Process: s += L"进程"; break;
+	default:             s += (r.face == Face::RegEnum) ? L"子键名" : L"值名"; break;
 	}
 	s += L" ";
 	s += OpName(r.op);
@@ -545,7 +670,7 @@ static std::wstring NextStepHint(const WCHAR* line)
 	++i;                                                        // 当
 
 	if (i >= t.size()) {
-		return L"写面：注册表值 / 注册表枚举 / 剪贴板";
+		return L"写面：注册表值 / 注册表枚举 / 剪贴板 / 文件 / 截屏";
 	}
 	++i;                                                        // 面
 
@@ -574,7 +699,7 @@ static std::wstring NextStepHint(const WCHAR* line)
 	++i;                                                        // 时
 
 	if (i >= t.size()) {
-		return L"写动作：替换为 … / 隐藏 / 拒绝 / 放行";
+		return L"写动作：替换为 … / 替换为图 …（截屏面）/ 隐藏（枚举面）/ 拒绝 / 放行";
 	}
 	return L"";                                                 // 写完了
 }

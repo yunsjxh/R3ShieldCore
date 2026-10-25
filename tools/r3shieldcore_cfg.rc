@@ -5,10 +5,13 @@
  *    .ico 不入库）。build_cfgtool.sh 用 rc.exe 的 -I 指向 R3ShieldCore/rsrc，
  *    所以这里写文件名即可。
  *
- *  ★ 版本信息为什么写在这里（而引擎是交给 link 的 /VERSION）：
- *    link 的 /VERSION 只能给两段（"1.0"），拿不到 FileDescription 这类字符串；
- *    本工具**不传** /VERSION，改由本文件提供完整 VS_VERSION_INFO。
- *    ⚠️ 两者只能取其一 —— 同时存在会在资源表里出现两个 VERSION 条目。
+ *  ★ 版本信息写在这里（本工具不传 /VERSION）：
+ *    link 的 /VERSION 只能给两段（"1.0"），而且它写的是 **PE 可选头的
+ *    ImageVersion**，**不是**资源、也不会生成 RT_VERSION。
+ *    ⇒ 想要「详细信息」里有版本号，就**必须**在这里手写 VS_VERSION_INFO。
+ *    ⚠️ v1.0.1 修正：这里原来说"两者只能取其一，同时存在会出现两个 VERSION
+ *      条目" —— 那是错的（/VERSION 根本不产生资源条目）。主程序之前就是
+ *      信了这句话才一直**没有任何版本资源**（详见 r3shieldcore.rc 的注释）。
  *
  *  ★ 中文：文件存 UTF-8，靠 #pragma code_page(65001) 让 rc.exe 按 UTF-8 解码。
  * ==========================================================================*/
@@ -20,8 +23,8 @@
 1 ICON "r3shieldcore.ico"
 
 VS_VERSION_INFO VERSIONINFO
- FILEVERSION 1,0,0,0
- PRODUCTVERSION 1,0,0,0
+ FILEVERSION 1,0,1,0
+ PRODUCTVERSION 1,0,1,0
  FILEFLAGSMASK 0x3fL
  FILEFLAGS 0x0L
  FILEOS 0x40004L
@@ -34,11 +37,11 @@ BEGIN
         BEGIN
             VALUE "CompanyName",      "R3 ShieldCore"
             VALUE "FileDescription",  "R3 ShieldCore 配置与日志"
-            VALUE "FileVersion",      "1.0.0.0"
+            VALUE "FileVersion",      "1.0.1.0"
             VALUE "InternalName",     "r3shieldcore-cfg"
             VALUE "OriginalFilename", "r3shieldcore-cfg.exe"
             VALUE "ProductName",      "R3 ShieldCore"
-            VALUE "ProductVersion",   "1.0.0.0"
+            VALUE "ProductVersion",   "1.0.1.0"
         END
     END
     BLOCK "VarFileInfo"
