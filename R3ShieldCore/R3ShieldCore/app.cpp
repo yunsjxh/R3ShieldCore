@@ -973,7 +973,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
 		}
 		if (policy.Flags & (R3ShieldCore::FlagHookCamera | R3ShieldCore::FlagHookInputHook | R3ShieldCore::FlagHookScreen
 			| R3ShieldCore::FlagHookAudio)) {
-			printf("  说明      : 摄像头/音频/输入钩子/截屏均为用户态可见性，绕过路径见 开发约定文档\n");
+			printf("  说明      : 摄像头/音频/输入钩子/截屏均为用户态可见性，绕过路径见项目文档\n");
 		}
 		if (policy.Flags & (R3ShieldCore::FlagHookDllLoad | R3ShieldCore::FlagHookClipboard | R3ShieldCore::FlagHookSpawn
 			| R3ShieldCore::FlagHookTokenTheft | R3ShieldCore::FlagHookWmiSubscription)) {

@@ -90,7 +90,7 @@ cd "$PROJECT_ROOT" || { echo "找不到项目目录: $PROJECT_ROOT"; exit 1; }
 #     构建在 `compile_all` 编完最后一个 .cpp 之后**永久卡住**，
 #     日志停在那一个文件名上，不动、不报错、CPU 为 0。
 #
-#   真因：某些运行环境（shell 包装）会注入
+#   真因：某些运行环境会往 shell 里注入
 #       rm() { "${SAFE_DELETE_BIN_DIR}/rm" "$@"; }
 #     而 `SAFE_DELETE_BIN_DIR` 是**Windows 反斜杠绝对路径**
 #     （`D:\Program Files\...\safe-bin`）。MSYS bash 把 `which rm` 解析成
@@ -414,7 +414,7 @@ build_demo() {
     #
     #    ★ v30 曾把这里改成 highestAvailable（不强制管理员），
     #      **2026-10-01 已回退** —— 不提权时引擎大面积失效，实用价值不足。
-    #      详见 开发约定文档 §3.10l。
+    #      详见 开发约定 §3.10l。
     local manifestArgs=(
         /MANIFEST:EMBED
         /MANIFESTINPUT:R3ShieldCore/rsrc/r3shieldcore-uac.manifest

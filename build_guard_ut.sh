@@ -78,7 +78,7 @@ echo "=== 编译 guard 层底座（$ARCH）==="
 "$CL" $CFLAGS $INCS -Fo"$OBJDIR_REL/clipboard_guard.obj" "$LIB_SRC_REL/clipboard_guard.cpp" || exit 1
 # ★ v129：屏幕 / 输入钩子两个隐私面 —— 验「block 下不拦」必须走完整 Evaluate。
 #   摄像头面**不在**这里：camera_guard.cpp 依赖 Media Foundation（17 处 MF 符号），
-#   而本机 `mfplat.lib` 加进链接会出问题（见 项目约定 的铁律 215）。
+#   而本机 `mfplat.lib` 加进链接会出问题（见项目约定 215）。
 #   摄像头那处改动与这三个**完全同构**，由 `tools/check_privacy_face.sh` 的
 #   静态判据 + 变异负对照兜住。
 "$CL" $CFLAGS $INCS -Fo"$OBJDIR_REL/screen_guard.obj" "$LIB_SRC_REL/screen_guard.cpp" || exit 1

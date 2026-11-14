@@ -340,7 +340,7 @@ if (!IsKeyPrefixMatch(g_rules[i].keyPath, request.KeyPath)) continue;
 ①②③⑤⑥ 会**全部继续通过**，只有 ④ 变红。它证明这次改动是**分流**，不是**放水**。
 
 摄像头面**没有**行为单测：`camera_guard.cpp` 依赖 Media Foundation（17 处 MF 符号），
-而本机 `mfplat.lib` 加进链接会出问题（项目约定 铁律 215）。它那处改动与另外三个
+而本机 `mfplat.lib` 加进链接会出问题（项目约定 215）。它那处改动与另外三个
 **完全同构**，由 `tools/check_privacy_face.sh` 的形态判据兜住：
 
 - 四个面都必须有 `IsPrivacyFace(` 的**调用形态**（不是裸名字，注释/定义会喂饱计数）
@@ -1771,7 +1771,7 @@ unset -f rm unlink rmdir        # ① 去掉函数 —— 单独不够
 
 **顺带说明**：日志里的 `super topmost band unavailable; retained standard
 TOPMOST err=87` **不是**这次的问题 —— band 2 在本机平台级不可达（见
-`开发约定文档 §3.10m`），程序已按设计降级为普通 TOPMOST 并周期重申。
+`开发约定 §3.10m`），程序已按设计降级为普通 TOPMOST 并周期重申。
 
 **验证**：`build.sh Release x64` / `build.sh BuildCheck x64` 均 `BUILD OK`；
 `build_ut.sh x64` 全部测试集 0 失败（31/17/10/74/125/52/18/12）；
@@ -1930,7 +1930,7 @@ never_inject=C:\Users\<用户名>\.<用户数据目录>\
   被 hook 一样会崩。匹配是"前缀 + 路径边界"，`...\<程序>\` 命中整棵，
   但**不**命中 `...\<程序>2\`（不给"改个目录名就免注入"留后门）。
 - 为什么**不写进** `dist/R3ShieldCore-x64/r3shieldcore.ini`：那份是仓库里的**发布物**，
-  写进去等于把"本机环境信息"提交上去 —— `verify_dist_ini` 有一条
+  写进去等于把本机环境信息提交上去 —— `verify_dist_ini` 有一条
   断言专门拦这件事（"never_inject 随包默认为空"），2026-10-04 已经踩过一次。
   本机配置按 v66 的既有约定放 ProgramData（引擎/界面/cfg **优先读它**）。
 
@@ -3718,7 +3718,7 @@ MSYS 路径（`/tmp/...`），**原生引擎根本不认**，于是回退去读�
 ### 新增 — `--run-engine` 分两级跑：**冒烟闸门**先证"白名单真的限住了"
 
 原来只有"跑起来看结果"一条路：白名单若没生效，引擎在 60s 里**全局注入**
-（编辑器与编辑器等进程都可能被 hook 崩）。现在第二级要过第一级才启动：
+（编辑器等进程都可能被 hook 崩）。现在第二级要过第一级才启动：
 
 | 级 | 内容 | 时长 | 判据 |
 |---|---|---|---|
@@ -4080,7 +4080,7 @@ DLL 加载、剪贴板、进程创建旁路、服务安全描述符、COM 激活
 - 新增 `SECURITY.md`（安全模型边界 + 私有漏洞上报 + 不接受为漏洞的类别清单）、
   `CONTRIBUTING.md`、`CHANGELOG.md`、`THIRD-PARTY-NOTICES.md`
 - 新增 `.github/`：issue 表单、PR 模板、CI（6 个源码闸门 + 3 条负对照）
-- 修复 `R3ShieldCore/README.md` 指向内部本地记录的死链
+- 修复 `R3ShieldCore/README.md` 指向内部文档的死链
 
 ### 安全
 

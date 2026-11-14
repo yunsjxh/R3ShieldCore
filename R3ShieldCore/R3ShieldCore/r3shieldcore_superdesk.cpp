@@ -797,7 +797,7 @@ namespace R3ShieldCoreSuperDesk
 			//
 			//   为什么必须换源：win32k 判定 UIAccess 只看**进程创建那一刻的有效令牌**。
 			//   用「自己的管理员令牌 + 就地设 TokenUIAccess」这条路，实测 5 组配置全灭
-			//   （开发约定文档 §3.10m「实测二」）—— 令牌上那个位复查 = 1，
+			//   （开发约定 §3.10m「实测二」）—— 令牌上那个位复查 = 1，
 			//   但 win32k 创建进程时不认，子进程出生即 uiAccess=0 ⇒
 			//   ApplyHighestPermittedTopmost 里 `if (uiAccessEnabled)` 直接挡住，
 			//   SetWindowBand 压根不会被调用。KSword 能用的原因正是它复制 SYSTEM 令牌。

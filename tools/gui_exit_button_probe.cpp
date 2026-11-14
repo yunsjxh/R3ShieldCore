@@ -213,7 +213,7 @@ int main(int argc, char** argv)
     Sleep(1500);
     if (!alive()) {
         printf("[probe] FAIL: app died during startup -- engine refused to load?\n");
-        printf("[probe]       harden the DLL dir ACL first (see 开发约定 3.12):\n");
+        printf("[probe]       harden the DLL dir ACL first (see dev notes 3.12):\n");
         printf("[probe]         icacls <dir> /inheritance:d\n");
         printf("[probe]         icacls <dir> /remove:g \"NT AUTHORITY\\Authenticated Users\"\n");
         TerminateProcess(pi.hProcess, 1);

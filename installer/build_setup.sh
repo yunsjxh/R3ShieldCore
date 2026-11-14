@@ -6,7 +6,7 @@
 # 为什么不再用 iexpress
 # ====================
 # 老的 build_installer.sh 是 iexpress 自解压 + 批处理。它能用，但有四个
-# 改不掉的硬伤（前三个都在 v65 真机验证时踩到过，详见 docs/开发约定 附录 K）：
+# 改不掉的硬伤（前三个都在 v65 真机验证时踩到过，详见项目约定 附录 K）：
 #   1. AppLaunched 指向 .bat 会被 wextract 改写成 `Command.com /c x.bat`，
 #      而 64 位 Windows 没有 command.com ⇒ **双击什么都不装**；
 #      而且参数会被静默丢弃、构建期完全正常。
